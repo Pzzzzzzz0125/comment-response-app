@@ -17,6 +17,9 @@
       </div>
     </div>
     <div class="header-stats" aria-live="polite">
+      <button id="responseReviewButton" class="button review-queue-button" type="button">
+        Review response links <span id="responseReviewCount">—</span>
+      </button>
       <span id="datasetCount">Loading dataset…</span>
       <span class="status-dot"></span>
       <span>Local source-linked data</span>
@@ -148,6 +151,64 @@
       </article>
     </section>
   </main>
+
+  <dialog id="responseReviewDialog" class="response-review-dialog" aria-labelledby="responseReviewTitle">
+    <div class="response-review-shell">
+      <header class="response-review-header">
+        <div>
+          <p class="step-label">Data quality workflow</p>
+          <h2 id="responseReviewTitle">Response link review</h2>
+          <p id="responseReviewProgress" class="response-review-progress">Loading review queue…</p>
+        </div>
+        <button id="responseReviewClose" class="viewer-close" type="button" aria-label="Close response review">×</button>
+      </header>
+      <div class="response-review-toolbar">
+        <label class="field"><span>Status</span><select id="responseReviewStatus">
+          <option value="pending">Pending + follow-up</option>
+          <option value="suggested">Not reviewed</option>
+          <option value="needs_review">Ingestion needs review</option>
+          <option value="needs_followup">Needs follow-up</option>
+          <option value="confirmed">Confirmed</option>
+          <option value="rejected">Rejected</option>
+          <option value="all">All review links</option>
+        </select></label>
+        <label class="field"><span>City</span><select id="responseReviewCity"><option value="">All cities</option></select></label>
+        <div class="review-navigation">
+          <button id="responseReviewPrevious" class="button ghost" type="button">← Previous</button>
+          <button id="responseReviewSkip" class="button ghost" type="button">Skip →</button>
+        </div>
+      </div>
+      <div class="response-review-main">
+        <div id="responseReviewEmpty" class="review-empty hidden">
+          <div class="empty-icon" aria-hidden="true">✓</div>
+          <h3>No links in this queue</h3>
+          <p>Choose another status or city to inspect previous decisions.</p>
+        </div>
+        <div id="responseReviewContent" class="hidden">
+          <div id="responseReviewMeta" class="review-meta"></div>
+          <div class="review-comparison">
+            <section class="review-evidence-card">
+              <div class="review-card-heading"><h3>Government comment</h3><div id="responseReviewCommentSources"></div></div>
+              <p id="responseReviewCommentText" class="review-full-text"></p>
+            </section>
+            <section class="review-evidence-card response">
+              <div class="review-card-heading"><h3>Company response</h3><div id="responseReviewResponseSources"></div></div>
+              <p id="responseReviewResponseText" class="review-full-text"></p>
+            </section>
+          </div>
+          <label class="field review-note-field"><span>Reviewer note (optional)</span><textarea id="responseReviewNote" rows="2" maxlength="500" placeholder="Why is this correct, incorrect, or uncertain?"></textarea></label>
+          <div class="review-decision-actions">
+            <button id="responseReviewUndo" class="button ghost" type="button">Undo decision</button>
+            <span class="dialog-spacer"></span>
+            <button id="responseReviewFollowup" class="button followup" type="button">Needs follow-up</button>
+            <button id="responseReviewReject" class="button reject" type="button">Reject link</button>
+            <button id="responseReviewConfirm" class="button confirm" type="button">Confirm link</button>
+          </div>
+          <p class="review-shortcuts">Keyboard: C confirm · R reject · F follow-up · S skip</p>
+        </div>
+      </div>
+    </div>
+  </dialog>
 
   <dialog id="sourceViewerDialog" class="source-viewer-dialog" aria-labelledby="sourceViewerTitle">
     <div class="source-viewer-shell">

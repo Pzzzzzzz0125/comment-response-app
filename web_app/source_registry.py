@@ -150,6 +150,14 @@ class SourceLocation:
         if not paragraph and file_type in WORD_TYPES and str(row_value).isdigit():
             paragraph = int(row_value)
         quote = str(record.get("original_text", "") or "")
+        metadata = {
+            "legacy_location": raw_location,
+            "source_row": int(row_value) if str(row_value).isdigit() else None,
+            "source_page_end": int(record["source_page_end"]) if str(record.get("source_page_end", "")).isdigit() else None,
+        }
+        if isinstance(record.get("source_locator_json"), dict):
+            metadata["structured_locator_json"] = record["source_locator_json"]
+            metadata["coordinate_source"] = str(record.get("extraction_method", ""))
         return cls(
             document_id=document_id,
             original_document_type=file_type,
@@ -162,11 +170,7 @@ class SourceLocation:
             cell_range=cell_range or str(record.get("source_cell_range", "") or ""),
             paragraph_index=paragraph,
             preview_document_id=preview_document_id,
-            metadata={
-                "legacy_location": raw_location,
-                "source_row": int(row_value) if str(row_value).isdigit() else None,
-                "source_page_end": int(record["source_page_end"]) if str(record.get("source_page_end", "")).isdigit() else None,
-            },
+            metadata=metadata,
         )
 
 
@@ -178,6 +182,32 @@ def pdf_navigation(location: SourceLocation | dict[str, Any]) -> dict[str, Any]:
     if value.get("exact_quote"):
         return {"method": "text_search", "page_number": value.get("page_number") or 1, "query": value["exact_quote"]}
     return {"method": "page", "page_number": value.get("page_number") or 1}
+
+
+def structured_locator_boxes(
+    locators: list[dict[str, Any]], page_number: int, companion: list[dict[str, Any]] | None = None,
+) -> list[list[float]]:
+    """Convert reviewed form locators into Adobe/PDF coordinate boxes."""
+    combined = [*locators, *(companion or [])]
+    heights: list[float] = []
+    for item in combined:
+        pdf_rect = item.get("pdf_rect")
+        top_left = item.get("top_left_bbox")
+        if int(item.get("page") or 0) == page_number and isinstance(pdf_rect, list) and isinstance(top_left, list) and len(pdf_rect) == len(top_left) == 4:
+            heights.extend([float(pdf_rect[1]) + float(top_left[3]), float(pdf_rect[3]) + float(top_left[1])])
+    height = sum(heights) / len(heights) if heights else 0.0
+    boxes: list[list[float]] = []
+    for item in locators:
+        if int(item.get("page") or 0) != page_number:
+            continue
+        pdf_rect = item.get("pdf_rect")
+        top_left = item.get("top_left_bbox")
+        if isinstance(pdf_rect, list) and len(pdf_rect) == 4:
+            boxes.append([round(float(value), 3) for value in pdf_rect])
+        elif height and isinstance(top_left, list) and len(top_left) == 4:
+            x_min, top, x_max, bottom = (float(value) for value in top_left)
+            boxes.append([round(x_min, 3), round(height - bottom, 3), round(x_max, 3), round(height - top, 3)])
+    return boxes
 
 
 def sha256_file(path: Path) -> str:
@@ -656,6 +686,12 @@ class SourceRegistry:
 
     def migrate(self) -> dict[str, int]:
         dataset = json.loads(self.dataset_path.read_text(encoding="utf-8"))
+        rematch_by_owner: dict[str, tuple[dict[str, Any], str]] = {}
+        for link in dataset.get("comment_response_links", []):
+            if link.get("provenance") != "document_structure_rematch" or link.get("review_status") != "confirmed":
+                continue
+            rematch_by_owner[str(link.get("comment_id", ""))] = (link, "comment")
+            rematch_by_owner[str(link.get("response_id", ""))] = (link, "response")
         enrichment_path = self.registry_path.parent / "gemini_enrichment.json"
         enrichment_entries: dict[str, dict[str, Any]] = {}
         if enrichment_path.is_file():
@@ -720,6 +756,26 @@ class SourceRegistry:
                         record, document_id, document["original_document_type"],
                         document.get("preview_document_id"), cell_range,
                     )
+                    rematch = rematch_by_owner.get(owner_id)
+                    if rematch and relative == rematch[0].get("source_pdf"):
+                        link, role = rematch
+                        locator_key = f"{role}_locator_json"
+                        pages_key = f"{role}_pages"
+                        locators = link.get(locator_key, []) if isinstance(link.get(locator_key), list) else []
+                        companion_key = "response_locator_json" if role == "comment" else "comment_locator_json"
+                        companion = link.get(companion_key, []) if isinstance(link.get(companion_key), list) else []
+                        cited_pages = link.get(pages_key, []) if isinstance(link.get(pages_key), list) else []
+                        page_number = int(cited_pages[0]) if cited_pages else int(location.page_number or 1)
+                        quote = str(link.get("imported_current_round_comment_text", "")) if role == "comment" else str(record.get("original_text", ""))
+                        location.page_number = page_number
+                        location.pdf_bounding_boxes = structured_locator_boxes(locators, page_number, companion)
+                        location.exact_quote = quote
+                        location.normalized_quote = normalize_quote(quote)
+                        location.metadata.update({
+                            "coordinate_source": "document_structure_rematch",
+                            "import_key": link.get("import_key", ""),
+                            "structured_locator_json": locators,
+                        })
                     source_id = stable_id("S", f"{owner_id}|{document_id}|primary|{ordinal}")
                     sources[source_id] = {
                         "source_id": source_id,
@@ -909,6 +965,9 @@ class SourceRegistry:
             document = documents[source["document_id"]]
             page_number = int(location.get("page_number") or 0)
             quote = str(location.get("exact_quote", ""))
+            if location.get("pdf_bounding_boxes") and location.get("metadata", {}).get("coordinate_source") == "document_structure_rematch":
+                coordinate_sources += 1
+                continue
             if document["original_document_type"] != "pdf" or page_number < 1 or not quote:
                 continue
             key = (document["document_id"], page_number)

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import getpass
 import json
+import os
 import re
 import subprocess
 import sys
@@ -21,6 +23,7 @@ if str(WORKSPACE_IMPORT) not in sys.path:
 
 from corpus_audit import audit_corpus as audit
 from phase2 import extract_dataset as base
+from phase2.visual_ingestion import VisualGeminiClient, VisualIngestionPipeline, atomic_json
 
 
 def gs_text_pages(path: Path) -> list[str]:
@@ -651,53 +654,40 @@ def process_new_group(
     workspace: Path,
     summary: dict[str, str],
     records: list[dict[str, Any]],
+    pipeline: VisualIngestionPipeline,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    city = summary["likely_city"]
-    if city == "Menlo Park":
-        comments: list[dict[str, Any]] = []
-        responses: list[dict[str, Any]] = []
-        links: list[dict[str, Any]] = []
-        summaries: list[dict[str, Any]] = []
-        review: list[dict[str, Any]] = []
-        comment_record = records[0]
-        response_record = records[-1] if len(records) > 1 else None
-        if comment_record["extension"] == ".docx":
-            result = extract_menlo_docx(
-                workspace / comment_record["path"], comment_record
-            )
-            c, r, l, s, q = result
-            comments += c; responses += r; links += l; summaries.append(s); review += q
-        else:
-            summaries.append({
-                "city": city,
-                "property_project": comment_record["likely_property_project"],
-                "review_round": comment_record["likely_review_round"],
-                "source_document": comment_record["path"],
-                "source_type": "drawing_markup_deferred",
-                "comment_count": 0,
-                "response_count": 0,
-                "matched_count": 0,
-                "unmatched_count": 0,
-                "extraction_method": "deferred_visual_document",
-                "processing_error": "Marked-up plan comments deferred to visual-document phase",
-            })
-        if response_record is not None:
-            result = extract_menlo_matrix(
-                workspace / response_record["path"], response_record
-            )
-            c, r, l, s, q = result
-            comments += c; responses += r; links += l; summaries.append(s); review += q
-        return comments, responses, links, summaries, review
-    if city == "Sunnyvale":
-        comment_record = records[0]
-        response_record = records[1] if len(records) > 1 else None
-        return extract_sunnyvale(
-            workspace / comment_record["path"],
-            comment_record,
-            workspace / response_record["path"] if response_record else None,
-            response_record,
-        )
-    raise ValueError(f"No incremental extractor for city: {city}")
+    comments: list[dict[str, Any]] = []
+    responses: list[dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
+    source_summaries: list[dict[str, Any]] = []
+    review: list[dict[str, Any]] = []
+    for record in records:
+        source = workspace / record["path"]
+        result = pipeline.process(source, record["path"], {
+            "property_hint": summary.get("likely_property_project", record.get("likely_property_project", "")),
+            "city_hint": summary.get("likely_city", record.get("likely_city", "")),
+            "review_round_hint": summary.get("likely_review_round", record.get("likely_review_round", "")),
+            "audit_document_type_hint": record.get("document_type", ""),
+        })
+        c, r, l, s, q = result
+        comments.extend(c); responses.extend(r); links.extend(l); source_summaries.append(s); review.extend(q)
+    return comments, responses, links, source_summaries, review
+
+
+def enforce_visual_verification(
+    comments: list[dict[str, Any]], responses: list[dict[str, Any]], links: list[dict[str, Any]],
+) -> None:
+    """Legacy prefix decisions cannot silently confirm failed Gemini verification."""
+    comments_by_id = {row["comment_id"]: row for row in comments}
+    responses_by_id = {row["response_id"]: row for row in responses}
+    for link in links:
+        if link.get("provenance") != "gemini_visual_two_pass" or link.get("verification_status") != "needs_review":
+            continue
+        link["review_status"] = "needs_review"
+        link["match_confidence"] = 0.0
+        comments_by_id[link["comment_id"]]["human_review_status"] = "needs_review"
+        if link.get("response_id") in responses_by_id:
+            responses_by_id[link["response_id"]]["human_review_status"] = "needs_review"
 
 
 def run_incremental(
@@ -705,6 +695,7 @@ def run_incremental(
     audit_dir: Path,
     output_dir: Path,
     review_decisions: Path | None,
+    pipeline: VisualIngestionPipeline,
 ) -> dict[str, int]:
     workspace = workspace.resolve()
     audit_dir = audit_dir.resolve()
@@ -725,6 +716,12 @@ def run_incremental(
                 for item in source.get("source_document", "").split(" | ")
                 if item.strip()
             )
+    processed_hashes = {
+        str(path): str(digest) for path, digest in dataset.get("processed_source_hashes", {}).items()
+    } if isinstance(dataset.get("processed_source_hashes"), dict) else {}
+    for path in processed:
+        if path not in processed_hashes and path in inventory:
+            processed_hashes[path] = str(inventory[path].get("sha256", ""))
     comments = list(dataset.get("comments", []))
     responses = list(dataset.get("responses", []))
     links = list(dataset.get("comment_response_links", []))
@@ -735,10 +732,20 @@ def run_incremental(
     new_comments = 0
     for summary, records in groups:
         paths = {record["path"] for record in records}
+        changed_in_place = [
+            record["path"] for record in records
+            if record["path"] in processed and processed_hashes.get(record["path"]) not in {"", str(record.get("sha256", ""))}
+        ]
+        if changed_in_place:
+            raise ValueError(
+                "Previously ingested source changed in place; preserve the immutable original and import the revision under a versioned path: "
+                + ", ".join(changed_in_place)
+            )
         if paths.issubset(processed):
             reused_groups += 1
             continue
-        result = process_new_group(workspace, summary, records)
+        new_records = [record for record in records if record["path"] not in processed]
+        result = process_new_group(workspace, summary, new_records, pipeline)
         c, r, l, s, q = result
         comments.extend(c)
         responses.extend(r)
@@ -746,11 +753,13 @@ def run_incremental(
         source_rows.extend(s)
         review_rows.extend(q)
         processed.update(paths)
+        processed_hashes.update({record["path"]: str(record.get("sha256", "")) for record in new_records})
         new_groups += 1
         new_comments += len(c)
     base.validate_dataset(comments, responses, links)
     decisions = base.load_review_decision(review_decisions)
     base.apply_review_decision(comments, responses, links, review_rows, decisions)
+    enforce_visual_verification(comments, responses, links)
     comments.sort(key=lambda row: (
         row["city"], row["property_project"], base.natural_number(row["review_round"]),
         row["source_document"], base.natural_number(row["source_row"]),
@@ -777,11 +786,9 @@ def run_incremental(
         "review_items": review_rows,
         "review_decisions": decisions,
         "processed_source_paths": sorted(processed),
+        "processed_source_hashes": dict(sorted(processed_hashes.items())),
     }
-    (output_dir / "dataset.json").write_text(
-        json.dumps(updated, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_json(output_dir / "dataset.json", updated)
     base.write_report(
         output_dir / "phase2_report.md",
         comments, responses, links, source_rows, review_rows,
@@ -807,11 +814,24 @@ def main() -> int:
     parser.add_argument("--audit-dir", type=Path, default=Path("corpus_audit_output"))
     parser.add_argument("--output", type=Path, default=Path("phase2_dataset"))
     parser.add_argument("--review-decisions", type=Path)
+    parser.add_argument("--artifact-root", type=Path, default=Path("phase2_dataset/ingestion_artifacts"))
+    parser.add_argument("--oracle-dataset", type=Path, default=Path("phase2_dataset/dataset.json"))
+    parser.add_argument("--gemini-model", default=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"))
+    parser.add_argument("--gemini-api-key-stdin", action="store_true", help="Read Gemini key from a hidden prompt")
     args = parser.parse_args()
     try:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+        if not api_key and args.gemini_api_key_stdin:
+            api_key = getpass.getpass("Gemini API key: ")
+        if not api_key:
+            raise ValueError("New-file ingestion requires GEMINI_API_KEY or --gemini-api-key-stdin")
+        pipeline = VisualIngestionPipeline(
+            VisualGeminiClient(api_key, args.gemini_model), args.artifact_root,
+            args.oracle_dataset if args.oracle_dataset.is_file() else None,
+        )
         result = run_incremental(
             args.workspace_root, args.audit_dir, args.output,
-            args.review_decisions,
+            args.review_decisions, pipeline,
         )
     except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, ET.ParseError) as exc:
         print(f"Incremental Phase 2 update failed: {exc}", file=__import__("sys").stderr)
