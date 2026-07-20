@@ -14,7 +14,8 @@ python3 web_app/server.py \
   --source-registry demo_data/source_registry.json \
   --preview-root demo_data/previews \
   --enrichment demo_data/gemini_enrichment.json \
-  --search-index demo_data/search_index.json
+  --search-index demo_data/search_index.json \
+  --link-reviews demo_data/link_review_decisions.json
 ```
 
 Open <http://localhost:8000>. Smart Search uses its clearly labeled deterministic

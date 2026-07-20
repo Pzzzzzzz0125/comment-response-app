@@ -140,11 +140,13 @@ class DatasetStore:
         search_index_path: Path | None = None,
         document_authorizer: Any = None,
         gemini_client: GeminiClient | None = None,
+        link_reviews_path: Path | None = None,
     ):
         self.dataset_path = dataset_path.resolve()
         self.categories_path = categories_path.resolve()
         self.source_root = source_root.resolve()
         self.enrichment_path = (enrichment_path or self.categories_path.parent / "gemini_enrichment.json").resolve()
+        self.link_reviews_path = (link_reviews_path or self.categories_path.parent / "link_review_decisions.json").resolve()
         self.gemini_client = gemini_client
         self.search_index = SearchIndex(search_index_path or self.categories_path.parent / "search_index.json")
         self._search_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -157,6 +159,7 @@ class DatasetStore:
         self._assignments: dict[str, str] = {}
         self._analysis_cache: dict[str, dict[str, Any]] = {}
         self._enrichment_entries: dict[str, dict[str, Any]] = {}
+        self._link_review_decisions: dict[str, dict[str, Any]] = {}
         self.source_registry = SourceRegistry(
             self.dataset_path,
             self.source_root,
@@ -167,7 +170,38 @@ class DatasetStore:
         self.reload(force=True)
         self._load_categories()
         self._load_enrichment()
+        self._load_link_reviews()
         self._sync_search_index()
+
+    def _load_link_reviews(self) -> None:
+        with self._lock:
+            if not self.link_reviews_path.is_file():
+                self._link_review_decisions = {}
+                return
+            payload = json.loads(self.link_reviews_path.read_text(encoding="utf-8"))
+            decisions = payload.get("decisions", {})
+            known_link_ids = {str(row.get("link_id", "")) for row in self._links_by_comment.values()}
+            self._link_review_decisions = {
+                str(link_id): value for link_id, value in decisions.items()
+                if link_id in known_link_ids and isinstance(value, dict)
+                and value.get("decision") in {"confirmed", "rejected", "needs_followup"}
+            } if isinstance(decisions, dict) else {}
+
+    def _save_link_reviews(self) -> None:
+        self.link_reviews_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"schema_version": "1.0", "decisions": dict(sorted(self._link_review_decisions.items()))}
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=self.link_reviews_path.parent,
+            prefix="link-reviews-", suffix=".tmp", delete=False,
+        ) as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            temporary = Path(stream.name)
+        os.replace(temporary, self.link_reviews_path)
+
+    def _effective_link_status(self, link: dict[str, Any]) -> str:
+        decision = self._link_review_decisions.get(str(link.get("link_id", "")), {})
+        return str(decision.get("decision") or link.get("review_status", "not_applicable"))
 
     def _sync_search_index(self) -> dict[str, int]:
         return self.search_index.sync(
@@ -175,7 +209,7 @@ class DatasetStore:
             lambda row: self._enrichment_for(str(row["comment_id"]), row).get("display_text") or readable_text(row.get("original_text", "")),
             lambda comment_id: self._assignments.get(comment_id, "Uncategorized"),
             lambda comment_id: (
-                self._links_by_comment.get(comment_id, {}).get("review_status") == "confirmed"
+                self._effective_link_status(self._links_by_comment.get(comment_id, {})) == "confirmed"
                 or self._responses_by_id.get(self._comments_by_id.get(comment_id, {}).get("response_id", ""), {}).get("human_review_status") == "confirmed"
             ),
         )
@@ -319,11 +353,86 @@ class DatasetStore:
                 "human_review_status": response.get("human_review_status", "pending"),
             } if response else None),
             "link": {
+                "link_id": link.get("link_id", ""),
                 "match_confidence": link.get("match_confidence", ""),
                 "matching_method": link.get("matching_method", ""),
-                "review_status": link.get("review_status", "not_applicable"),
+                "review_status": self._effective_link_status(link),
             },
         }
+
+    def link_review_queue(self, status: str = "pending", city: str = "", summary_only: bool = False) -> dict[str, Any]:
+        self.reload()
+        allowed_statuses = {"pending", "suggested", "confirmed", "rejected", "needs_review", "needs_followup", "all"}
+        if status not in allowed_statuses:
+            raise ValueError("Unknown link-review status")
+        eligible: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+        for comment in self._comments:
+            link = self._links_by_comment.get(str(comment.get("comment_id", "")), {})
+            if not link.get("response_id"):
+                continue
+            base_status = str(link.get("review_status", ""))
+            link_id = str(link.get("link_id", ""))
+            if base_status not in {"suggested", "needs_review"} and link_id not in self._link_review_decisions:
+                continue
+            effective = self._effective_link_status(link)
+            eligible.append((comment, link, effective))
+
+        counts = Counter(effective for _, _, effective in eligible)
+        count_payload = {
+            "total": len(eligible), "suggested": counts["suggested"],
+            "confirmed": counts["confirmed"], "rejected": counts["rejected"],
+            "needs_review": counts["needs_review"], "needs_followup": counts["needs_followup"],
+            "completed": counts["confirmed"] + counts["rejected"],
+        }
+        if summary_only:
+            return {"items": [], "counts": count_payload}
+        items: list[dict[str, Any]] = []
+        for comment, link, effective in eligible:
+            if city and comment.get("city") != city:
+                continue
+            if status == "pending" and effective not in {"suggested", "needs_review", "needs_followup"}:
+                continue
+            if status not in {"pending", "all"} and effective != status:
+                continue
+            view = self._view_comment(comment)
+            decision = self._link_review_decisions.get(str(link.get("link_id", "")), {})
+            items.append({
+                "link_id": link.get("link_id", ""), "status": effective,
+                "base_status": link.get("review_status", ""),
+                "note": decision.get("note", ""), "updated_at": decision.get("updated_at"),
+                "comment": view,
+            })
+        items.sort(key=lambda item: (
+            str(item["comment"].get("city", "")), str(item["comment"].get("property_project", "")),
+            str(item["comment"].get("review_round", "")), str(item["comment"].get("discipline", "")),
+            str(item["comment"].get("comment_number", "")), str(item.get("link_id", "")),
+        ))
+        return {
+            "items": items,
+            "counts": count_payload,
+        }
+
+    def set_link_review(self, link_id: str, decision: str, note: str = "") -> dict[str, Any]:
+        decision = decision.strip().casefold()
+        note = re.sub(r"\s+", " ", note).strip()
+        if decision not in {"", "confirmed", "rejected", "needs_followup"}:
+            raise ValueError("Decision must be confirmed, rejected, needs_followup, or empty")
+        if len(note) > 500:
+            raise ValueError("Review note must be 500 characters or fewer")
+        link = next((row for row in self._links_by_comment.values() if str(row.get("link_id", "")) == link_id), None)
+        if not link or not link.get("response_id"):
+            raise ValueError("Unknown response link")
+        with self._lock:
+            if decision:
+                self._link_review_decisions[link_id] = {
+                    "decision": decision, "note": note, "updated_at": int(time.time()),
+                }
+            else:
+                self._link_review_decisions.pop(link_id, None)
+            self._save_link_reviews()
+            self._search_cache.clear()
+            self._sync_search_index()
+        return {"link_id": link_id, "decision": decision or str(link.get("review_status", "suggested"))}
 
     def _source_references(self, owner_id: str, text: str) -> list[dict[str, Any]]:
         references: list[dict[str, Any]] = []
@@ -600,7 +709,7 @@ class DatasetStore:
                     "matched_search_unit": row.get("matched_excerpt", ""),
                     "historical_response": response.get("original_text", "") if response else "",
                     "response_review_status": response.get("human_review_status", "") if response else "no_response",
-                    "response_link_review_status": link.get("review_status", "not_applicable"),
+                    "response_link_review_status": self._effective_link_status(link),
                     "data_quality_flags": row["record"].get("data_quality_flags", []),
                     "initial_evaluation": evaluation_by_id[row["comment_id"]],
                 })
@@ -789,6 +898,16 @@ class PermitHandler(BaseHTTPRequestHandler):
             city = parse_qs(parsed.query).get("city", [""])[0]
             self._json({"categories": self.app.store.categories(city)})
             return
+        if parsed.path == "/api/link-reviews":
+            query = parse_qs(parsed.query)
+            try:
+                self._json(self.app.store.link_review_queue(
+                    query.get("status", ["pending"])[0], query.get("city", [""])[0],
+                    query.get("summary", ["0"])[0] == "1",
+                ))
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         if parsed.path == "/api/config":
             self._json({"adobe_pdf_embed_client_id": self.app.adobe_pdf_embed_client_id})
             return
@@ -849,6 +968,13 @@ class PermitHandler(BaseHTTPRequestHandler):
                 result = self.app.store.set_category(comment_ids, str(payload.get("category", "")))
                 self._json(result)
                 return
+            if parsed.path == "/api/link-reviews":
+                result = self.app.store.set_link_review(
+                    str(payload.get("link_id", "")), str(payload.get("decision", "")),
+                    str(payload.get("note", "")),
+                )
+                self._json(result)
+                return
         except (ValueError, TypeError) as exc:
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
@@ -902,6 +1028,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview-root", type=Path, default=workspace / "web_app" / "data" / "previews")
     parser.add_argument("--enrichment", type=Path, default=workspace / "web_app" / "data" / "gemini_enrichment.json")
     parser.add_argument("--search-index", type=Path, default=workspace / "web_app" / "data" / "search_index.json")
+    parser.add_argument("--link-reviews", type=Path, default=workspace / "web_app" / "data" / "link_review_decisions.json")
     parser.add_argument("--gemini-model", default=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"))
     parser.add_argument("--gemini-api-key-stdin", action="store_true", help="Read Gemini key from a hidden startup prompt")
     parser.add_argument(
@@ -922,6 +1049,7 @@ def main() -> int:
             args.dataset, args.categories, args.source_root,
             args.source_registry, args.preview_root, args.enrichment, args.search_index,
             gemini_client=gemini_client,
+            link_reviews_path=args.link_reviews,
         )
         server = PermitServer(
             (args.host, args.port), store, args.static_root,

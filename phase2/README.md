@@ -39,12 +39,44 @@ Then append only newly selected review-round sources:
 python3 phase2/incremental_update.py \
   --audit-dir corpus_audit_output \
   --output phase2_dataset \
-  --review-decisions phase2/review_decisions.csv
+  --review-decisions phase2/review_decisions.csv \
+  --gemini-api-key-stdin
 
 python3 web_app/migrate_sources.py
 ```
 
-The updater stores processed source paths and stable source-derived IDs. Repeating it without new sources reuses every group and produces byte-identical datasets.
+New-file ingestion is accuracy-first and does not use the legacy city-specific OCR
+or column heuristics to confirm records. For every new PDF, DOC/DOCX, XLS/XLSX,
+or CSV that may contain comments or responses, it:
+
+1. renders every page as a high-resolution image and extracts all directly readable text;
+2. sends all page images and the complete raw text to Gemini for verbatim structured extraction;
+3. sends all original page images and the proposed JSON through an independent Gemini verification pass;
+4. confirms only records whose completeness, verbatim text, and pairing checks all pass;
+5. stores every uncertain, incomplete, duplicate, conflicting, or failed-verification record as `needs_review`;
+6. preserves manifests, page images, raw text, extraction JSON, verification JSON, prompt versions, and uncertainty reasons under `phase2_dataset/ingestion_artifacts/`.
+
+Ghostscript (`gs`) is required for PDF text extraction and page rendering.
+LibreOffice (`soffice`) is additionally required to render DOC, DOCX, XLS, XLSX,
+and CSV documents. The importer fails explicitly when a required renderer is
+unavailable; it never falls back to text-only confirmation. Large image bundles
+use Gemini's temporary Files API so no page is dropped to satisfy inline request
+limits.
+
+The updater stores processed source hashes and stable source-derived IDs. Repeating
+it without new sources reuses every group. A file that changes in place is rejected;
+keep the immutable original and import the revision under a versioned path.
+
+Run the complete PC3/PC4/PC5 visual regression against the 123 manually confirmed
+parent pairs with:
+
+```sh
+python3 phase2/run_visual_regression.py --api-key-stdin --force
+```
+
+The regression checks PC3 = 92, PC4 = 19, PC5 = 12 and compares every comment
+number, complete comment text, and paired response. A mismatch prevents the result
+from becoming confirmed.
 
 The source-registry migration is the viewer-ingestion step. It preserves originals, updates opaque document/citation IDs, and regenerates hash-addressed office previews when the corresponding original changes.
 

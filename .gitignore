@@ -22,6 +22,7 @@ demo_data/category_assignments.json
 demo_data/gemini_enrichment.json
 demo_data/search_index.json
 demo_data/source_registry.json
+demo_data/link_review_decisions.json
 demo_data/previews/
 
 # Local secrets and developer overrides.

@@ -18,6 +18,9 @@ const state = {
   searchModeLabel: "Gemini semantic ranking",
   sourceViewerRequest: 0,
   appConfig: null,
+  reviewQueue: [],
+  reviewQueueIndex: 0,
+  reviewCounts: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -78,6 +81,27 @@ const elements = {
   categoryDialogHelp: $("categoryDialogHelp"),
   removeCategory: $("removeCategoryButton"),
   toast: $("toast"),
+  responseReviewButton: $("responseReviewButton"),
+  responseReviewCount: $("responseReviewCount"),
+  responseReviewDialog: $("responseReviewDialog"),
+  responseReviewClose: $("responseReviewClose"),
+  responseReviewProgress: $("responseReviewProgress"),
+  responseReviewStatus: $("responseReviewStatus"),
+  responseReviewCity: $("responseReviewCity"),
+  responseReviewPrevious: $("responseReviewPrevious"),
+  responseReviewSkip: $("responseReviewSkip"),
+  responseReviewEmpty: $("responseReviewEmpty"),
+  responseReviewContent: $("responseReviewContent"),
+  responseReviewMeta: $("responseReviewMeta"),
+  responseReviewCommentSources: $("responseReviewCommentSources"),
+  responseReviewResponseSources: $("responseReviewResponseSources"),
+  responseReviewCommentText: $("responseReviewCommentText"),
+  responseReviewResponseText: $("responseReviewResponseText"),
+  responseReviewNote: $("responseReviewNote"),
+  responseReviewUndo: $("responseReviewUndo"),
+  responseReviewFollowup: $("responseReviewFollowup"),
+  responseReviewReject: $("responseReviewReject"),
+  responseReviewConfirm: $("responseReviewConfirm"),
 };
 
 async function api(path, options = {}) {
@@ -367,6 +391,101 @@ function sourceLinks(sources) {
   container.className = "source-links";
   (sources || []).forEach((source) => container.append(sourceLink(source)));
   return container;
+}
+
+async function loadReviewSummary() {
+  const payload = await api("/api/link-reviews?status=all&summary=1");
+  state.reviewCounts = payload.counts;
+  const remaining = payload.counts.suggested + payload.counts.needs_review + payload.counts.needs_followup;
+  elements.responseReviewCount.textContent = remaining;
+  elements.responseReviewButton.title = `${remaining} links still need attention; ${payload.counts.completed} completed`;
+}
+
+function populateReviewCities() {
+  const selected = elements.responseReviewCity.value;
+  elements.responseReviewCity.replaceChildren(new Option("All cities", ""));
+  state.cities.forEach((city) => elements.responseReviewCity.append(new Option(city.name, city.name)));
+  elements.responseReviewCity.value = selected;
+}
+
+async function loadReviewQueue(preferredLinkId = "") {
+  const status = elements.responseReviewStatus.value;
+  const city = elements.responseReviewCity.value;
+  const payload = await api(`/api/link-reviews?status=${encodeURIComponent(status)}&city=${encodeURIComponent(city)}`);
+  state.reviewQueue = payload.items;
+  state.reviewCounts = payload.counts;
+  const preferredIndex = preferredLinkId ? state.reviewQueue.findIndex((item) => item.link_id === preferredLinkId) : -1;
+  state.reviewQueueIndex = preferredIndex >= 0 ? preferredIndex : Math.min(state.reviewQueueIndex, Math.max(0, state.reviewQueue.length - 1));
+  renderReviewQueue();
+  await loadReviewSummary();
+}
+
+function renderReviewQueue() {
+  const item = state.reviewQueue[state.reviewQueueIndex];
+  const counts = state.reviewCounts || { total: 0, completed: 0, suggested: 0, needs_review: 0, needs_followup: 0 };
+  const remaining = counts.suggested + counts.needs_review + counts.needs_followup;
+  elements.responseReviewProgress.textContent = `${counts.completed} of ${counts.total} completed · ${remaining} need attention${state.reviewQueue.length ? ` · showing ${state.reviewQueueIndex + 1} of ${state.reviewQueue.length}` : ""}`;
+  elements.responseReviewEmpty.classList.toggle("hidden", Boolean(item));
+  elements.responseReviewContent.classList.toggle("hidden", !item);
+  elements.responseReviewPrevious.disabled = !item || state.reviewQueue.length < 2;
+  elements.responseReviewSkip.disabled = !item || state.reviewQueue.length < 2;
+  elements.responseReviewFollowup.disabled = !item;
+  elements.responseReviewReject.disabled = !item;
+  elements.responseReviewConfirm.disabled = !item;
+  elements.responseReviewUndo.disabled = !item;
+  if (!item) return;
+
+  const comment = item.comment;
+  const response = comment.response;
+  elements.responseReviewMeta.replaceChildren(
+    metadataChip(item.status.replaceAll("_", " ")),
+    metadataChip(comment.city), metadataChip(comment.property_project),
+    metadataChip(`Round ${comment.review_round}`), metadataChip(comment.discipline),
+    metadataChip(`Comment ${comment.comment_number || "—"}`),
+  );
+  elements.responseReviewCommentText.textContent = comment.display_text;
+  elements.responseReviewResponseText.textContent = response?.display_text || "No response text is stored for this link.";
+  elements.responseReviewCommentSources.replaceChildren(sourceLinks(comment.sources));
+  elements.responseReviewResponseSources.replaceChildren(sourceLinks(response?.sources || []));
+  elements.responseReviewNote.value = item.note || "";
+  elements.responseReviewUndo.disabled = item.base_status === item.status && !item.note;
+}
+
+function moveReviewQueue(offset) {
+  if (!state.reviewQueue.length) return;
+  state.reviewQueueIndex = (state.reviewQueueIndex + offset + state.reviewQueue.length) % state.reviewQueue.length;
+  renderReviewQueue();
+}
+
+async function saveLinkReview(decision) {
+  const item = state.reviewQueue[state.reviewQueueIndex];
+  if (!item) return;
+  const buttons = [elements.responseReviewUndo, elements.responseReviewFollowup, elements.responseReviewReject, elements.responseReviewConfirm];
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    await api("/api/link-reviews", {
+      method: "POST",
+      body: JSON.stringify({ link_id: item.link_id, decision, note: elements.responseReviewNote.value.trim() }),
+    });
+    showToast(decision ? `Link marked ${decision.replaceAll("_", " ")}.` : "Review decision removed.");
+    await loadReviewQueue(decision ? "" : item.link_id);
+  } catch (error) {
+    showToast(error.message);
+    buttons.forEach((button) => { button.disabled = false; });
+  }
+}
+
+async function openResponseReview() {
+  populateReviewCities();
+  elements.responseReviewStatus.value = "pending";
+  elements.responseReviewCity.value = "";
+  state.reviewQueueIndex = 0;
+  if (!elements.responseReviewDialog.open) elements.responseReviewDialog.showModal();
+  try {
+    await loadReviewQueue();
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 function resetSourceViewer() {
@@ -928,6 +1047,24 @@ function bindEvents() {
     elements.nativePdfViewer.src = "about:blank";
     elements.adobePdfViewer.replaceChildren();
   });
+  elements.responseReviewButton.addEventListener("click", openResponseReview);
+  elements.responseReviewClose.addEventListener("click", () => elements.responseReviewDialog.close());
+  elements.responseReviewStatus.addEventListener("change", () => { state.reviewQueueIndex = 0; loadReviewQueue().catch((error) => showToast(error.message)); });
+  elements.responseReviewCity.addEventListener("change", () => { state.reviewQueueIndex = 0; loadReviewQueue().catch((error) => showToast(error.message)); });
+  elements.responseReviewPrevious.addEventListener("click", () => moveReviewQueue(-1));
+  elements.responseReviewSkip.addEventListener("click", () => moveReviewQueue(1));
+  elements.responseReviewConfirm.addEventListener("click", () => saveLinkReview("confirmed"));
+  elements.responseReviewReject.addEventListener("click", () => saveLinkReview("rejected"));
+  elements.responseReviewFollowup.addEventListener("click", () => saveLinkReview("needs_followup"));
+  elements.responseReviewUndo.addEventListener("click", () => saveLinkReview(""));
+  document.addEventListener("keydown", (event) => {
+    if (!elements.responseReviewDialog.open || elements.sourceViewerDialog.open || event.target.matches("input, textarea, select")) return;
+    const key = event.key.toLowerCase();
+    if (key === "c") saveLinkReview("confirmed");
+    if (key === "r") saveLinkReview("rejected");
+    if (key === "f") saveLinkReview("needs_followup");
+    if (key === "s") moveReviewQueue(1);
+  });
   elements.historySearchForm.addEventListener("submit", (event) => {
     event.preventDefault();
     if (state.similarityMode) {
@@ -979,6 +1116,7 @@ async function initialize() {
   if (!preferred) throw new Error("The dataset contains no cities.");
   state.cities = payload.cities;
   await loadCity(preferred);
+  await loadReviewSummary();
 }
 
 initialize().catch((error) => {

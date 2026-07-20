@@ -6,6 +6,7 @@ from pathlib import Path
 
 from web_app.server import DatasetStore, readable_text, tokenize, topic_tokens
 from web_app.gemini_enrich import GeminiClient, normalize_result, record_digest
+from web_app.import_rematched_workbook import excel_date, locator_boxes
 from web_app.rag_search import SearchIndex, coherent_units, normalize_analysis
 from web_app.source_registry import (
     SourceLocation,
@@ -15,6 +16,7 @@ from web_app.source_registry import (
     pdf_navigation,
     reference_tokens,
     sheet_references,
+    structured_locator_boxes,
     viewer_type_for,
 )
 
@@ -112,6 +114,7 @@ def sample_dataset():
         ],
         "comment_response_links": [
             {
+                "link_id": "L-SJ-1",
                 "comment_id": "C-SJ-1",
                 "response_id": "R-SJ-1",
                 "match_confidence": 1.0,
@@ -229,6 +232,43 @@ class DatasetStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown comment ID"):
             self.store.set_category(["missing"], "Planning")
 
+    def test_suggested_response_links_can_be_reviewed_without_mutating_dataset(self):
+        before = self.dataset_path.read_bytes()
+        link = self.store._links_by_comment["C-SJ-1"]
+        link["review_status"] = "suggested"
+
+        queue = self.store.link_review_queue()
+        self.assertEqual(queue["counts"]["total"], 1)
+        self.assertEqual(queue["counts"]["suggested"], 1)
+        self.assertEqual(queue["items"][0]["link_id"], "L-SJ-1")
+        self.assertEqual(queue["items"][0]["comment"]["response"]["response_id"], "R-SJ-1")
+
+        self.store.set_link_review("L-SJ-1", "confirmed", "Checked against both source files.")
+        self.assertEqual(self.store.link_review_queue()["items"], [])
+        confirmed = self.store.link_review_queue("confirmed")["items"][0]
+        self.assertEqual(confirmed["status"], "confirmed")
+        self.assertEqual(confirmed["note"], "Checked against both source files.")
+        self.assertEqual(self.dataset_path.read_bytes(), before)
+
+        reloaded = DatasetStore(self.dataset_path, self.categories_path, self.source_root)
+        reloaded._links_by_comment["C-SJ-1"]["review_status"] = "suggested"
+        self.assertEqual(reloaded.link_review_queue("confirmed")["items"][0]["link_id"], "L-SJ-1")
+        reloaded.set_link_review("L-SJ-1", "")
+        self.assertEqual(reloaded.link_review_queue()["items"][0]["status"], "suggested")
+
+    def test_response_link_review_rejects_unknown_inputs(self):
+        with self.assertRaisesRegex(ValueError, "Unknown response link"):
+            self.store.set_link_review("missing", "confirmed")
+        with self.assertRaisesRegex(ValueError, "Decision must be"):
+            self.store.set_link_review("L-SJ-1", "maybe")
+
+    def test_ingestion_needs_review_link_appears_in_pending_queue(self):
+        link = self.store._links_by_comment["C-SJ-1"]
+        link["review_status"] = "needs_review"
+        queue = self.store.link_review_queue("pending")
+        self.assertEqual(queue["counts"]["needs_review"], 1)
+        self.assertEqual(queue["items"][0]["status"], "needs_review")
+
 
 class SearchIndexTests(unittest.TestCase):
     def test_clear_top_level_comments_become_separate_search_units(self):
@@ -279,6 +319,15 @@ class TokenizeTests(unittest.TestCase):
 
     def test_topic_tokens_ignore_changed_measurement_values(self):
         self.assertEqual(topic_tokens("The door length is 10"), topic_tokens("The door length is 4"))
+
+    def test_rematch_import_converts_excel_dates_and_top_left_coordinates(self):
+        comment_locator = [{"page": 1, "top_left_bbox": [10, 20, 110, 70]}]
+        response_locator = [{
+            "page": 1, "pdf_rect": [200, 42, 300, 92],
+            "top_left_bbox": [200, 520, 300, 570],
+        }]
+        self.assertEqual(excel_date("45985"), "2025-11-24")
+        self.assertEqual(locator_boxes(comment_locator, 1, response_locator), [[10.0, 542.0, 110.0, 592.0]])
 
 
 class SourceViewerTests(unittest.TestCase):
@@ -426,6 +475,11 @@ class SourceViewerTests(unittest.TestCase):
         ))
         self.assertEqual(navigation["method"], "coordinates")
         self.assertEqual(navigation["page_number"], 4)
+
+    def test_reviewed_form_locator_converts_to_pdf_coordinates(self):
+        comment = [{"page": 4, "top_left_bbox": [10, 20, 110, 70]}]
+        response = [{"page": 4, "pdf_rect": [200, 42, 300, 92], "top_left_bbox": [200, 520, 300, 570]}]
+        self.assertEqual(structured_locator_boxes(comment, 4, response), [[10.0, 542.0, 110.0, 592.0]])
 
     def test_pdf_text_search_is_the_fallback_without_coordinates(self):
         navigation = pdf_navigation(SourceLocation(

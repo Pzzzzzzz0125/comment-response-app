@@ -1,106 +1,164 @@
-# Permit precedent browser
+# Comment Response App
 
-This local web application browses the source-linked Phase 2 dataset without changing extracted records. User categories are stored separately in `data/category_assignments.json`.
+An evidence-backed knowledge system for finding, understanding, and reusing historical city permit-review comments and company responses.
 
-Start it from the workspace root:
+## Project Goal
 
-```sh
-python3 web_app/server.py
-```
+Housing and design projects often go through several review rounds. A city reviews the submitted plans, returns comments, and the project team responds by revising the plans or providing clarification. This process can repeat across properties, cities, and review rounds.
 
-Then open <http://localhost:8000>. The Adobe PDF Embed client ID is registered for
-`localhost`; opening the app through `127.0.0.1` uses a different origin and can
-fail Adobe's domain validation.
+The goal of the Comment Response App is to turn that history into a searchable knowledge base. It should help users understand how similar issues were handled previously while keeping every answer connected to the original records.
 
-Features:
+The system is intended to let users:
 
-- city summary with technical/non-technical counts and deduplicated common topics;
-- city, project, round, discipline, category, and matched-status filters;
-- keyword-first history search followed by bounded Gemini-assisted hybrid RAG when requested;
-- display-only cleanup of spreadsheet/OCR line breaks while preserving original source text;
-- selectable comments and bulk category assignment;
-- historical response panel with exact source citations;
-- links to the primary source plus local files and web resources referenced in the text;
-- secondary-source resolution for named submission documents and explicit plan-sheet references (for example, A0.1), including page targeting and evidence-text highlighting;
-- an in-app routed SourceViewer for PDF, Word previews, spreadsheets, and unsupported files;
-- explicit unmatched and pending-review states.
+- Ask how similar city comments were handled in past projects.
+- Find relevant historical comments and company responses.
+- Request summaries, comparisons, and counts from the historical record.
+- Review differently worded comments that refer to the same underlying issue.
+- Open the supporting source document at the cited location.
+- Recognize when no sufficiently relevant historical precedent exists.
 
-The classification and topic grouping are deterministic exploration aids. Smart Search keeps records local for candidate retrieval. It interprets the query, creates meaning-preserving rewrites, retrieves up to 200 unique candidates, evaluates summaries in batches of 25, deeply reranks the strongest full stored records, and independently verifies the final direct/related labels. Gemini never creates citations or source locations. If Gemini is unavailable, a clearly labeled unverified deterministic fallback remains usable and may return no result.
+The system supports professional review; it does not replace professional judgment or treat an AI-generated answer as an approved permit response.
 
-## Smart Search index and evaluation
+## Product Principles
 
-`data/search_index.json` stores coherent searchable units mapped to immutable historical parent comments, with city, discipline, category, code sections, acceptance signal, quality flags, content hashes, embedding model/version, and optional embeddings. Clear top-level numbered comments are split for retrieval without changing the source record, response relationship, or citation. Long historical responses are deliberately excluded from embedding input. Build Gemini embeddings incrementally (unchanged unit hashes are skipped):
+### Evidence first
 
-```sh
-python3 web_app/build_search_index.py
-```
+Answers should be grounded in stored historical comments, responses, and source documents. The system should cite the records supporting an answer and distinguish direct precedents from merely related examples.
 
-Use `--metadata-only` to refresh records without an API call. Keep the Gemini key server-side via the environment or hidden startup prompt:
+### Preserve the original record
 
-```sh
-python3 web_app/server.py --gemini-api-key-stdin
-```
+Similar comments may be grouped under a common issue, but the original wording, property, city, review round, response, and source location must remain available.
 
-Explicit city, discipline, and category UI filters override inferred filters. Inferred metadata affects ranking but is not a hard exclusion. Development diagnostics can be enabled with `PERMIT_SEARCH_DEBUG=1`; they record pipeline/model/prompt versions and decisions without exposing filesystem paths.
+### Do not manufacture certainty
 
-Audit extraction structure, response associations, metadata, truncation, and source-file availability with:
+The application should be able to say that no sufficiently relevant precedent was found. Missing, suggested, or unverified comment-response links should not be presented as confirmed facts.
 
-```sh
-python3 web_app/audit_search_data.py
-```
+### Human review remains necessary
 
-Run the versioned broad evaluation fixture with:
+Historical responses may provide useful precedent, but requirements can vary by project, city, code cycle, and reviewer. Users remain responsible for validating any proposed action.
 
-```sh
-python3 web_app/evaluate_search.py
-```
+## Intended User Journey
 
-The included fixture is explicitly provisional and requires domain review before it can be called a gold dataset. The command reports current retrieval metrics and the legacy token-cosine baseline. Live direct/related classification accuracy and Gemini failure rate remain unavailable until the project has API credits and the labels are reviewed.
+1. The user selects a city or chooses to search across all available history.
+2. The user asks a question in the conversational interface.
+3. The system identifies whether the user is requesting a precedent search, summary, comparison, or count.
+4. The system searches the historical records or calculates the requested result from structured data.
+5. It returns a grounded answer with links to the supporting comments and responses.
+6. The user opens the matching result set in the comment list.
+7. Selecting a comment shows the corresponding historical response, when one is available.
+8. Selecting a citation opens the original source document at the relevant page, paragraph, sheet, cell, or range.
+9. The user can ask follow-up questions, change the scope, filter the results, or compare projects.
 
-## Gemini organization and secondary-reference analysis
+Example questions include:
 
-Gemini enrichment is an explicit ingestion step, not a browser-time API call. It preserves the extracted dataset, stores resumable results in `data/gemini_enrichment.json`, and sends each comment/response plus same-project candidate filenames to Gemini. The result contains display-only paragraphs/lists and confidence-scored secondary sheet/document hints. The registry still verifies every hint against an authorized same-project file before exposing a source link.
+- How have we handled tree-related comments in previous projects?
+- Find comments requiring setback dimensions to be added to the plans. How did we respond?
+- How many historical comments concern door width or door size?
+- Summarize the most common drainage-related requirements for this city.
+- Compare the responses used for similar fire-rated exterior-wall comments.
 
-```sh
-GEMINI_API_KEY=your-key python3 web_app/gemini_enrich.py --workers 4
-python3 web_app/migrate_sources.py
-```
+## Similar-Issue Grouping
 
-To prioritize responses after a partial or credit-limited run:
+Different comments can express the same underlying issue. For example, two reviewers may identify different noncompliant door dimensions while both comments concern the same door-clearance requirement.
 
-```sh
-GEMINI_API_KEY=your-key python3 web_app/gemini_enrich.py --record-type response --workers 4
-```
+The system should support a hierarchy such as:
 
-Results are cached by record hash, prompt version, and model, so rerunning skips completed records. The API key is read from the environment (or a hidden `--api-key-stdin` prompt) and is never written to the cache or served by the app. This processing sends permit text and candidate filenames to Google's Gemini API; use it only under the project's approved data-handling policy.
+- Broad topic, such as doors, trees, setbacks, or drainage
+- Canonical issue, representing the shared underlying requirement
+- Individual historical variants
+- Original comments, responses, project details, and source evidence
 
-## Source registry and previews
+Grouping should improve discovery and counting without erasing meaningful differences between projects.
 
-Source citations use opaque IDs from `data/source_registry.json`; API responses never expose corpus paths. Rebuild the registry after an extraction run or whenever original documents change:
+## Real Data and Demo Data
 
-```sh
-python3 web_app/migrate_sources.py
-```
+The public repository contains only materials that are safe to review publicly:
 
-The migration hashes each original, normalizes citation locations, infers cited XLSX cells from the saved quote when possible, and updates previews whose original hash changed. It also resolves explicitly referenced plan sheets and named documents within the same project/submission package. Ghostscript (`gs`) is used when available to identify a referenced PDF sheet's preview page and searchable evidence phrase. DOC/DOCX previews use the replaceable `LibreOfficePreviewConverter`. Install LibreOffice and ensure `soffice` is on `PATH` to generate them. Legacy XLS files also use LibreOffice for an XLSX grid preview. XLSX and CSV viewing otherwise uses the existing Python standard-library stack and requires no SheetJS dependency.
+- Application code
+- Automated tests
+- Documentation
+- Extraction and audit tools
+- Synthetic demo data
 
-The Adobe PDF Embed client ID can be set without editing code:
+The public repository does **not** contain:
 
-```sh
-ADOBE_PDF_EMBED_CLIENT_ID=your-client-id python3 web_app/server.py
-```
+- Real permit documents
+- The real production dataset
+- Production embeddings
+- The production source registry
+- API keys or credentials
+- Local filesystem paths
 
-The supplied local client ID is the default. Adobe credentials are domain-bound; configure the registered domains in Adobe Developer Console if the viewer reports an invalid client ID. When the Adobe SDK is unavailable, PDFs fall back to the browser's inline PDF renderer.
+At present, the real permit documents and production data are stored in the local development environment and are excluded from Git through `.gitignore`.
 
-Source APIs:
+The exact production data root and deployment configuration still need to be documented and confirmed. They should be provided through environment-specific configuration rather than hardcoded into the application or committed to the repository.
 
-- `GET /api/sources/{source_id}` returns normalized citation and viewer routing metadata.
-- `GET /api/documents/{document_id}/preview` serves PDF content inline and supports byte ranges.
-- `GET /api/documents/{document_id}/spreadsheet` returns a read-only sheet window.
-- `GET /api/documents/{document_id}/original` is the only attachment response.
+## Development and Production Alignment
 
-Run tests:
+The proposed environment boundary is:
 
-```sh
-python3 -m unittest discover -s web_app/tests -v
-```
+| Area | Development | Production |
+| --- | --- | --- |
+| Data | Synthetic fixtures or an approved sanitized subset | Real permit documents and indexed production records |
+| Schema | Shared production-compatible schema | Same schema |
+| Ingestion | Same validation and import workflow | Same validation and import workflow |
+| Source viewer | Demo documents | Authorized real source documents |
+| Credentials | Development-only configuration | Production secrets and access controls |
+
+Code behavior, data schemas, identifiers, and validation rules should remain consistent across environments. Only the configured data sources, credentials, and access permissions should differ.
+
+## Current Status
+
+The project is currently a reviewable MVP rather than only a UI prototype.
+
+Completed core capabilities include:
+
+- City-based browsing of historical comments.
+- Keyword and AI-assisted semantic search.
+- Retrieval of historical comments and available responses.
+- Classification of results as direct, related, or unverified candidates.
+- In-app viewing of PDF, Word, spreadsheet, and CSV source material.
+- Navigation to cited pages or spreadsheet locations, with highlighting where source metadata allows it.
+- Automated tests covering search, data structure, document previews, permissions, and source behavior.
+- Data-quality flags for records that may be incomplete or require review.
+
+The current evaluation results are provisional. A larger domain-reviewed gold dataset is still required before search quality can be treated as production-validated.
+
+## Next Priorities
+
+1. Replace the top-level analysis summary with a conversational, history-grounded AI interface.
+2. Document and validate the production data location, configuration, backup, and access model.
+3. Define a stable data contract shared by development and production.
+4. Complete human or domain review of suggested comment-response matches.
+5. Define and validate the canonical issue taxonomy and grouping workflow.
+6. Build a larger, domain-approved search evaluation set.
+7. Add clear user-visible handling for missing evidence, unverified matches, and incomplete source records.
+8. Confirm production security, permissions, monitoring, and operational ownership.
+
+## Scope Boundaries
+
+The application is designed to retrieve and summarize historical evidence. It should not:
+
+- Invent citations, page numbers, spreadsheet locations, or file paths.
+- Present a related example as a direct precedent.
+- Calculate counts from an AI estimate when the value can be computed from the database.
+- Hide uncertainty about incomplete or unverified records.
+- Automatically treat a historical response as correct for a new project without review.
+
+## Repository
+
+Public review repository: [Pzzzzzzz0125/comment-response-app](https://github.com/Pzzzzzzz0125/comment-response-app)
+
+The repository is intentionally separated from real production documents and private production data.
+
+## Open Documentation Items
+
+The following information should be added after it is confirmed:
+
+- Exact production data root and configuration owner
+- Production deployment environment and release process
+- Backup and recovery procedure
+- Authentication roles and document-access rules
+- Data-retention and deletion requirements
+- Approved taxonomy owner and review process
+- Production acceptance criteria and domain evaluation thresholds
