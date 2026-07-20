@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Browse historical permit comments and company responses with source citations.">
+  <title>Permit Precedents</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand-block">
+      <div class="brand-mark" aria-hidden="true">PP</div>
+      <div>
+        <p class="eyebrow">Permit knowledge base</p>
+        <h1>Permit Precedents</h1>
+      </div>
+    </div>
+    <div class="header-stats" aria-live="polite">
+      <span id="datasetCount">Loading dataset…</span>
+      <span class="status-dot"></span>
+      <span>Local source-linked data</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="city-overview" aria-labelledby="cityOverviewTitle">
+      <div class="overview-topline">
+        <div>
+          <p class="step-label">City intelligence</p>
+          <h2 id="cityOverviewTitle">Review landscape</h2>
+        </div>
+        <label class="field city-picker">
+          <span>Select city</span>
+          <select id="citySelect" aria-label="Choose city"></select>
+        </label>
+      </div>
+      <p id="analysisSummary" class="analysis-summary">Loading city analysis…</p>
+      <div class="analysis-grid" aria-label="City comment summary">
+        <div class="analysis-stat"><strong id="totalComments">—</strong><span>Total comments</span></div>
+        <div class="analysis-stat"><strong id="uniqueComments">—</strong><span>Unique text</span></div>
+        <div class="analysis-stat technical"><strong id="technicalComments">—</strong><span>Technical</span></div>
+        <div class="analysis-stat administrative"><strong id="nontechnicalComments">—</strong><span>Non-technical</span></div>
+      </div>
+      <div class="common-topics-block">
+        <div class="topics-heading">
+          <div>
+            <p class="step-label">Deduplicated view</p>
+            <h3>Common comment topics</h3>
+          </div>
+          <p id="analysisMethod" class="method-note"></p>
+        </div>
+        <div id="commonTopics" class="common-topics"></div>
+      </div>
+    </section>
+
+    <section class="workspace" aria-label="Permit comment browser">
+      <aside class="comment-browser">
+        <div class="browser-header">
+          <div>
+            <p class="step-label">Historical record</p>
+            <h2>Comments</h2>
+          </div>
+          <span id="visibleCount" class="count-pill">0</span>
+        </div>
+
+        <div class="filters">
+          <form id="historySearchForm" class="history-search-form">
+            <label class="field filter-search">
+              <span>Search historical comments</span>
+              <div class="search-input-row">
+                <input id="historySearch" type="search" placeholder="Keyword, code, sheet, or a full question…">
+                <button class="button search-button" type="submit">Search</button>
+              </div>
+            </label>
+          </form>
+          <div id="smartSearchPrompt" class="smart-search-prompt hidden" role="status">
+            <div>
+              <strong>No keyword match found</strong>
+              <span>Gemini Smart Search can find comments with similar meaning even when the wording is different.</span>
+            </div>
+            <button id="smartSearchButton" class="button smart" type="button">Try Gemini Smart Search</button>
+          </div>
+          <div id="searchModeNotice" class="search-mode-notice hidden" role="status">
+            <span id="searchModeText"></span>
+            <button id="clearSmartSearchButton" class="text-button" type="button">Back to keyword search</button>
+          </div>
+          <div class="filter-grid">
+            <label class="field">
+              <span>Project / address</span>
+              <select id="projectFilter"><option value="">All projects</option></select>
+            </label>
+            <label class="field">
+              <span>Discipline</span>
+              <select id="disciplineFilter"><option value="">All disciplines</option></select>
+            </label>
+            <label class="field">
+              <span>Round</span>
+              <select id="roundFilter"><option value="">All rounds</option></select>
+            </label>
+            <label class="field">
+              <span>Response</span>
+              <select id="matchFilter">
+                <option value="">Matched + unmatched</option>
+                <option value="matched">Has response</option>
+                <option value="unmatched">No response</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Category</span>
+              <select id="categoryFilter"><option value="">All categories</option></select>
+            </label>
+            <label class="field">
+              <span>Review state</span>
+              <select id="reviewFilter">
+                <option value="">All review states</option>
+                <option value="confirmed">Confirmed</option>
+                <option value="pending">Pending</option>
+                <option value="not_required">Not required</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="selection-toolbar">
+          <label class="select-all-label">
+            <input id="selectVisible" type="checkbox">
+            <span>Select visible</span>
+          </label>
+          <span id="selectedCount">0 selected</span>
+          <button id="categorizeButton" class="text-button" type="button" disabled>Categorize</button>
+        </div>
+
+        <div id="commentList" class="comment-list" aria-live="polite"></div>
+        <div id="emptyList" class="empty-list hidden">
+          <p>No comments match these filters.</p>
+          <button id="resetFiltersButton" class="button ghost" type="button">Reset filters</button>
+        </div>
+      </aside>
+
+      <article id="detailPanel" class="detail-panel">
+        <div id="detailEmpty" class="detail-empty">
+          <div class="empty-icon" aria-hidden="true">↗</div>
+          <h2>Select a comment</h2>
+          <p>Choose a historical comment on the left to see its response and source evidence.</p>
+        </div>
+        <div id="detailContent" class="hidden"></div>
+      </article>
+    </section>
+  </main>
+
+  <dialog id="sourceViewerDialog" class="source-viewer-dialog" aria-labelledby="sourceViewerTitle">
+    <div class="source-viewer-shell">
+      <header class="source-viewer-header">
+        <div>
+          <p class="step-label">Source evidence</p>
+          <h2 id="sourceViewerTitle">Document viewer</h2>
+          <p id="sourceViewerMeta" class="source-viewer-meta"></p>
+        </div>
+        <button id="sourceViewerClose" class="viewer-close" type="button" aria-label="Close source viewer">×</button>
+      </header>
+      <div class="source-viewer-layout">
+        <aside class="source-viewer-evidence">
+          <div>
+            <span class="viewer-label">Citation</span>
+            <strong id="sourceViewerLocation">—</strong>
+          </div>
+          <div>
+            <span class="viewer-label">Extracted evidence</span>
+            <blockquote id="sourceViewerQuote">No extracted evidence text is available for this reference.</blockquote>
+          </div>
+          <div id="sourceViewerStatus" class="viewer-status" role="status"></div>
+          <a id="sourceViewerDownload" class="button viewer-download" href="#">Download original</a>
+        </aside>
+        <section class="source-viewer-stage">
+          <div id="sourceViewerLoading" class="viewer-loading">Preparing document viewer…</div>
+          <div id="adobePdfViewer" class="pdf-viewer hidden"></div>
+          <iframe id="nativePdfViewer" class="pdf-viewer hidden" title="PDF source preview"></iframe>
+          <div id="spreadsheetViewer" class="spreadsheet-viewer hidden">
+            <div class="spreadsheet-toolbar">
+              <label class="field"><span>Sheet</span><select id="spreadsheetSheet"></select></label>
+              <span id="spreadsheetSelection" class="metadata-chip"></span>
+            </div>
+            <div id="spreadsheetGrid" class="spreadsheet-grid"></div>
+          </div>
+          <div id="unsupportedViewer" class="unsupported-viewer hidden">
+            <div class="empty-icon" aria-hidden="true">i</div>
+            <h3>Preview unavailable</h3>
+            <p id="unsupportedViewerMessage"></p>
+          </div>
+        </section>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="categoryDialog" class="category-dialog">
+    <form method="dialog" id="categoryForm">
+      <p class="step-label">Organize precedents</p>
+      <h2>Assign a category</h2>
+      <p id="categoryDialogHelp">Apply a category to the selected comments.</p>
+      <label class="field">
+        <span>Category name</span>
+        <input id="categoryInput" list="categorySuggestions" maxlength="80" placeholder="e.g. Fire separation">
+        <datalist id="categorySuggestions"></datalist>
+      </label>
+      <p class="dialog-note">Categories are user annotations. Original comments and disciplines remain unchanged.</p>
+      <div class="dialog-actions">
+        <button id="removeCategoryButton" class="button danger-ghost" type="button">Remove category</button>
+        <span class="dialog-spacer"></span>
+        <button class="button ghost" value="cancel">Cancel</button>
+        <button id="saveCategoryButton" class="button primary" type="submit" value="save">Apply</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="https://acrobatservices.adobe.com/view-sdk/viewer.js"></script>
+  <script src="/app.js" defer></script>
+</body>
+</html>

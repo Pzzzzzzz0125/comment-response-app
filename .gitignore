@@ -1,0 +1,30 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Large/private original permit documents are supplied separately.
+comments&response/
+
+# Regenerable converted document previews.
+web_app/data/previews/
+
+# Regenerable audit reports may contain workstation-local paths.
+corpus_audit_output/
+
+# Local permit-derived datasets and review decisions are not public artifacts.
+phase2_dataset/
+web_app/data/*.json
+phase2/review_decisions.csv
+corpus_audit/manual_overrides.csv
+
+# Demo-derived runtime indexes are regenerated on first run.
+demo_data/category_assignments.json
+demo_data/gemini_enrichment.json
+demo_data/search_index.json
+demo_data/source_registry.json
+demo_data/previews/
+
+# Local secrets and developer overrides.
+.env
+.env.*
+!.env.example

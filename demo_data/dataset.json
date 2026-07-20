@@ -1,0 +1,37 @@
+{
+  "schema_version": "2.0",
+  "comments": [
+    {
+      "comment_id": "C-DEMO-001", "city": "Demo City", "property_project": "100 Example Avenue — Demo Project", "review_round": "1", "discipline": "Building", "reviewer": "Demo Reviewer", "comment_number": "1",
+      "original_text": "Provide a 42-inch-high guard at the open side of the landing.", "source_document": "demo_sources/Demo City/comments.csv", "source_sheet": "comments", "source_row": 2, "source_location": "sheet comments, row 2",
+      "extraction_method": "spreadsheet_cells", "extraction_confidence": 1.0, "match_status": "matched", "human_review_status": "confirmed", "response_id": "R-DEMO-001"
+    },
+    {
+      "comment_id": "C-DEMO-002", "city": "Demo City", "property_project": "100 Example Avenue — Demo Project", "review_round": "1", "discipline": "Planning", "reviewer": "Demo Reviewer", "comment_number": "2",
+      "original_text": "Show and dimension the required front-yard setback on the site plan.", "source_document": "demo_sources/Demo City/comments.csv", "source_sheet": "comments", "source_row": 3, "source_location": "sheet comments, row 3",
+      "extraction_method": "spreadsheet_cells", "extraction_confidence": 1.0, "match_status": "matched", "human_review_status": "confirmed", "response_id": "R-DEMO-002"
+    },
+    {
+      "comment_id": "C-DEMO-003", "city": "Demo City", "property_project": "100 Example Avenue — Demo Project", "review_round": "1", "discipline": "Fire", "reviewer": "Demo Reviewer", "comment_number": "3",
+      "original_text": "Provide a smoke and carbon-monoxide alarm in the hallway outside the accessory unit.", "source_document": "demo_sources/Demo City/comments.csv", "source_sheet": "comments", "source_row": 4, "source_location": "sheet comments, row 4",
+      "extraction_method": "spreadsheet_cells", "extraction_confidence": 1.0, "match_status": "matched", "human_review_status": "confirmed", "response_id": "R-DEMO-003"
+    },
+    {
+      "comment_id": "C-DEMO-004", "city": "Example Town", "property_project": "200 Sample Street — Demo Addition", "review_round": "2", "discipline": "Building", "reviewer": "Demo Reviewer", "comment_number": "1",
+      "original_text": "Identify the one-hour-rated wall and reference an approved assembly detail.", "source_document": "demo_sources/Example Town/comments.csv", "source_sheet": "comments", "source_row": 2, "source_location": "sheet comments, row 2",
+      "extraction_method": "spreadsheet_cells", "extraction_confidence": 1.0, "match_status": "matched", "human_review_status": "confirmed", "response_id": "R-DEMO-004"
+    }
+  ],
+  "responses": [
+    {"response_id": "R-DEMO-001", "comment_id": "C-DEMO-001", "original_text": "A 42-inch guard and construction detail were added to Sheet A3.1.", "source_document": "demo_sources/Demo City/responses.csv", "source_sheet": "responses", "source_row": 2, "source_location": "sheet responses, row 2", "human_review_status": "confirmed"},
+    {"response_id": "R-DEMO-002", "comment_id": "C-DEMO-002", "original_text": "The front-yard setback dimension was added to the revised site plan.", "source_document": "demo_sources/Demo City/responses.csv", "source_sheet": "responses", "source_row": 3, "source_location": "sheet responses, row 3", "human_review_status": "confirmed"},
+    {"response_id": "R-DEMO-003", "comment_id": "C-DEMO-003", "original_text": "Smoke and carbon-monoxide alarms are now shown in the hallway outside the accessory unit.", "source_document": "demo_sources/Demo City/responses.csv", "source_sheet": "responses", "source_row": 4, "source_location": "sheet responses, row 4", "human_review_status": "confirmed"},
+    {"response_id": "R-DEMO-004", "comment_id": "C-DEMO-004", "original_text": "The wall is labeled one-hour rated and references the approved assembly on Sheet A5.0.", "source_document": "demo_sources/Example Town/responses.csv", "source_sheet": "responses", "source_row": 2, "source_location": "sheet responses, row 2", "human_review_status": "confirmed"}
+  ],
+  "comment_response_links": [
+    {"comment_id": "C-DEMO-001", "response_id": "R-DEMO-001", "match_confidence": 1.0, "matching_method": "synthetic_demo", "review_status": "confirmed"},
+    {"comment_id": "C-DEMO-002", "response_id": "R-DEMO-002", "match_confidence": 1.0, "matching_method": "synthetic_demo", "review_status": "confirmed"},
+    {"comment_id": "C-DEMO-003", "response_id": "R-DEMO-003", "match_confidence": 1.0, "matching_method": "synthetic_demo", "review_status": "confirmed"},
+    {"comment_id": "C-DEMO-004", "response_id": "R-DEMO-004", "match_confidence": 1.0, "matching_method": "synthetic_demo", "review_status": "confirmed"}
+  ]
+}
