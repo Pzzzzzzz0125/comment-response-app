@@ -13,10 +13,14 @@ try:
     from .gemini_enrich import GeminiClient, record_digest
     from .rag_search import SearchIndex
     from .server import readable_text
+    from .data_trust import searchable_comment, verified_text
+    from .local_secrets import gemini_api_key
 except ImportError:
     from gemini_enrich import GeminiClient, record_digest
     from rag_search import SearchIndex
     from server import readable_text
+    from data_trust import searchable_comment, verified_text
+    from local_secrets import gemini_api_key
 
 
 def main() -> int:
@@ -31,18 +35,23 @@ def main() -> int:
     args = parser.parse_args()
 
     dataset = json.loads(args.dataset.read_text(encoding="utf-8"))
-    comments = dataset.get("comments", [])
     links = {item["comment_id"]: item for item in dataset.get("comment_response_links", [])}
+    comments = [
+        row for row in dataset.get("comments", [])
+        if searchable_comment(row, links.get(row.get("comment_id", "")))
+    ]
     categories = json.loads(args.categories.read_text(encoding="utf-8")).get("assignments", {}) if args.categories.is_file() else {}
     enrichments = json.loads(args.enrichment.read_text(encoding="utf-8")).get("entries", {}) if args.enrichment.is_file() else {}
 
     api_key = ""
     client = None
     if not args.metadata_only:
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or getpass.getpass("Gemini API key: ")
+        api_key = gemini_api_key() or getpass.getpass("Gemini API key: ")
         client = GeminiClient(api_key, args.gemini_model)
 
     def display(comment: dict) -> str:
+        if comment.get("text_trust_status") == "verified":
+            return readable_text(verified_text(comment))
         entry = enrichments.get(str(comment["comment_id"]), {})
         return str(entry.get("display_text", "")) if entry.get("input_sha256") == record_digest(comment) else readable_text(str(comment.get("original_text", "")))
 

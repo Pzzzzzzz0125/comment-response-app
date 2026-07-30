@@ -149,11 +149,22 @@ class SourceLocation:
         paragraph = int(paragraph_match.group(1)) if paragraph_match else None
         if not paragraph and file_type in WORD_TYPES and str(row_value).isdigit():
             paragraph = int(row_value)
-        quote = str(record.get("original_text", "") or "")
+        quote = str(
+            record.get("verified_text")
+            if record.get("text_trust_status") == "verified" and record.get("verified_text")
+            else record.get("original_text", "")
+        )
+        structured = record.get("source_locator_json") if isinstance(record.get("source_locator_json"), dict) else {}
+        if not sheet:
+            sheet = str(structured.get("sheet_name", "") or "")
+        structured_paragraph = structured.get("paragraph_index")
+        if file_type in WORD_TYPES and str(structured_paragraph).isdigit():
+            paragraph = int(structured_paragraph)
         metadata = {
             "legacy_location": raw_location,
             "source_row": int(row_value) if str(row_value).isdigit() else None,
             "source_page_end": int(record["source_page_end"]) if str(record.get("source_page_end", "")).isdigit() else None,
+            "comment_number": str(record.get("comment_number", "") or ""),
         }
         if isinstance(record.get("source_locator_json"), dict):
             metadata["structured_locator_json"] = record["source_locator_json"]
@@ -167,7 +178,11 @@ class SourceLocation:
             exact_quote=quote,
             normalized_quote=normalize_quote(quote),
             sheet_name=sheet,
-            cell_range=cell_range or str(record.get("source_cell_range", "") or ""),
+            cell_range=(
+                cell_range
+                or str(record.get("source_cell_range", "") or "")
+                or str(structured.get("cell_range", "") or "")
+            ),
             paragraph_index=paragraph,
             preview_document_id=preview_document_id,
             metadata=metadata,
@@ -325,6 +340,16 @@ REFERENCE_STOPWORDS = {
     "csv", "doc", "docx", "pdf", "version", "xls", "xlsx",
 }
 
+REFERENCE_SYNONYMS = {
+    "geotech": {"soil", "geotechnical"},
+    "geotechnical": {"soil", "geotech"},
+    "soil": {"geotech", "geotechnical"},
+    "calc": {"calculation", "structural"},
+    "calculation": {"calc", "structural"},
+    "foundation": {"footing", "structural"},
+    "footing": {"foundation", "structural"},
+}
+
 
 def reference_tokens(value: str) -> set[str]:
     value = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value or "")
@@ -342,6 +367,7 @@ def reference_tokens(value: str) -> set[str]:
         if word.endswith("e") and len(word) > 5:
             word = word[:-1]
         tokens.add(word)
+        tokens.update(REFERENCE_SYNONYMS.get(word, set()))
     return tokens
 
 
@@ -442,17 +468,33 @@ def _best_pdf_quote(text: str, wanted_tokens: set[str]) -> str:
     return best[:900].strip()
 
 
-def _sheet_pdf_location(path: Path, sheet: str, reference_text: str, pages: list[str]) -> tuple[int, str]:
+def _prepare_pdf_search_pages(
+    pages: list[str],
+) -> list[tuple[str, str, set[str]]]:
+    return [(
+        re.sub(r"[^A-Z0-9]", "", page_text.upper()),
+        re.sub(
+            r"[^A-Z0-9]", "",
+            "\n".join(page_text.splitlines()[-25:]).upper(),
+        ),
+        reference_tokens(page_text),
+    ) for page_text in pages]
+
+
+def _sheet_pdf_location(
+    path: Path,
+    sheet: str,
+    reference_text: str,
+    pages: list[str],
+    prepared_pages: list[tuple[str, str, set[str]]] | None = None,
+) -> tuple[int, str]:
     if not pages:
         return 1, ""
     compact_sheet = re.sub(r"[^A-Z0-9]", "", sheet.upper())
     wanted = reference_tokens(reference_text)
     best_index, best_score = 0, -1
-    for index, page_text in enumerate(pages):
-        compact_page = re.sub(r"[^A-Z0-9]", "", page_text.upper())
-        tail_text = "\n".join(page_text.splitlines()[-25:])
-        compact_tail = re.sub(r"[^A-Z0-9]", "", tail_text.upper())
-        page_tokens = reference_tokens(page_text)
+    searchable_pages = prepared_pages or _prepare_pdf_search_pages(pages)
+    for index, (compact_page, compact_tail, page_tokens) in enumerate(searchable_pages):
         score = (
             (80 if compact_sheet and compact_sheet in compact_tail else 0)
             + (12 if compact_sheet and compact_sheet in compact_page else 0)
@@ -467,7 +509,7 @@ def _postscript_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def _pdf_page_height(path: Path, page_number: int, executable: str) -> float:
+def _pdf_page_size(path: Path, page_number: int, executable: str) -> tuple[float, float]:
     script = f"({_postscript_string(str(path))}) (r) file runpdfbegin {page_number} pdfgetpage /MediaBox get == quit"
     try:
         completed = subprocess.run(
@@ -476,10 +518,53 @@ def _pdf_page_height(path: Path, page_number: int, executable: str) -> float:
         )
         numbers = re.findall(r"-?\d+(?:\.\d+)?", completed.stdout)
         if completed.returncode == 0 and len(numbers) >= 4:
-            return float(numbers[-1]) - float(numbers[-3])
+            left, bottom, right, top = (float(value) for value in numbers[-4:])
+            return max(1.0, right - left), max(1.0, top - bottom)
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
-    return 792.0
+    return 612.0, 792.0
+
+
+def _pdf_page_height(path: Path, page_number: int, executable: str) -> float:
+    return _pdf_page_size(path, page_number, executable)[1]
+
+
+def _normalized_box_to_pdf(width: float, height: float, item: dict[str, Any]) -> list[float]:
+    x_min, y_min = float(item["x_min"]), float(item["y_min"])
+    x_max, y_max = float(item["x_max"]), float(item["y_max"])
+    if not (0 <= x_min < x_max <= 1000 and 0 <= y_min < y_max <= 1000):
+        return []
+    return [
+        round(width * x_min / 1000.0, 3),
+        round(height * (1.0 - y_max / 1000.0), 3),
+        round(width * x_max / 1000.0, 3),
+        round(height * (1.0 - y_min / 1000.0), 3),
+    ]
+
+
+def _normalized_locator_boxes(
+    path: Path, page_number: int, value: Any,
+) -> list[list[float]]:
+    """Convert Gemini's 0-1000 top-left boxes to PDF bottom-left points."""
+    if not isinstance(value, dict) or not isinstance(value.get("bounding_boxes"), list):
+        return []
+    executable = shutil.which("gs")
+    if not executable or page_number < 1:
+        return []
+    width, height = _pdf_page_size(path, page_number, executable)
+    boxes: list[list[float]] = []
+    for item in value["bounding_boxes"]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            if int(item.get("page") or 0) != page_number:
+                continue
+            converted = _normalized_box_to_pdf(width, height, item)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if converted:
+            boxes.append(converted)
+    return boxes
 
 
 def _pdf_page_layout(path: Path, page_number: int) -> tuple[float, list[dict[str, Any]]]:
@@ -722,12 +807,23 @@ class SourceRegistry:
 
         sources: dict[str, dict[str, Any]] = {}
         pdf_page_cache: dict[str, list[str]] = {}
+        pdf_search_cache: dict[str, list[tuple[str, str, set[str]]]] = {}
 
         def pdf_pages(document: dict[str, Any]) -> list[str]:
             document_id = document["document_id"]
             if document_id not in pdf_page_cache:
                 pdf_page_cache[document_id] = _pdf_text_pages(self._path_for_relative(document["relative_path"]))
             return pdf_page_cache[document_id]
+
+        def pdf_search_pages(
+            document: dict[str, Any],
+        ) -> list[tuple[str, str, set[str]]]:
+            document_id = document["document_id"]
+            if document_id not in pdf_search_cache:
+                pdf_search_cache[document_id] = _prepare_pdf_search_pages(
+                    pdf_pages(document)
+                )
+            return pdf_search_cache[document_id]
 
         for collection in ("comments", "responses"):
             for record in dataset.get(collection, []):
@@ -739,6 +835,11 @@ class SourceRegistry:
                     item for item in enrichment.get("secondary_references", [])
                     if isinstance(item, dict) and float(item.get("confidence", 0) or 0) >= 0.55
                 ]
+                record_text = str(
+                    record.get("verified_text")
+                    if record.get("text_trust_status") == "verified" and record.get("verified_text")
+                    else record.get("original_text", "")
+                )
                 raw_paths = [part.strip() for part in re.split(r"\s+\|\s+", str(record.get("source_document", ""))) if part.strip()]
                 for ordinal, relative in enumerate(raw_paths):
                     document_id = path_to_id.get(relative)
@@ -750,7 +851,7 @@ class SourceRegistry:
                     if document["original_document_type"] == "xlsx":
                         cell_range = find_xlsx_cell(
                             self._path_for_relative(relative), str(record.get("source_sheet", "")), row,
-                            str(record.get("original_text", "")),
+                            record_text,
                         )
                     location = SourceLocation.from_record(
                         record, document_id, document["original_document_type"],
@@ -766,7 +867,7 @@ class SourceRegistry:
                         companion = link.get(companion_key, []) if isinstance(link.get(companion_key), list) else []
                         cited_pages = link.get(pages_key, []) if isinstance(link.get(pages_key), list) else []
                         page_number = int(cited_pages[0]) if cited_pages else int(location.page_number or 1)
-                        quote = str(link.get("imported_current_round_comment_text", "")) if role == "comment" else str(record.get("original_text", ""))
+                        quote = record_text
                         location.page_number = page_number
                         location.pdf_bounding_boxes = structured_locator_boxes(locators, page_number, companion)
                         location.exact_quote = quote
@@ -776,6 +877,19 @@ class SourceRegistry:
                             "import_key": link.get("import_key", ""),
                             "structured_locator_json": locators,
                         })
+                    if (
+                        not location.pdf_bounding_boxes
+                        and document["original_document_type"] == "pdf"
+                        and location.page_number
+                    ):
+                        normalized_boxes = _normalized_locator_boxes(
+                            self._path_for_relative(relative),
+                            int(location.page_number),
+                            record.get("source_locator_json"),
+                        )
+                        if normalized_boxes:
+                            location.pdf_bounding_boxes = normalized_boxes
+                            location.metadata["coordinate_source"] = "gemini_normalized_1000"
                     source_id = stable_id("S", f"{owner_id}|{document_id}|primary|{ordinal}")
                     sources[source_id] = {
                         "source_id": source_id,
@@ -784,7 +898,169 @@ class SourceRegistry:
                         "document_id": document_id,
                         "location": location.to_dict(),
                     }
-                display = normalize_quote(str(record.get("original_text", "")))
+                    for locator_index, locator in enumerate(
+                        record.get("additional_source_locators", []) or [],
+                        1,
+                    ):
+                        if not isinstance(locator, dict):
+                            continue
+                        locator_pages = locator.get("pages", [])
+                        if not isinstance(locator_pages, list):
+                            locator_pages = []
+                        locator_quote = str(
+                            locator.get("exact_quote", "")
+                        )
+                        additional_record = {
+                            "original_text": locator_quote,
+                            "verified_text": locator_quote,
+                            "text_trust_status": "verified",
+                            "source_location": (
+                                f"paragraph "
+                                f"{locator.get('paragraph_index', '')}"
+                            ),
+                            "source_row": locator.get(
+                                "paragraph_index", "",
+                            ),
+                            "source_page": (
+                                locator_pages[0]
+                                if locator_pages else ""
+                            ),
+                            "source_page_end": (
+                                locator_pages[-1]
+                                if locator_pages else ""
+                            ),
+                            "source_locator_json": locator,
+                            "extraction_method": record.get(
+                                "extraction_method", "",
+                            ),
+                        }
+                        additional_location = SourceLocation.from_record(
+                            additional_record,
+                            document_id,
+                            document["original_document_type"],
+                            document.get("preview_document_id"),
+                        )
+                        additional_location.metadata[
+                            "additional_source_ordinal"
+                        ] = locator_index
+                        additional_source_id = stable_id(
+                            "S",
+                            f"{owner_id}|{document_id}|additional|"
+                            f"{ordinal}|{locator_index}",
+                        )
+                        sources[additional_source_id] = {
+                            "source_id": additional_source_id,
+                            "owner_id": owner_id,
+                            "relation": (
+                                "Additional source location"
+                            ),
+                            "document_id": document_id,
+                            "location": additional_location.to_dict(),
+                        }
+                if collection == "comments":
+                    for event_index, event in enumerate(
+                        record.get("issue_thread_events", []) or [], 1,
+                    ):
+                        if not isinstance(event, dict):
+                            continue
+                        relative = str(
+                            event.get("source_document", "")
+                            or (raw_paths[0] if raw_paths else "")
+                        )
+                        document_id = path_to_id.get(relative)
+                        locator = (
+                            event.get("source_locator_json")
+                            if isinstance(
+                                event.get("source_locator_json"), dict,
+                            )
+                            else {}
+                        )
+                        exact_text = str(event.get("exact_text", ""))
+                        if not document_id or not exact_text.strip():
+                            continue
+                        document = documents[document_id]
+                        event_pages = locator.get("pages", [])
+                        if not isinstance(event_pages, list):
+                            event_pages = []
+                        paragraph_index = locator.get(
+                            "paragraph_index", "",
+                        )
+                        source_location = (
+                            f"sheet {locator.get('sheet_name', '')} · "
+                            f"cell {locator.get('cell_range', '')}"
+                            if locator.get("sheet_name")
+                            and locator.get("cell_range")
+                            else f"paragraph {paragraph_index}"
+                            if str(paragraph_index).isdigit()
+                            else f"page {event_pages[0]}"
+                            if event_pages else "issue history evidence"
+                        )
+                        event_record = {
+                            "original_text": exact_text,
+                            "verified_text": exact_text,
+                            "text_trust_status": "verified",
+                            "source_location": source_location,
+                            "source_sheet": locator.get("sheet_name", ""),
+                            "source_row": locator.get(
+                                "row_number", paragraph_index,
+                            ),
+                            "source_page": (
+                                event_pages[0] if event_pages else ""
+                            ),
+                            "source_page_end": (
+                                event_pages[-1] if event_pages else ""
+                            ),
+                            "source_bounding_boxes": locator.get(
+                                "bounding_boxes", [],
+                            ),
+                            "source_cell_range": locator.get(
+                                "cell_range", "",
+                            ),
+                            "source_locator_json": locator,
+                            "extraction_method": record.get(
+                                "extraction_method", "",
+                            ),
+                        }
+                        location = SourceLocation.from_record(
+                            event_record,
+                            document_id,
+                            document["original_document_type"],
+                            document.get("preview_document_id"),
+                        )
+                        event_id = str(
+                            event.get("event_id")
+                            or f"discussion-{event_index}"
+                        )
+                        location.metadata.update({
+                            "issue_thread_id": str(
+                                record.get("issue_thread_id", "")
+                            ),
+                            "issue_event_id": event_id,
+                            "issue_event_type": str(
+                                event.get("event_type", "")
+                            ),
+                        })
+                        source_id = stable_id(
+                            "S",
+                            f"{owner_id}|{document_id}|discussion|{event_id}",
+                        )
+                        relation = (
+                            "Reviewer follow-up"
+                            if event.get("event_type")
+                            == "reviewer_follow_up"
+                            else "Prior applicant response"
+                            if event.get("event_type")
+                            == "applicant_response"
+                            else "Discussion history"
+                        )
+                        sources[source_id] = {
+                            "source_id": source_id,
+                            "owner_id": owner_id,
+                            "relation": relation,
+                            "document_id": document_id,
+                            "location": location.to_dict(),
+                        }
+                display = normalize_quote(record_text)
                 current_ids = {path_to_id.get(path) for path in raw_paths}
 
                 def add_reference(candidate: str, relation: str, location: SourceLocation) -> None:
@@ -929,8 +1205,9 @@ class SourceRegistry:
                     if sheet in ai_sheet_queries:
                         compact_sheet = re.sub(r"[^A-Z0-9]", "", sheet.upper())
                         sheet_verified = any(
-                            compact_sheet in re.sub(r"[^A-Z0-9]", "", page.upper())
-                            for page in candidate_pages
+                            compact_sheet in compact_page
+                            for compact_page, _compact_tail, _tokens
+                            in pdf_search_pages(document)
                         )
                         if not sheet_verified:
                             continue
@@ -939,6 +1216,7 @@ class SourceRegistry:
                         sheet,
                         ai_sheet_queries.get(sheet) or reference_text,
                         candidate_pages,
+                        pdf_search_pages(document),
                     )
                     location = SourceLocation(
                         document_id=candidate,
@@ -965,7 +1243,11 @@ class SourceRegistry:
             document = documents[source["document_id"]]
             page_number = int(location.get("page_number") or 0)
             quote = str(location.get("exact_quote", ""))
-            if location.get("pdf_bounding_boxes") and location.get("metadata", {}).get("coordinate_source") == "document_structure_rematch":
+            if (
+                location.get("pdf_bounding_boxes")
+                and location.get("metadata", {}).get("coordinate_source")
+                in {"document_structure_rematch", "gemini_normalized_1000"}
+            ):
                 coordinate_sources += 1
                 continue
             if document["original_document_type"] != "pdf" or page_number < 1 or not quote:
@@ -1042,7 +1324,6 @@ class SourceRegistry:
             "document": document,
             "location": location,
             "preview_url": f"/api/documents/{location.get('preview_document_id') or document['document_id']}/preview",
-            "original_download_url": f"/api/documents/{document['document_id']}/original",
             "spreadsheet_url": f"/api/documents/{document['document_id']}/spreadsheet",
         }
 

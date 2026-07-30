@@ -35,25 +35,32 @@ from corpus_audit import audit_corpus as audit
 COMMENT_FIELDS = [
     "comment_id", "city", "property_project", "review_round", "discipline",
     "reviewer", "reviewer_context", "comment_number", "original_text",
+    "normalized_comment_text",
     "source_document", "source_sha256", "source_sheet", "source_row",
-    "source_page", "source_page_end", "source_location", "extraction_method",
+    "source_page", "source_page_end", "source_location", "source_locator_json", "extraction_method",
     "extraction_confidence", "source_cycle", "source_status", "response_id", "match_status",
-    "human_review_status",
+    "human_review_status", "verification_status", "text_trust_status",
+    "search_eligible", "ingestion_pipeline_version",
 ]
 RESPONSE_FIELDS = [
     "response_id", "comment_id", "original_text", "source_document",
     "source_sha256", "source_sheet", "source_row", "source_page",
-    "source_location", "extraction_method", "extraction_confidence",
-    "human_review_status",
+    "source_location", "source_locator_json", "extraction_method", "extraction_confidence",
+    "human_review_status", "verification_status", "text_trust_status",
+    "search_eligible", "ingestion_pipeline_version",
 ]
 LINK_FIELDS = [
     "link_id", "comment_id", "response_id", "match_status", "matching_method",
     "match_confidence", "review_status", "source_document", "source_location",
+    "comment_locator_json", "response_locator_json", "verification_status", "provenance",
 ]
 SOURCE_FIELDS = [
     "city", "property_project", "review_round", "source_document",
     "source_type", "comment_count", "response_count", "matched_count",
-    "unmatched_count", "extraction_method", "processing_error",
+    "unmatched_count", "extraction_method", "processing_error", "processing_status",
+    "opened", "pages_screened", "pages_fully_analyzed",
+    "additional_markup_detected", "verification_result",
+    "ingestion_pipeline_version", "source_sha256",
 ]
 REVIEW_FIELDS = [
     "item_type", "item_id", "reason", "source_document", "source_location",

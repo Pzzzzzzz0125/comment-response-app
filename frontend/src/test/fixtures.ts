@@ -1,0 +1,32 @@
+import type { CommentRecord } from "@/types"
+
+export const commentFixture: CommentRecord = {
+  comment_id: "comment-1",
+  city: "San Jose",
+  property_project: "123 Main Street",
+  review_round: "PC3",
+  discipline: "Planning",
+  comment_type: "technical",
+  reviewer: "City reviewer",
+  comment_number: "12",
+  original_text: "Protect the existing street tree during construction.",
+  display_text: "Protect the existing street tree during construction.",
+  source_filename: "City Comments.pdf",
+  source_location: "page 4",
+  extraction_method: "visual_verified",
+  extraction_confidence: 1,
+  match_status: "matched",
+  human_review_status: "confirmed",
+  category: "Tree protection",
+  sources: [{ source_id: "source-comment", relation: "Primary source", filename: "City Comments.pdf" }],
+  response: {
+    response_id: "response-1",
+    original_text: "Tree protection notes were added to sheet L1.0.",
+    display_text: "Tree protection notes were added to sheet L1.0.",
+    source_filename: "Response Letter.pdf",
+    source_location: "page 3",
+    human_review_status: "confirmed",
+    sources: [{ source_id: "source-response", relation: "Primary source", filename: "Response Letter.pdf" }],
+  },
+  link: { link_id: "link-1", match_confidence: 1, matching_method: "same_pdf_form_row", review_status: "confirmed" },
+}

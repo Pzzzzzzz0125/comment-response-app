@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import html
 import json
 import math
 import mimetypes
@@ -25,10 +26,20 @@ try:
     from .source_registry import SourceRegistry
     from .gemini_enrich import GeminiClient, record_digest
     from .rag_search import SearchIndex, normalize_analysis
+    from .knowledge_chat import KnowledgeChat
+    from .data_trust import searchable_comment, verified_text
+    from .comment_dedup import find_duplicate_comments
+    from .document_identity import canonicalize_documents, topic_occurrence_key, topic_occurrence_allowed
+    from .local_secrets import gemini_api_key
 except ImportError:  # Direct `python3 web_app/server.py` execution.
     from source_registry import SourceRegistry
     from gemini_enrich import GeminiClient, record_digest
     from rag_search import SearchIndex, normalize_analysis
+    from knowledge_chat import KnowledgeChat
+    from data_trust import searchable_comment, verified_text
+    from comment_dedup import find_duplicate_comments
+    from document_identity import canonicalize_documents, topic_occurrence_key, topic_occurrence_allowed
+    from local_secrets import gemini_api_key
 
 
 STOP_WORDS = {
@@ -63,11 +74,17 @@ TOPIC_STOP_WORDS = STOP_WORDS | {
 
 def readable_text(text: str) -> str:
     """Return display-friendly text without changing the immutable source value."""
-    value = unicodedata.normalize("NFKC", text or "")
+    value = html.unescape(unicodedata.normalize("NFKC", text or ""))
     value = value.replace("_x000D_", " ").replace("_x000A_", " ")
     value = value.replace("\r", " ").replace("\n", " ").replace("\t", " ")
     value = value.replace("\u00a0", " ")
     value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(
+        r"^(?:response\s*[_:-]\s*)+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
     value = re.sub(r"\s+([,.;:!?])", r"\1", value)
     return value
 
@@ -140,19 +157,28 @@ class DatasetStore:
         search_index_path: Path | None = None,
         document_authorizer: Any = None,
         gemini_client: GeminiClient | None = None,
+        knowledge_gemini_client: GeminiClient | None = None,
         link_reviews_path: Path | None = None,
+        workbook_reviews_path: Path | None = None,
     ):
         self.dataset_path = dataset_path.resolve()
         self.categories_path = categories_path.resolve()
         self.source_root = source_root.resolve()
         self.enrichment_path = (enrichment_path or self.categories_path.parent / "gemini_enrichment.json").resolve()
         self.link_reviews_path = (link_reviews_path or self.categories_path.parent / "link_review_decisions.json").resolve()
+        self.workbook_reviews_path = (
+            workbook_reviews_path
+            or self.categories_path.parent / "workbook_review_decisions.json"
+        ).resolve()
         self.gemini_client = gemini_client
+        self.knowledge_gemini_client = knowledge_gemini_client
         self.search_index = SearchIndex(search_index_path or self.categories_path.parent / "search_index.json")
         self._search_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._lock = threading.RLock()
         self._dataset_mtime_ns = -1
         self._comments: list[dict[str, Any]] = []
+        self._all_comments: list[dict[str, Any]] = []
+        self._document_identity: dict[str, Any] = {}
         self._comments_by_id: dict[str, dict[str, Any]] = {}
         self._responses_by_id: dict[str, dict[str, Any]] = {}
         self._links_by_comment: dict[str, dict[str, Any]] = {}
@@ -160,6 +186,7 @@ class DatasetStore:
         self._analysis_cache: dict[str, dict[str, Any]] = {}
         self._enrichment_entries: dict[str, dict[str, Any]] = {}
         self._link_review_decisions: dict[str, dict[str, Any]] = {}
+        self._workbook_review_decisions: dict[str, dict[str, Any]] = {}
         self.source_registry = SourceRegistry(
             self.dataset_path,
             self.source_root,
@@ -171,7 +198,9 @@ class DatasetStore:
         self._load_categories()
         self._load_enrichment()
         self._load_link_reviews()
+        self._load_workbook_reviews()
         self._sync_search_index()
+        self.knowledge_chat = KnowledgeChat(self)
 
     def _load_link_reviews(self) -> None:
         with self._lock:
@@ -199,6 +228,43 @@ class DatasetStore:
             temporary = Path(stream.name)
         os.replace(temporary, self.link_reviews_path)
 
+    def _load_workbook_reviews(self) -> None:
+        with self._lock:
+            if not self.workbook_reviews_path.is_file():
+                self._workbook_review_decisions = {}
+                return
+            payload = json.loads(
+                self.workbook_reviews_path.read_text(encoding="utf-8")
+            )
+            decisions = payload.get("decisions", {})
+            self._workbook_review_decisions = {
+                str(source): value
+                for source, value in decisions.items()
+                if isinstance(value, dict)
+                and value.get("decision") in {"confirmed", "needs_followup"}
+            } if isinstance(decisions, dict) else {}
+
+    def _save_workbook_reviews(self) -> None:
+        self.workbook_reviews_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": "1.0",
+            "decisions": dict(sorted(self._workbook_review_decisions.items())),
+        }
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=self.workbook_reviews_path.parent,
+            prefix="workbook-reviews-",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            json.dump(
+                payload, stream, ensure_ascii=False, indent=2, sort_keys=True,
+            )
+            stream.write("\n")
+            temporary = Path(stream.name)
+        os.replace(temporary, self.workbook_reviews_path)
+
     def _effective_link_status(self, link: dict[str, Any]) -> str:
         decision = self._link_review_decisions.get(str(link.get("link_id", "")), {})
         return str(decision.get("decision") or link.get("review_status", "not_applicable"))
@@ -206,7 +272,9 @@ class DatasetStore:
     def _sync_search_index(self) -> dict[str, int]:
         return self.search_index.sync(
             self._comments,
-            lambda row: self._enrichment_for(str(row["comment_id"]), row).get("display_text") or readable_text(row.get("original_text", "")),
+            lambda row: readable_text(verified_text(row)) if row.get("text_trust_status") == "verified" else (
+                self._enrichment_for(str(row["comment_id"]), row).get("display_text") or readable_text(row.get("original_text", ""))
+            ),
             lambda comment_id: self._assignments.get(comment_id, "Uncategorized"),
             lambda comment_id: (
                 self._effective_link_status(self._links_by_comment.get(comment_id, {})) == "confirmed"
@@ -226,10 +294,21 @@ class DatasetStore:
             comment_ids = [row["comment_id"] for row in comments]
             if len(comment_ids) != len(set(comment_ids)):
                 raise ValueError("Dataset contains duplicate comment IDs")
-            self._comments = comments
-            self._comments_by_id = {row["comment_id"]: row for row in comments}
+            links_by_comment = {row["comment_id"]: row for row in links}
+            self._all_comments = comments
+            # Annotate physical files and extracted rows before any runtime
+            # search/topic deduplication.  This is deliberately in-memory so
+            # opening the app never mutates the production dataset; the
+            # canonicalize_documents CLI persists the same registry during
+            # ingestion or an explicit repair.
+            self._document_identity = canonicalize_documents(comments)
+            searchable = [row for row in comments if searchable_comment(row, links_by_comment.get(row["comment_id"]))]
+            # Runtime guard: ingestion mistakes must never create repeated list,
+            # summary, search-index, or knowledge-chat evidence.
+            self._comments, self._duplicate_comments = find_duplicate_comments(searchable, links)
+            self._comments_by_id = {row["comment_id"]: row for row in self._comments}
             self._responses_by_id = {row["response_id"]: row for row in responses}
-            self._links_by_comment = {row["comment_id"]: row for row in links}
+            self._links_by_comment = links_by_comment
             self._dataset_mtime_ns = stat.st_mtime_ns
             self._analysis_cache = {}
 
@@ -316,23 +395,117 @@ class DatasetStore:
         link = self._links_by_comment.get(comment_id, {})
         comment_enrichment = self._enrichment_for(comment_id, comment)
         response_enrichment = self._enrichment_for(response_id, response) if response else {}
+        comment_text = verified_text(comment)
+        response_text = verified_text(response) if response else ""
+        comment_sources = self._source_references(comment_id, comment_text)
+        response_sources = (
+            self._source_references(response["response_id"], response_text)
+            if response else []
+        )
+        primary_comment_source = next((
+            source for source in comment_sources
+            if source.get("relation") == "Primary source"
+        ), None)
+        primary_response_source = next((
+            source for source in response_sources
+            if source.get("relation") == "Primary source"
+        ), None)
+        event_sources = {
+            str(
+                ((source.get("location") or {}).get("metadata") or {}).get(
+                    "issue_event_id", ""
+                )
+            ): source
+            for source in comment_sources
+            if isinstance(source.get("location"), dict)
+        }
+        discussion_events = [
+            event for event in comment.get("issue_thread_events", []) or []
+            if isinstance(event, dict) and str(
+                event.get("exact_text", "")
+            ).strip()
+        ]
+        discussion_events.sort(key=lambda event: (
+            0 if event.get("occurred_at") else 1,
+            str(event.get("occurred_at", "")),
+            int(event.get("source_order") or 0),
+        ))
+        timeline_events: list[dict[str, Any]] = [{
+            "event_id": f"{comment_id}-government-comment",
+            "event_type": "government_comment",
+            "actor_role": "government",
+            "actor": str(comment.get("reviewer", "")),
+            "occurred_at": "",
+            "occurred_at_label": "",
+            "label": "Government comment",
+            "text": readable_text(comment_text),
+            "review_round": str(comment.get("review_round", "")),
+            "source": primary_comment_source,
+        }]
+        for event in discussion_events:
+            event_type = str(event.get("event_type", "discussion_note"))
+            timeline_events.append({
+                "event_id": str(event.get("event_id", "")),
+                "event_type": event_type,
+                "actor_role": str(event.get("actor_role", "unknown")),
+                "actor": str(event.get("actor", "")),
+                "occurred_at": str(event.get("occurred_at", "")),
+                "occurred_at_label": str(
+                    event.get("occurred_at_label", "")
+                ),
+                "label": (
+                    "Reviewer follow-up"
+                    if event_type == "reviewer_follow_up"
+                    else "Applicant response"
+                    if event_type == "applicant_response"
+                    else "Discussion note"
+                ),
+                "text": readable_text(event.get("exact_text", "")),
+                "review_round": str(
+                    event.get("review_round")
+                    or comment.get("review_round", "")
+                ),
+                "source": event_sources.get(
+                    str(event.get("event_id", ""))
+                ),
+            })
+        if response:
+            timeline_events.append({
+                "event_id": f"{response_id}-current-response",
+                "event_type": "current_applicant_response",
+                "actor_role": "company",
+                "actor": "",
+                "occurred_at": "",
+                "occurred_at_label": "",
+                "label": (
+                    "Current applicant response"
+                    if discussion_events else "Company response"
+                ),
+                "text": readable_text(response_text),
+                "review_round": str(
+                    response.get("response_letter_round")
+                    or comment.get("review_round", "")
+                ),
+                "source": primary_response_source,
+            })
         return {
             "comment_id": comment_id,
+            "source_file_id": comment.get("source_file_id", ""),
+            "canonical_document_id": comment.get("canonical_document_id", ""),
+            "canonical_comment_id": comment.get("canonical_comment_id", ""),
+            "occurrence_type": comment.get("occurrence_type", "newly_issued"),
             "city": comment.get("city", "unknown"),
             "property_project": comment.get("property_project", "unknown"),
             "review_round": comment.get("review_round", "unknown"),
             "discipline": comment.get("discipline", "unknown"),
-            "comment_type": classify_comment(comment.get("original_text", ""), comment.get("discipline", "")),
+            "comment_type": classify_comment(comment_text, comment.get("discipline", "")),
             "reviewer": comment.get("reviewer", ""),
             "comment_number": comment.get("comment_number", ""),
-            "original_text": comment.get("original_text", ""),
-            "display_text": comment_enrichment.get("display_text") or readable_text(comment.get("original_text", "")),
+            "original_text": comment_text,
+            "display_text": readable_text(comment_text) if comment.get("text_trust_status") == "verified" else (comment_enrichment.get("display_text") or readable_text(comment_text)),
             "display_blocks": comment_enrichment.get("blocks", []),
             "source_filename": compact_path(comment.get("source_document", "")),
-            "sources": self._source_references(
-                comment_id,
-                comment.get("original_text", ""),
-            ),
+            "sources": comment_sources,
             "source_location": comment.get("source_location", "unknown"),
             "extraction_method": comment.get("extraction_method", ""),
             "extraction_confidence": comment.get("extraction_confidence", ""),
@@ -341,14 +514,11 @@ class DatasetStore:
             "category": self._assignments.get(comment_id, "Uncategorized"),
             "response": ({
                 "response_id": response["response_id"],
-                "original_text": response.get("original_text", ""),
-                "display_text": response_enrichment.get("display_text") or readable_text(response.get("original_text", "")),
+                "original_text": response_text,
+                "display_text": readable_text(response_text) if response.get("text_trust_status") == "verified" else (response_enrichment.get("display_text") or readable_text(response_text)),
                 "display_blocks": response_enrichment.get("blocks", []),
                 "source_filename": compact_path(response.get("source_document", "")),
-                "sources": self._source_references(
-                    response["response_id"],
-                    response.get("original_text", ""),
-                ),
+                "sources": response_sources,
                 "source_location": response.get("source_location", "unknown"),
                 "human_review_status": response.get("human_review_status", "pending"),
             } if response else None),
@@ -357,6 +527,22 @@ class DatasetStore:
                 "match_confidence": link.get("match_confidence", ""),
                 "matching_method": link.get("matching_method", ""),
                 "review_status": self._effective_link_status(link),
+            },
+            "issue_thread": {
+                "thread_id": str(
+                    comment.get("issue_thread_id", comment_id)
+                ),
+                "grouping_status": str(
+                    comment.get("issue_grouping_status", "single_record")
+                ),
+                "grouping_method": str(
+                    comment.get(
+                        "issue_grouping_method", "single_source_record",
+                    )
+                ),
+                "status": str(comment.get("issue_status", "")),
+                "event_count": len(timeline_events),
+                "events": timeline_events,
             },
         }
 
@@ -434,6 +620,367 @@ class DatasetStore:
             self._sync_search_index()
         return {"link_id": link_id, "decision": decision or str(link.get("review_status", "suggested"))}
 
+    def _structured_workbook_groups(
+        self,
+    ) -> dict[str, list[dict[str, Any]]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for comment in self._all_comments:
+            if (
+                comment.get("extraction_method")
+                != "local_structured_spreadsheet"
+            ):
+                continue
+            link = self._links_by_comment.get(
+                str(comment.get("comment_id", "")), {},
+            )
+            if (
+                link.get("provenance")
+                != "local_structured_gemini_verified"
+            ):
+                continue
+            source = str(comment.get("source_document", "")).strip()
+            if (
+                not source
+                or Path(source).suffix.casefold() not in {".xlsx", ".csv"}
+            ):
+                continue
+            groups.setdefault(source, []).append(comment)
+        return groups
+
+    def _workbook_completeness(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        artifact_ids = {
+            str(
+                (row.get("ingestion_audit") or {}).get("artifact_id", "")
+            )
+            for row in rows
+            if isinstance(row.get("ingestion_audit"), dict)
+        }
+        if len(artifact_ids) != 1 or not next(iter(artifact_ids), ""):
+            return {
+                "can_confirm": False,
+                "reason": "Rows do not share one ingestion artifact",
+            }
+        artifact_id = next(iter(artifact_ids))
+        manifest_path = (
+            self.dataset_path.parent
+            / "ingestion_artifacts"
+            / artifact_id
+            / "completeness_manifest.json"
+        )
+        if not manifest_path.is_file():
+            return {
+                "can_confirm": False,
+                "reason": "Structured completeness manifest is missing",
+            }
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {
+                "can_confirm": False,
+                "reason": "Structured completeness manifest is unreadable",
+            }
+        expected = int(manifest.get("candidate_comment_count") or 0)
+        unresolved = int(manifest.get("unresolved_signal_count") or 0)
+        can_confirm = (
+            manifest.get("completion_status") == "complete"
+            and manifest.get("requires_visual") is not True
+            and unresolved == 0
+            and expected == len(rows)
+            and not manifest.get("duplicate_unit_ids")
+            and not manifest.get("unassigned_unit_ids")
+        )
+        return {
+            "can_confirm": can_confirm,
+            "reason": (
+                ""
+                if can_confirm
+                else "Local completeness checks did not pass"
+            ),
+            "artifact_id": artifact_id,
+            "expected_comments": expected,
+            "unresolved_signals": unresolved,
+            "requires_visual": bool(manifest.get("requires_visual")),
+        }
+
+    def workbook_review_queue(
+        self,
+        status: str = "pending",
+        city: str = "",
+        summary_only: bool = False,
+    ) -> dict[str, Any]:
+        self.reload()
+        if status not in {
+            "pending", "confirmed", "needs_followup", "all",
+        }:
+            raise ValueError("Unknown workbook-review status")
+        items: list[dict[str, Any]] = []
+        for source, rows in self._structured_workbook_groups().items():
+            rows.sort(key=lambda row: (
+                int(row.get("source_row") or 0),
+                str(row.get("comment_id", "")),
+            ))
+            if city and rows[0].get("city") != city:
+                continue
+            links = [
+                self._links_by_comment.get(
+                    str(row.get("comment_id", "")), {},
+                )
+                for row in rows
+            ]
+            dataset_confirmed = all(
+                row.get("search_eligible") is True
+                and row.get("text_trust_status") == "verified"
+                for row in rows
+            ) and all(
+                link.get("review_status") in {
+                    "confirmed", "not_required",
+                }
+                for link in links
+            )
+            decision = self._workbook_review_decisions.get(source, {})
+            effective = (
+                "confirmed"
+                if dataset_confirmed
+                else "needs_followup"
+                if decision.get("decision") == "needs_followup"
+                else "pending"
+            )
+            completeness = self._workbook_completeness(rows)
+            row_views = [self._view_comment(row) for row in rows]
+            first_source = next((
+                reference
+                for view in row_views
+                for reference in view.get("sources", [])
+                if reference.get("kind") == "local"
+            ), None)
+            comment_columns = sorted({
+                re.sub(
+                    r"\d.*$", "",
+                    str(row.get("source_cell_range", "")),
+                )
+                for row in rows
+                if str(row.get("source_cell_range", ""))
+            })
+            response_columns = sorted({
+                re.sub(
+                    r"\d.*$", "",
+                    str(
+                        self._responses_by_id.get(
+                            str(row.get("response_id", "")), {},
+                        ).get("source_cell_range", "")
+                    ),
+                )
+                for row in rows
+                if str(row.get("response_id", ""))
+            } - {""})
+            items.append({
+                "source_document": source,
+                "filename": Path(source).name,
+                "status": effective,
+                "note": str(decision.get("note", "")),
+                "updated_at": decision.get("updated_at"),
+                "city": str(rows[0].get("city", "")),
+                "property_project": str(
+                    rows[0].get("property_project", "")
+                ),
+                "review_rounds": sorted({
+                    str(row.get("review_round", "")) for row in rows
+                }),
+                "comment_count": len(rows),
+                "response_count": sum(
+                    bool(row.get("response_id")) for row in rows
+                ),
+                "comment_columns": comment_columns,
+                "response_columns": response_columns,
+                "source": first_source,
+                "rows": row_views if not summary_only else [],
+                "structural_checks": completeness,
+            })
+        items.sort(key=lambda item: (
+            item["city"], item["property_project"], item["filename"],
+        ))
+        counts = Counter(item["status"] for item in items)
+        total = len(items)
+        visible_items = (
+            items
+            if status == "all"
+            else [item for item in items if item["status"] == status]
+        )
+        return {
+            "items": [] if summary_only else visible_items,
+            "counts": {
+                "total": total,
+                "pending": counts["pending"],
+                "confirmed": counts["confirmed"],
+                "needs_followup": counts["needs_followup"],
+            },
+        }
+
+    def set_workbook_review(
+        self,
+        source_document: str,
+        decision: str,
+        note: str = "",
+    ) -> dict[str, Any]:
+        source_document = source_document.strip()
+        decision = decision.strip().casefold()
+        note = re.sub(r"\s+", " ", note).strip()
+        if decision not in {"confirmed", "needs_followup"}:
+            raise ValueError(
+                "Decision must be confirmed or needs_followup"
+            )
+        if len(note) > 500:
+            raise ValueError(
+                "Workbook review note must be 500 characters or fewer"
+            )
+        groups = self._structured_workbook_groups()
+        rows = groups.get(source_document)
+        if not rows:
+            raise ValueError("Unknown structured workbook")
+        completeness = self._workbook_completeness(rows)
+        if decision == "confirmed" and not completeness["can_confirm"]:
+            raise ValueError(
+                str(completeness.get("reason"))
+                or "Workbook did not pass local completeness checks"
+            )
+        now = int(time.time())
+        with self._lock:
+            data = json.loads(
+                self.dataset_path.read_text(encoding="utf-8")
+            )
+            target_ids = {
+                str(row.get("comment_id", "")) for row in rows
+            }
+            if decision == "confirmed":
+                comments_by_id = {
+                    str(row.get("comment_id", "")): row
+                    for row in data.get("comments", [])
+                }
+                responses_by_id = {
+                    str(row.get("response_id", "")): row
+                    for row in data.get("responses", [])
+                }
+                links_by_comment = {
+                    str(row.get("comment_id", "")): row
+                    for row in data.get("comment_response_links", [])
+                }
+                if not target_ids.issubset(comments_by_id):
+                    raise RuntimeError(
+                        "Dataset changed during workbook review; reload and retry"
+                    )
+                for comment_id in target_ids:
+                    comment = comments_by_id[comment_id]
+                    link = links_by_comment.get(comment_id, {})
+                    if (
+                        comment.get("source_document") != source_document
+                        or comment.get("extraction_method")
+                        != "local_structured_spreadsheet"
+                        or link.get("provenance")
+                        != "local_structured_gemini_verified"
+                    ):
+                        raise RuntimeError(
+                            "Workbook rows changed during review; reload and retry"
+                        )
+                    comment.update({
+                        "verified_text": str(
+                            comment.get("original_text", "")
+                        ),
+                        "source_status": "confirmed",
+                        "human_review_status": "confirmed",
+                        "verification_status": "confirmed",
+                        "text_trust_status": "verified",
+                        "search_eligible": True,
+                        "extraction_confidence": 1.0,
+                    })
+                    audit_payload = comment.setdefault(
+                        "ingestion_audit", {},
+                    )
+                    if isinstance(audit_payload, dict):
+                        audit_payload["human_workbook_verification"] = {
+                            "decision": "confirmed",
+                            "note": note,
+                            "updated_at": now,
+                            "artifact_id": completeness.get(
+                                "artifact_id", ""
+                            ),
+                        }
+                    response_id = str(comment.get("response_id", ""))
+                    response = responses_by_id.get(response_id)
+                    if response:
+                        response.update({
+                            "verified_text": str(
+                                response.get("original_text", "")
+                            ),
+                            "human_review_status": "confirmed",
+                            "verification_status": "confirmed",
+                            "text_trust_status": "verified",
+                            "search_eligible": True,
+                            "extraction_confidence": 1.0,
+                        })
+                        response_audit = response.setdefault(
+                            "ingestion_audit", {},
+                        )
+                        if isinstance(response_audit, dict):
+                            response_audit[
+                                "human_workbook_verification"
+                            ] = {
+                                "decision": "confirmed",
+                                "note": note,
+                                "updated_at": now,
+                            }
+                    link.update({
+                        "review_status": (
+                            "confirmed" if response else "not_required"
+                        ),
+                        "verification_status": "confirmed",
+                        "match_confidence": 1.0 if response else 0.0,
+                    })
+                    link_audit = link.setdefault("ingestion_audit", {})
+                    if isinstance(link_audit, dict):
+                        link_audit["human_workbook_verification"] = {
+                            "decision": "confirmed",
+                            "note": note,
+                            "updated_at": now,
+                        }
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    encoding="utf-8",
+                    dir=self.dataset_path.parent,
+                    prefix="dataset-workbook-review-",
+                    suffix=".tmp",
+                    delete=False,
+                ) as stream:
+                    json.dump(
+                        data,
+                        stream,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    stream.write("\n")
+                    temporary = Path(stream.name)
+                os.replace(temporary, self.dataset_path)
+            self._workbook_review_decisions[source_document] = {
+                "decision": decision,
+                "note": note,
+                "updated_at": now,
+                "comment_count": len(rows),
+                "artifact_id": completeness.get("artifact_id", ""),
+            }
+            self._save_workbook_reviews()
+            self.reload(force=True)
+            self._load_link_reviews()
+            self._sync_search_index()
+            self._search_cache.clear()
+        return {
+            "source_document": source_document,
+            "decision": decision,
+            "updated": len(rows) if decision == "confirmed" else 0,
+        }
+
     def _source_references(self, owner_id: str, text: str) -> list[dict[str, Any]]:
         references: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -459,9 +1006,23 @@ class DatasetStore:
         return references
 
     def _common_topics(self, comments: list[dict[str, Any]], limit: int = 6) -> tuple[int, list[dict[str, Any]]]:
-        count = len(comments)
+        # A topic occurrence is one logical comment in one canonical document,
+        # never one physical filename or one extraction row.  Legacy rows that
+        # have not been canonicalized use their comment id as a safe fallback.
+        occurrence_rows: list[dict[str, Any]] = []
+        seen_occurrences: set[tuple[str, str]] = set()
+        for row in comments:
+            if not topic_occurrence_allowed(row):
+                continue
+            key = topic_occurrence_key(row)
+            if key in seen_occurrences:
+                continue
+            seen_occurrences.add(key)
+            occurrence_rows.append(row)
+
+        count = len(occurrence_rows)
         parents = list(range(count))
-        tokenized = [topic_tokens(row.get("original_text", "")) for row in comments]
+        tokenized = [topic_tokens(verified_text(row)) for row in occurrence_rows]
         signatures = [" ".join(tokens) for tokens in tokenized]
 
         def find(index: int) -> int:
@@ -496,13 +1057,29 @@ class DatasetStore:
             if len(indexes) < 2:
                 continue
             representative_index = max(indexes, key=lambda item: (len(tokenized[item]), -item))
-            representative = comments[representative_index]
+            representative = occurrence_rows[representative_index]
+            document_ids = {
+                str(occurrence_rows[item].get("canonical_document_id") or topic_occurrence_key(occurrence_rows[item])[0])
+                for item in indexes
+            }
+            # A topic is common only across independent logical documents.  A
+            # repeated row or a renamed/re-exported source is one occurrence.
+            if len(document_ids) < 2:
+                continue
+            document_registry = getattr(self, "_document_identity", {}).get("canonical_documents", {}) if self is not None else {}
+            duplicate_files_excluded = sum(
+                max(0, int(document_registry.get(document_id, {}).get("duplicate_group_size", 1)) - 1)
+                for document_id in document_ids
+            )
             common.append({
-                "label": topic_label(representative.get("original_text", "")),
+                "label": topic_label(verified_text(representative)),
                 "occurrences": len(indexes),
-                "projects": len({comments[item].get("property_project", "") for item in indexes}),
-                "rounds": len({(comments[item].get("property_project", ""), comments[item].get("review_round", "")) for item in indexes}),
-                "comment_ids": [comments[item]["comment_id"] for item in indexes],
+                "independent_source_documents": len(document_ids),
+                "physical_duplicate_files_excluded": duplicate_files_excluded,
+                "projects": len({occurrence_rows[item].get("property_project", "") for item in indexes}),
+                "rounds": len({(occurrence_rows[item].get("property_project", ""), occurrence_rows[item].get("review_round", "")) for item in indexes}),
+                "cities": len({occurrence_rows[item].get("city", "") for item in indexes}),
+                "comment_ids": [occurrence_rows[item]["comment_id"] for item in indexes],
             })
         common.sort(key=lambda row: (-row["occurrences"], row["label"].casefold()))
         return len(groups), common[:limit]
@@ -511,8 +1088,8 @@ class DatasetStore:
         if city in self._analysis_cache:
             return self._analysis_cache[city]
         comments = [row for row in self._comments if row.get("city") == city]
-        technical = sum(classify_comment(row.get("original_text", ""), row.get("discipline", "")) == "technical" for row in comments)
-        unique_comments = len({normalized_comment(row.get("original_text", "")) for row in comments})
+        technical = sum(classify_comment(verified_text(row), row.get("discipline", "")) == "technical" for row in comments)
+        unique_comments = len({normalized_comment(verified_text(row)) for row in comments})
         topic_count, common_topics = self._common_topics(comments)
         projects = len({row.get("property_project", "") for row in comments})
         rounds = len({(row.get("property_project", ""), row.get("review_round", "")) for row in comments})
@@ -528,12 +1105,13 @@ class DatasetStore:
             "total_comments": len(comments),
             "unique_comments": unique_comments,
             "topic_count": topic_count,
+            "common_topic_count": len(common_topics),
             "technical": technical,
             "nontechnical": nontechnical,
             "projects": projects,
             "review_cycles": rounds,
             "common_topics": common_topics,
-            "method_note": "Technical status and topic groups are deterministic aids for exploration; verify them before reporting.",
+            "method_note": "A common topic requires the same normalized topic in at least two independent canonical source documents. Renamed, re-exported, archived, and copied files count once; repeated rows inside one document are excluded.",
         }
         self._analysis_cache[city] = payload
         return payload
@@ -566,7 +1144,7 @@ class DatasetStore:
         candidates = [row for row in self._comments if not city or row["city"] == city]
         if not candidates:
             return []
-        tokenized = [tokenize(row.get("original_text", "")) for row in candidates]
+        tokenized = [tokenize(verified_text(row)) for row in candidates]
         document_frequency: Counter[str] = Counter()
         for tokens in tokenized:
             document_frequency.update(set(tokens))
@@ -587,7 +1165,7 @@ class DatasetStore:
             vector = {token: frequency * idf[token] for token, frequency in counts.items()}
             norm = math.sqrt(sum(value * value for value in vector.values())) or 1.0
             score = sum(query_vector.get(token, 0) * value for token, value in vector.items()) / (query_norm * norm)
-            text_lower = comment.get("original_text", "").casefold()
+            text_lower = verified_text(comment).casefold()
             if query_phrase and query_phrase in text_lower:
                 score += 0.35
             results.append({"comment_id": comment["comment_id"], "score": round(score, 4)})
@@ -705,9 +1283,9 @@ class DatasetStore:
                     "candidate_id": row["comment_id"],
                     "city": comment.get("city", ""), "discipline": comment.get("discipline", ""),
                     "property_project": comment.get("property_project", ""), "review_round": comment.get("review_round", ""),
-                    "heading_and_original_comment": comment.get("original_text", ""),
+                    "heading_and_original_comment": verified_text(comment),
                     "matched_search_unit": row.get("matched_excerpt", ""),
-                    "historical_response": response.get("original_text", "") if response else "",
+                    "historical_response": verified_text(response) if response else "",
                     "response_review_status": response.get("human_review_status", "") if response else "no_response",
                     "response_link_review_status": self._effective_link_status(link),
                     "data_quality_flags": row["record"].get("data_quality_flags", []),
@@ -880,9 +1458,14 @@ class PermitHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if self._redirect_root_to_localhost(parsed.path):
             return
-        document_match = re.fullmatch(r"/api/documents/([A-Za-z0-9-]+)/(preview|original)", parsed.path)
+        if re.fullmatch(r"/api/documents/[A-Za-z0-9-]+/original", parsed.path):
+            self.send_response(HTTPStatus.GONE)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        document_match = re.fullmatch(r"/api/documents/([A-Za-z0-9-]+)/preview", parsed.path)
         if document_match:
-            self._serve_document(document_match.group(1), document_match.group(2), send_body=False)
+            self._serve_document(document_match.group(1), "preview", send_body=False)
             return
         self._serve_static(parsed.path, send_body=False)
 
@@ -908,8 +1491,37 @@ class PermitHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        if parsed.path == "/api/workbook-reviews":
+            query = parse_qs(parsed.query)
+            try:
+                self._json(self.app.store.workbook_review_queue(
+                    query.get("status", ["pending"])[0],
+                    query.get("city", [""])[0],
+                    query.get("summary", ["0"])[0] == "1",
+                ))
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         if parsed.path == "/api/config":
-            self._json({"adobe_pdf_embed_client_id": self.app.adobe_pdf_embed_client_id})
+            self._json({
+                "adobe_pdf_embed_client_id": self.app.adobe_pdf_embed_client_id,
+                "smart_search_model": getattr(self.app.store.gemini_client, "model", ""),
+                "knowledge_chat_model": getattr(self.app.store.knowledge_gemini_client, "model", ""),
+            })
+            return
+        conversation_match = re.fullmatch(r"/api/conversations/([A-Za-z0-9_-]+)", parsed.path)
+        if conversation_match:
+            try:
+                self._json(self.app.store.knowledge_chat.conversation(conversation_match.group(1)))
+            except KeyError as exc:
+                self._error(HTTPStatus.NOT_FOUND, str(exc.args[0]))
+            return
+        result_set_match = re.fullmatch(r"/api/result-sets/([A-Za-z0-9_-]+)/comments", parsed.path)
+        if result_set_match:
+            try:
+                self._json(self.app.store.knowledge_chat.result_comments(result_set_match.group(1)))
+            except KeyError as exc:
+                self._error(HTTPStatus.NOT_FOUND, str(exc.args[0]))
             return
         source_match = re.fullmatch(r"/api/sources/([A-Za-z0-9-]+)", parsed.path)
         if source_match:
@@ -921,7 +1533,10 @@ class PermitHandler(BaseHTTPRequestHandler):
         document_match = re.fullmatch(r"/api/documents/([A-Za-z0-9-]+)/(preview|original|spreadsheet)", parsed.path)
         if document_match:
             document_id, action = document_match.groups()
-            if action in {"preview", "original"}:
+            if action == "original":
+                self._error(HTTPStatus.GONE, "Original-file downloads are disabled; use the in-app viewer")
+                return
+            if action == "preview":
                 self._serve_document(document_id, action)
                 return
             query = parse_qs(parsed.query)
@@ -961,6 +1576,9 @@ class PermitHandler(BaseHTTPRequestHandler):
                 )
                 self._json(result)
                 return
+            if parsed.path == "/api/knowledge-chat":
+                self._json(self.app.store.knowledge_chat.chat(payload))
+                return
             if parsed.path == "/api/categories":
                 comment_ids = payload.get("comment_ids", [])
                 if not isinstance(comment_ids, list) or not all(isinstance(item, str) for item in comment_ids):
@@ -975,6 +1593,17 @@ class PermitHandler(BaseHTTPRequestHandler):
                 )
                 self._json(result)
                 return
+            if parsed.path == "/api/workbook-reviews":
+                result = self.app.store.set_workbook_review(
+                    str(payload.get("source_document", "")),
+                    str(payload.get("decision", "")),
+                    str(payload.get("note", "")),
+                )
+                self._json(result)
+                return
+        except KeyError as exc:
+            self._error(HTTPStatus.NOT_FOUND, str(exc.args[0] if exc.args else exc))
+            return
         except (ValueError, TypeError) as exc:
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return
@@ -1029,7 +1658,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enrichment", type=Path, default=workspace / "web_app" / "data" / "gemini_enrichment.json")
     parser.add_argument("--search-index", type=Path, default=workspace / "web_app" / "data" / "search_index.json")
     parser.add_argument("--link-reviews", type=Path, default=workspace / "web_app" / "data" / "link_review_decisions.json")
+    parser.add_argument("--workbook-reviews", type=Path, default=workspace / "web_app" / "data" / "workbook_review_decisions.json")
     parser.add_argument("--gemini-model", default=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"))
+    parser.add_argument(
+        "--knowledge-gemini-model",
+        default=os.environ.get("KNOWLEDGE_GEMINI_MODEL", "gemini-3.1-flash-lite"),
+        help="Gemini model used only for Knowledge Chat routing and grounded summaries",
+    )
     parser.add_argument("--gemini-api-key-stdin", action="store_true", help="Read Gemini key from a hidden startup prompt")
     parser.add_argument(
         "--adobe-pdf-embed-client-id",
@@ -1041,15 +1676,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        gemini_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-        if not gemini_api_key and args.gemini_api_key_stdin:
-            gemini_api_key = getpass.getpass("Gemini API key: ")
-        gemini_client = GeminiClient(gemini_api_key, args.gemini_model) if gemini_api_key else None
+        shared_gemini_api_key = gemini_api_key()
+        if not shared_gemini_api_key and args.gemini_api_key_stdin:
+            shared_gemini_api_key = getpass.getpass("Gemini API key: ")
+        gemini_client = GeminiClient(shared_gemini_api_key, args.gemini_model) if shared_gemini_api_key else None
+        knowledge_gemini_client = GeminiClient(shared_gemini_api_key, args.knowledge_gemini_model) if shared_gemini_api_key else None
         store = DatasetStore(
             args.dataset, args.categories, args.source_root,
             args.source_registry, args.preview_root, args.enrichment, args.search_index,
             gemini_client=gemini_client,
+            knowledge_gemini_client=knowledge_gemini_client,
             link_reviews_path=args.link_reviews,
+            workbook_reviews_path=args.workbook_reviews,
         )
         server = PermitServer(
             (args.host, args.port), store, args.static_root,

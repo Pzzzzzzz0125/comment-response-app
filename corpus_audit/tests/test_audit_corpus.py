@@ -90,6 +90,17 @@ class CorpusAuditTests(unittest.TestCase):
         self.assertEqual(audit.infer_round(response_path)[0], "2")
         self.assertEqual(audit.infer_round(later_response)[0], "3")
 
+    def test_misspelled_submital_package_still_maps_to_prior_review_round(self):
+        path = Path(
+            "25-018-10344_el-prado_way_unit_a_cupertino/"
+            "2nd submital package/response letter.docx"
+        )
+        self.assertEqual(audit.infer_round(path)[0], "1")
+        project, _, _ = audit.infer_project(path)
+        self.assertEqual(
+            project, "25 018 10344 El Prado Way Unit A",
+        )
+
     def test_menlo_park_city_and_project_suffix(self):
         path = Path(
             "25-001-100_example_ave_menlopark/building/"
@@ -108,6 +119,36 @@ class CorpusAuditTests(unittest.TestCase):
             self.assertEqual(result["headers"]["Review Matrix"]["row"], 1)
             self.assertEqual(result["comment_columns"]["Review Matrix"][0]["column"], "B")
             self.assertEqual(result["response_columns"]["Review Matrix"][0]["column"], "C")
+
+    def test_xlsx_content_sample_supports_authoritative_city_detection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "2026-110167 review.xlsx"
+            make_xlsx(
+                path,
+                ["Reviewer", "City Comment", "Applicant Response"],
+                [[
+                    "reviewer@sanjoseca.gov",
+                    "Please revise the plans.",
+                    "Sheet updated.",
+                ]],
+            )
+            result = audit.inspect_xlsx(path)
+            city, confidence, evidence = audit.infer_city(
+                Path("25-031-7298_Queensbridge_Way") / path.name,
+                result["content_sample"],
+            )
+            self.assertEqual(city, "San Jose")
+            self.assertEqual(confidence, 0.99)
+            self.assertTrue(any("sanjoseca.gov" in item for item in evidence))
+
+    def test_authoritative_source_city_overrides_conflicting_folder_name(self):
+        city, confidence, evidence = audit.infer_city(
+            Path("100_Main_St_Cupertino/comments.xlsx"),
+            "Reviewer: yvonne.delgado@sanjoseca.gov",
+        )
+        self.assertEqual(city, "San Jose")
+        self.assertEqual(confidence, 0.99)
+        self.assertTrue(any("conflicting" in item for item in evidence))
 
     def test_xlsx_without_cell_references_uses_sequential_columns(self):
         with tempfile.TemporaryDirectory() as temp:

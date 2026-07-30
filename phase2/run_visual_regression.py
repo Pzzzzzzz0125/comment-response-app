@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 
 from phase2.visual_ingestion import VisualGeminiClient, VisualIngestionPipeline, sha256_file
+from web_app.local_secrets import gemini_api_key
 
 
 def main() -> int:
@@ -22,7 +23,7 @@ def main() -> int:
     parser.add_argument("--api-key-stdin", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+    api_key = gemini_api_key()
     if not api_key and args.api_key_stdin:
         api_key = getpass.getpass("Gemini API key: ")
     if not api_key:

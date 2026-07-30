@@ -88,6 +88,39 @@ CITY_ALIASES = {
     "menlo park": "Menlo Park",
     "menlopark": "Menlo Park",
 }
+CITY_AUTHORITY_SIGNALS = {
+    "San Jose": (
+        "sanjoseca.gov", "sjpermits.org", "sjeplans",
+        "san jose municipal code",
+    ),
+    "Palo Alto": (
+        "cityofpaloalto.org", "palo alto municipal code",
+    ),
+    "Sunnyvale": (
+        "sunnyvale.ca.gov", "sunnyvale.gov", "sunnyvale municipal code",
+    ),
+    "Santa Clara": (
+        "santaclaraca.gov", "santa clara city code",
+    ),
+    "Fremont": (
+        "fremont.gov", "fremont municipal code",
+    ),
+    "Milpitas": (
+        "milpitas.gov", "milpitas municipal code",
+    ),
+    "Cupertino": (
+        "cupertino.gov", "cupertino.org", "cupertino municipal code",
+    ),
+    "Mountain View": (
+        "mountainview.gov", "mountain view city code",
+    ),
+    "Redwood City": (
+        "redwoodcity.org", "redwood city municipal code",
+    ),
+    "Menlo Park": (
+        "menlopark.gov", "menlopark.org", "menlo park municipal code",
+    ),
+}
 
 INVENTORY_FIELDS = [
     "path", "absolute_path", "parent_folder", "filename", "extension",
@@ -325,6 +358,7 @@ def inspect_xlsx(path: Path, row_limit: int = 30) -> dict[str, Any]:
         "response_columns": {},
         "primary_sheet": "",
         "sample_signals": "",
+        "content_sample": "",
         "text_extraction_succeeded": False,
         "processing_error": "",
     }
@@ -335,6 +369,8 @@ def inspect_xlsx(path: Path, row_limit: int = 30) -> dict[str, Any]:
             result["sheet_count"] = len(targets)
             result["sheet_names"] = [name for name, _ in targets]
             signal_parts: list[str] = []
+            content_parts: list[str] = []
+            content_length = 0
             primary_score = -1
             for sheet_name, target in targets:
                 root = ET.fromstring(archive.read(target))
@@ -385,6 +421,13 @@ def inspect_xlsx(path: Path, row_limit: int = 30) -> dict[str, Any]:
                 if response_columns:
                     result["response_columns"][sheet_name] = response_columns
                 limited_values = [value for row in rows for value in row.values()]
+                for value in limited_values:
+                    if content_length >= 20_000:
+                        break
+                    remaining = 20_000 - content_length
+                    sampled = value[:remaining]
+                    content_parts.append(sampled)
+                    content_length += len(sampled) + 1
                 signal_text = " ".join(limited_values)
                 comments = keyword_hits(signal_text, COMMENT_TERMS)
                 responses = keyword_hits(signal_text, RESPONSE_TERMS)
@@ -394,6 +437,7 @@ def inspect_xlsx(path: Path, row_limit: int = 30) -> dict[str, Any]:
                     primary_score = score
                     result["primary_sheet"] = sheet_name
             result["sample_signals"] = " ".join(sorted(set(signal_parts)))
+            result["content_sample"] = " ".join(content_parts)[:20_000]
             result["text_extraction_succeeded"] = bool(targets)
     except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
         result["processing_error"] = f"XLSX inspection failed: {type(exc).__name__}: {exc}"
@@ -406,6 +450,7 @@ def inspect_delimited(path: Path) -> dict[str, Any]:
         "sheet_count": 1, "sheet_names": [path.stem], "headers": {},
         "comment_columns": {}, "response_columns": {}, "primary_sheet": path.stem,
         "sample_signals": "", "text_extraction_succeeded": False,
+        "content_sample": "",
         "processing_error": "",
     }
     try:
@@ -416,7 +461,9 @@ def inspect_delimited(path: Path) -> dict[str, Any]:
         result["headers"] = {path.stem: {"row": 1, "columns": headers}}
         result["comment_columns"] = {path.stem: [h for h in headers if keyword_hits(h["header"], COMMENT_TERMS)]}
         result["response_columns"] = {path.stem: [h for h in headers if keyword_hits(h["header"], RESPONSE_TERMS)]}
-        result["sample_signals"] = " ".join(keyword_hits(" ".join(" ".join(r) for r in rows), COMMENT_TERMS + RESPONSE_TERMS))
+        content_sample = " ".join(" ".join(r) for r in rows)[:20_000]
+        result["content_sample"] = content_sample
+        result["sample_signals"] = " ".join(keyword_hits(content_sample, COMMENT_TERMS + RESPONSE_TERMS))
         result["text_extraction_succeeded"] = True
     except (OSError, csv.Error) as exc:
         result["processing_error"] = f"Delimited file inspection failed: {type(exc).__name__}: {exc}"
@@ -427,6 +474,7 @@ def inspect_ods(path: Path, row_limit: int = 30) -> dict[str, Any]:
     result = {
         "sheet_count": 0, "sheet_names": [], "headers": {}, "comment_columns": {},
         "response_columns": {}, "primary_sheet": "", "sample_signals": "",
+        "content_sample": "",
         "text_extraction_succeeded": False, "processing_error": "",
     }
     try:
@@ -434,6 +482,7 @@ def inspect_ods(path: Path, row_limit: int = 30) -> dict[str, Any]:
             root = ET.fromstring(archive.read("content.xml"))
         tables = [node for node in root.iter() if xml_local(node.tag) == "table"]
         signals: list[str] = []
+        content_parts: list[str] = []
         for table_index, table in enumerate(tables, start=1):
             name = next((v for k, v in table.attrib.items() if xml_local(k) == "name"), f"Sheet {table_index}")
             result["sheet_names"].append(name)
@@ -455,10 +504,13 @@ def inspect_ods(path: Path, row_limit: int = 30) -> dict[str, Any]:
             result["headers"][name] = {"row": header_index, "columns": headers}
             result["comment_columns"][name] = [h for h in headers if keyword_hits(h["header"], COMMENT_TERMS)]
             result["response_columns"][name] = [h for h in headers if keyword_hits(h["header"], RESPONSE_TERMS)]
-            signals.extend(keyword_hits(" ".join(v for r in rows for v in r.values()), COMMENT_TERMS + RESPONSE_TERMS))
+            sheet_text = " ".join(v for r in rows for v in r.values())
+            content_parts.append(sheet_text)
+            signals.extend(keyword_hits(sheet_text, COMMENT_TERMS + RESPONSE_TERMS))
         result["sheet_count"] = len(tables)
         result["primary_sheet"] = result["sheet_names"][0] if tables else ""
         result["sample_signals"] = " ".join(sorted(set(signals)))
+        result["content_sample"] = " ".join(content_parts)[:20_000]
         result["text_extraction_succeeded"] = bool(tables)
     except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
         result["processing_error"] = f"ODS inspection failed: {type(exc).__name__}: {exc}"
@@ -621,24 +673,53 @@ def inspect_eml(path: Path) -> dict[str, Any]:
 
 
 def infer_city(relative_path: Path, text: str) -> tuple[str, float, list[str]]:
+    """Resolve a city from cheap authoritative content before trusting a folder name."""
     path_text = " ".join(relative_path.parts).replace("_", " ").replace("-", " ").casefold()
-    text_lower = text[:20_000].casefold()
-    candidates: dict[str, tuple[float, list[str]]] = {}
+    text_lower = normalize_space(text[:20_000]).casefold()
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def add(city: str, score: float, detail: str) -> None:
+        candidate = candidates.setdefault(city, {"score": 0.0, "evidence": []})
+        candidate["score"] = max(float(candidate["score"]), score)
+        if detail not in candidate["evidence"]:
+            candidate["evidence"].append(detail)
+
     for alias, city in CITY_ALIASES.items():
-        score = 0.0
-        evidence: list[str] = []
         if alias in path_text:
-            score += 0.82
-            evidence.append(f"folder/filename contains '{alias}'")
-        if alias in text_lower:
-            score += 0.16
-            evidence.append(f"extracted text contains '{alias}'")
-        if score:
-            candidates[city] = (min(score, 0.98), evidence)
+            add(city, 0.82, f"folder/filename contains '{alias}'")
+        if not text_lower or alias not in text_lower:
+            continue
+        add(city, 0.64, f"extracted text contains '{alias}'")
+        escaped = re.escape(alias)
+        if re.search(rf"\b(?:city\s+of\s+)?{escaped}\b.{{0,60}}\bca\s+\d{{5}}(?:-\d{{4}})?\b", text_lower):
+            add(city, 0.99, f"source contains a postal address naming {city}")
+        if re.search(rf"\bcity\s+of\s+{escaped}\b", text_lower):
+            add(city, 0.97, f"source identifies City of {city}")
+
+    for city, signals in CITY_AUTHORITY_SIGNALS.items():
+        for signal in signals:
+            if signal in text_lower:
+                add(city, 0.99, f"source contains authoritative city signal '{signal}'")
+
     if not candidates:
-        return "unknown", 0.0, ["no recognized city alias"]
-    city, (score, evidence) = max(candidates.items(), key=lambda item: item[1][0])
-    return city, score, evidence
+        return "unknown", 0.0, ["no recognized city evidence"]
+    ranked = sorted(
+        candidates.items(),
+        key=lambda item: (-float(item[1]["score"]), item[0]),
+    )
+    city, selected = ranked[0]
+    evidence = list(selected["evidence"])
+    conflicts = [
+        (other_city, float(details["score"]))
+        for other_city, details in ranked[1:]
+        if float(details["score"]) >= 0.82
+    ]
+    if conflicts:
+        evidence.append(
+            "source evidence overrides conflicting path/content candidate(s): "
+            + ", ".join(f"{name} ({score:.2f})" for name, score in conflicts)
+        )
+    return city, float(selected["score"]), evidence
 
 
 def prettify_project_component(value: str) -> str:
@@ -659,7 +740,11 @@ def infer_project(relative_path: Path) -> tuple[str, float, list[str]]:
         lower = part.casefold()
         if lower in {"deliverable and submittals", "deliverables and submittals"}:
             continue
-        if re.search(r"\b(?:1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth)\b.*\b(?:comment|review|round|submission)", lower):
+        if re.search(
+            r"\b(?:1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth)\b"
+            r".*\b(?:comment|review|round|submission|submitt?al)",
+            lower,
+        ):
             break
         scope_parts.append(prettify_project_component(part))
     if root_name:
@@ -708,14 +793,16 @@ def infer_round(relative_path: Path) -> tuple[str, float, list[str]]:
         if value is not None:
             return str(value), 0.94, [f"response package folder '{part}'"]
     for part in reversed(folders):
-        value = ordinal_before(part.casefold(), r"submission\s+package")
+        value = ordinal_before(
+            part.casefold(), r"(?:submission|submitt?al)\s+package",
+        )
         if value is not None:
             review_round = max(1, value - 1)
             return str(review_round), 0.9, [
                 f"submission package '{part}' inferred to answer review round {review_round}"
             ]
     for part in reversed(folders):
-        value = ordinal_before(part.casefold(), r"submission")
+        value = ordinal_before(part.casefold(), r"(?:submission|submitt?al)")
         if value is not None:
             review_round = max(1, value - 1)
             return str(review_round), 0.82, [
@@ -873,7 +960,7 @@ def inspect_file(path: Path, source_root: Path, workspace_root: Path) -> dict[st
             text_extraction_succeeded=spreadsheet.get("text_extraction_succeeded", False),
             processing_error=spreadsheet.get("processing_error", ""),
         )
-        text = spreadsheet.get("sample_signals", "")
+        text = spreadsheet.get("content_sample") or spreadsheet.get("sample_signals", "")
     elif suffix == ".pdf":
         detail = inspect_pdf(path)
         record.update({key: value for key, value in detail.items() if key != "text"})

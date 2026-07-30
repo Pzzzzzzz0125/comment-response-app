@@ -114,6 +114,8 @@ The project is currently a reviewable MVP rather than only a UI prototype.
 Completed core capabilities include:
 
 - City-based browsing of historical comments.
+- An “Ask Permit History” conversational layer for precedent search, backend-calculated counts, summaries, comparisons, and grounded follow-ups.
+- Short-lived result sets that load the exact supporting records into the existing comment list without putting IDs in URLs.
 - Keyword and AI-assisted semantic search.
 - Retrieval of historical comments and available responses.
 - Classification of results as direct, related, or unverified candidates.
@@ -126,14 +128,108 @@ The current evaluation results are provisional. A larger domain-reviewed gold da
 
 ## Next Priorities
 
-1. Replace the top-level analysis summary with a conversational, history-grounded AI interface.
+1. Add the proposed canonical-issue clustering and human approval workflow without rewriting original comments.
 2. Document and validate the production data location, configuration, backup, and access model.
 3. Define a stable data contract shared by development and production.
 4. Complete human or domain review of suggested comment-response matches.
-5. Define and validate the canonical issue taxonomy and grouping workflow.
-6. Build a larger, domain-approved search evaluation set.
-7. Add clear user-visible handling for missing evidence, unverified matches, and incomplete source records.
-8. Confirm production security, permissions, monitoring, and operational ownership.
+5. Build a larger, domain-approved conversational evaluation set.
+6. Confirm production security, permissions, monitoring, and operational ownership.
+
+## Conversational API
+
+- `POST /api/knowledge-chat` classifies a question into an allowlisted plan and executes only predefined operations.
+- `GET /api/conversations/{conversation_id}` returns the server-held conversation state.
+- `GET /api/result-sets/{result_set_id}/comments` hydrates an unexpired result set through the existing comment view model.
+
+Counts are calculated from unique parent comment IDs in backend code. Gemini cannot provide executable SQL, counts, record IDs, source IDs, or source locations. Semantic answers use only independently verified Direct and Related records; unverified fallback candidates are excluded. Confirmed-response summaries exclude suggested and otherwise unconfirmed response links.
+
+The application enforces a data-trust boundary before building the search index.
+Gemini visual-ingestion rows and document-structure rematches are searchable only
+when they have `text_trust_status=verified`, a separate `verified_text`, and
+`search_eligible=true`. Quarantined text remains in the dataset for audit but is
+excluded from city summaries, keyword search, Smart Search, Knowledge Chat, and
+normal comment display.
+
+Import the manually verified all-project paired and unpaired workbook with a
+conflict-reporting dry run followed by the atomic import:
+
+```sh
+python3 web_app/import_all_projects_rematch.py /path/to/all_projects_comment_response_rematch.xlsx
+python3 web_app/import_all_projects_rematch.py /path/to/all_projects_comment_response_rematch.xlsx --apply
+```
+
+The importer requires exact Comment IDs and source text, never uses semantic
+matching, preserves raw comment text, supports verified grouped responses, and
+stores both XML and visible DOCX paragraph indices. Repeating the import creates
+no additional responses or links.
+
+Knowledge Chat routing and grounded answer summaries use `gemini-3.1-flash-lite` by default through `KNOWLEDGE_GEMINI_MODEL` or `--knowledge-gemini-model`. It shares the server-side API key but uses a separate client from Smart Search, whose model remains controlled by `GEMINI_MODEL` or `--gemini-model`. Semantic retrieval inside a conversation continues to use the existing Smart Search client.
+
+Source files remain available only through authorized in-app preview and spreadsheet endpoints. The public source model exposes no original-download action, and `/api/documents/{document_id}/original` is disabled.
+
+## Common Topic Document Identity
+
+Common Topics are counted only across independent logical documents. The
+canonicalization pass separates each physical `source_file` from its
+`canonical_document`: identical SHA-256 files, normalized-content re-exports,
+and renamed/archive copies are grouped as aliases. Repeated extraction rows
+inside one canonical document contribute one comment occurrence at most.
+
+The persisted dataset contains `source_files`, `canonical_documents`,
+`source_file_aliases`, and `near_duplicate_review`. Run the explicit repair
+command after an older dataset is imported:
+
+```bash
+python3 web_app/canonicalize_documents.py --apply
+```
+
+Near-duplicate documents with 90–98% substantive overlap are retained as
+separate documents and listed for review; only confirmed new or reissued
+comments contribute to topic frequency. The city summary reports independent
+source documents and the number of physical duplicate files excluded.
+
+## Frontend Architecture
+
+The browser interface is a React 19 + TypeScript application in `frontend/`.
+Flask-compatible Python HTTP handling remains responsible for data, Gemini,
+retrieval, ingestion, authorization, and file delivery. Vite builds the React
+application into `web_app/static/`, which the existing Python server serves as
+its single-page frontend.
+
+The component layers are:
+
+- `frontend/src/components/ui/`: shadcn/ui source components and theme primitives.
+- `frontend/src/components/ai-elements/`: AI Elements conversation, message,
+  prompt, suggestion, and source components.
+- `frontend/src/components/knowledge-chat.tsx`: the existing knowledge-chat API
+  rendered as a source-grounded conversational experience.
+- `frontend/src/components/history-results.tsx`: keyword/Smart Search results,
+  filters, selection, categorization, and collapsible match explanations.
+- `frontend/src/components/comment-detail.tsx`: responsive, resizable comparison
+  of government comments and historical company responses.
+- `frontend/src/components/source-viewer.tsx`: authorized PDF and spreadsheet
+  viewing with cited-page navigation, coordinate/text highlighting, and cited
+  range selection.
+- `frontend/src/components/review-links-dialog.tsx`: the existing response-link
+  review workflow.
+
+No Gemini key or document filesystem path is included in the frontend bundle.
+
+### Build and test the frontend
+
+Node.js 18 or newer is required. From `frontend/`:
+
+```bash
+npm install
+npm test
+npm run build
+```
+
+Commit `package-lock.json` so dependency resolution is reproducible. The built
+files in `web_app/static/` let reviewers run the app without starting a separate
+Vite process. During frontend development, `npm run dev` may be used separately;
+API proxying is not currently configured, so the production build remains the
+default integrated workflow.
 
 ## Scope Boundaries
 

@@ -29,3 +29,13 @@ demo_data/previews/
 .env
 .env.*
 !.env.example
+
+# React frontend dependencies and local build diagnostics.
+frontend/node_modules/
+frontend/coverage/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Local delivery archives are generated from the authorized source corpus.
+exports/
