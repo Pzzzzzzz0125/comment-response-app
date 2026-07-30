@@ -2546,6 +2546,9 @@ class VisualIngestionPipeline:
         self.oracle_dataset = oracle_dataset
         self.batch_pages = max(0, int(batch_pages))
         self.batch_overlap = max(0, int(batch_overlap))
+        self.batch_text_character_limit = max(
+            0, int(os.environ.get("VISUAL_BATCH_TEXT_CHARACTER_LIMIT", "21500")),
+        )
         self._metrics: dict[str, Any] = {}
 
     @staticmethod
@@ -2792,6 +2795,254 @@ class VisualIngestionPipeline:
         progress["last_completed_stage"] = stage if status == "complete" else ""
         atomic_json(path, progress)
 
+    @staticmethod
+    def _batch_text_characters(
+        bundle: EvidenceBundle, pages: list[PageImage],
+    ) -> int:
+        scoped = raw_text_for_page_batch(bundle.raw_text, pages)
+        if not isinstance(scoped, dict) or scoped.get("kind") != "pdf_text_pages":
+            return 0
+        return sum(
+            len(str(row.get("text", "")))
+            for row in scoped.get("pages", [])
+            if isinstance(row, dict)
+        )
+
+    def _split_batch_pages(
+        self, pages: list[PageImage],
+    ) -> list[list[PageImage]]:
+        if len(pages) <= 1:
+            return []
+        midpoint = len(pages) // 2
+        overlap = min(self.batch_overlap, 1) if len(pages) > 2 else 0
+        left = pages[:midpoint + overlap]
+        right = pages[midpoint:]
+        if not left or not right or left == pages or right == pages:
+            return [[page] for page in pages]
+        return [left, right]
+
+    @staticmethod
+    def _retryable_batch_failure(exc: BaseException) -> bool:
+        message = str(exc).casefold()
+        return any(signal in message for signal in (
+            "timed out",
+            "timeout",
+            "deadline exceeded",
+            "request entity too large",
+            "payload too large",
+        ))
+
+    def _extract_and_verify_page_group(
+        self,
+        bundle: EvidenceBundle,
+        context: dict[str, Any],
+        pages: list[PageImage],
+        root_index: int,
+        root_count: int,
+        force: bool,
+        label: str,
+        split_depth: int = 0,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        extraction_path = (
+            bundle.artifact_dir / f"gemini_extraction.{label}.json"
+        )
+        verification_path = (
+            bundle.artifact_dir / f"gemini_verification.{label}.json"
+        )
+        metadata_path = (
+            bundle.artifact_dir / f"gemini_cache_metadata.{label}.json"
+        )
+        split_marker_path = (
+            bundle.artifact_dir / f"adaptive_split.{label}.json"
+        )
+        page_numbers = [page.page_number for page in pages]
+        batch_context = {
+            **context,
+            "document_page_count": (
+                bundle.document_page_count or len(bundle.pages)
+            ),
+            "visual_batch": {
+                "index": root_index,
+                "count": root_count,
+                "pages": page_numbers,
+                "overlap_pages": self.batch_overlap,
+                "split_depth": split_depth,
+            },
+        }
+        batch_bundle = EvidenceBundle(
+            bundle.artifact_id,
+            bundle.source_path,
+            bundle.source_sha256,
+            bundle.original_type,
+            raw_text_for_page_batch(bundle.raw_text, pages),
+            pages,
+            bundle.artifact_dir,
+            document_page_count=bundle.document_page_count,
+            screening=bundle.screening,
+        )
+        extraction_identity = self._extraction_cache_identity(batch_bundle)
+        split_marker = self._read_cache_metadata(split_marker_path)
+        text_characters = self._batch_text_characters(bundle, pages)
+        split_reason = ""
+        if (
+            len(pages) > 1
+            and split_marker.get("parent_extraction_identity")
+            == extraction_identity
+        ):
+            split_reason = str(
+                split_marker.get("reason", "cached adaptive split"),
+            )
+        elif (
+            len(pages) > 1
+            and self.batch_text_character_limit
+            and text_characters > self.batch_text_character_limit
+        ):
+            split_reason = (
+                f"native text payload {text_characters} exceeds "
+                f"{self.batch_text_character_limit}"
+            )
+        if split_reason:
+            child_batches = self._split_batch_pages(pages)
+            atomic_json(split_marker_path, {
+                "parent_extraction_identity": extraction_identity,
+                "reason": split_reason,
+                "children": [
+                    [page.page_number for page in child]
+                    for child in child_batches
+                ],
+            })
+            print(
+                f"Adaptive split {label} pages {page_numbers[0]}-"
+                f"{page_numbers[-1]}: {split_reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+            results: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for child in child_batches:
+                child_label = (
+                    f"{label}.split-p{child[0].page_number:04d}-"
+                    f"{child[-1].page_number:04d}"
+                )
+                results.extend(self._extract_and_verify_page_group(
+                    bundle,
+                    context,
+                    child,
+                    root_index,
+                    root_count,
+                    force,
+                    child_label,
+                    split_depth + 1,
+                ))
+            return results
+
+        print(
+            f"Gemini visual batch {root_index}/{root_count} pages "
+            f"{page_numbers[0]}-{page_numbers[-1]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            extraction_cached = (
+                not force
+                and extraction_path.is_file()
+                and self._stage_cache_is_compatible(
+                    batch_bundle,
+                    "extraction",
+                    extraction_identity,
+                    metadata_path,
+                )
+            )
+            if extraction_cached:
+                extraction = json.loads(
+                    extraction_path.read_text(encoding="utf-8"),
+                )
+                self._metrics["extraction_cache_hits"] += 1
+            else:
+                extraction = self._extract(batch_bundle, batch_context)
+                extraction["_visual_batch_context"] = batch_context
+                atomic_json(extraction_path, extraction)
+                self._write_stage_cache_identity(
+                    batch_bundle,
+                    "extraction",
+                    extraction_identity,
+                    metadata_path,
+                )
+            verification_bundle = self._verification_bundle_for_confidence(
+                batch_bundle,
+                extraction,
+            )
+            verification_identity = self._verification_cache_identity(
+                verification_bundle,
+                extraction,
+            )
+            verification_cached = (
+                not force
+                and verification_path.is_file()
+                and self._stage_cache_is_compatible(
+                    batch_bundle,
+                    "verification",
+                    verification_identity,
+                    metadata_path,
+                )
+            )
+            if verification_cached:
+                verification = json.loads(
+                    verification_path.read_text(encoding="utf-8"),
+                )
+                self._metrics["verification_cache_hits"] += 1
+            else:
+                verification = self._verify(
+                    verification_bundle,
+                    extraction,
+                )
+                atomic_json(verification_path, verification)
+                self._write_stage_cache_identity(
+                    batch_bundle,
+                    "verification",
+                    verification_identity,
+                    metadata_path,
+                )
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            child_batches = self._split_batch_pages(pages)
+            if not child_batches or not self._retryable_batch_failure(exc):
+                raise
+            atomic_json(split_marker_path, {
+                "parent_extraction_identity": extraction_identity,
+                "reason": f"retryable request failure: {exc}",
+                "children": [
+                    [page.page_number for page in child]
+                    for child in child_batches
+                ],
+            })
+            print(
+                f"Adaptive retry split {label} pages {page_numbers[0]}-"
+                f"{page_numbers[-1]} after: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            results = []
+            for child in child_batches:
+                child_label = (
+                    f"{label}.split-p{child[0].page_number:04d}-"
+                    f"{child[-1].page_number:04d}"
+                )
+                results.extend(self._extract_and_verify_page_group(
+                    bundle,
+                    context,
+                    child,
+                    root_index,
+                    root_count,
+                    force,
+                    child_label,
+                    split_depth + 1,
+                ))
+            return results
+        extraction, verification = match_verified_extraction(
+            extraction,
+            verification,
+        )
+        return [(extraction, verification)]
+
     def _extract_and_verify_batches(
         self, bundle: EvidenceBundle, context: dict[str, Any], force: bool,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2799,73 +3050,18 @@ class VisualIngestionPipeline:
         extractions: list[dict[str, Any]] = []
         verifications: list[dict[str, Any]] = []
         for index, pages in enumerate(batches, 1):
-            extraction_path = bundle.artifact_dir / f"gemini_extraction.batch-{index:03d}.json"
-            verification_path = bundle.artifact_dir / f"gemini_verification.batch-{index:03d}.json"
-            metadata_path = bundle.artifact_dir / f"gemini_cache_metadata.batch-{index:03d}.json"
-            batch_context = {
-                **context,
-                "document_page_count": bundle.document_page_count or len(bundle.pages),
-                "visual_batch": {
-                    "index": index, "count": len(batches),
-                    "pages": [page.page_number for page in pages],
-                    "overlap_pages": self.batch_overlap,
-                },
-            }
-            batch_bundle = EvidenceBundle(
-                bundle.artifact_id, bundle.source_path, bundle.source_sha256,
-                bundle.original_type, raw_text_for_page_batch(bundle.raw_text, pages),
-                pages, bundle.artifact_dir,
-                document_page_count=bundle.document_page_count,
-                screening=bundle.screening,
+            pairs = self._extract_and_verify_page_group(
+                bundle,
+                context,
+                pages,
+                index,
+                len(batches),
+                force,
+                f"batch-{index:03d}",
             )
-            print(
-                f"Gemini visual batch {index}/{len(batches)} pages "
-                f"{pages[0].page_number}-{pages[-1].page_number}",
-                file=sys.stderr, flush=True,
-            )
-            extraction_identity = self._extraction_cache_identity(batch_bundle)
-            extraction_cached = (
-                not force
-                and extraction_path.is_file()
-                and self._stage_cache_is_compatible(
-                    batch_bundle, "extraction", extraction_identity, metadata_path,
-                )
-            )
-            if extraction_cached:
-                extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
-                self._metrics["extraction_cache_hits"] += 1
-            else:
-                extraction = self._extract(batch_bundle, batch_context)
-                extraction["_visual_batch_context"] = batch_context
-                atomic_json(extraction_path, extraction)
-                self._write_stage_cache_identity(
-                    batch_bundle, "extraction", extraction_identity, metadata_path,
-                )
-            verification_bundle = self._verification_bundle_for_confidence(
-                batch_bundle, extraction,
-            )
-            verification_identity = self._verification_cache_identity(
-                verification_bundle, extraction,
-            )
-            verification_cached = (
-                not force
-                and verification_path.is_file()
-                and self._stage_cache_is_compatible(
-                    batch_bundle, "verification", verification_identity, metadata_path,
-                )
-            )
-            if verification_cached:
-                    verification = json.loads(verification_path.read_text(encoding="utf-8"))
-                    self._metrics["verification_cache_hits"] += 1
-            else:
-                verification = self._verify(verification_bundle, extraction)
-                atomic_json(verification_path, verification)
-                self._write_stage_cache_identity(
-                    batch_bundle, "verification", verification_identity, metadata_path,
-                )
-            extraction, verification = match_verified_extraction(extraction, verification)
-            extractions.append(extraction)
-            verifications.append(verification)
+            for extraction, verification in pairs:
+                extractions.append(extraction)
+                verifications.append(verification)
         extraction, verification = merge_visual_batches(extractions, verifications)
         atomic_json(bundle.artifact_dir / "gemini_extraction.json", extraction)
         atomic_json(bundle.artifact_dir / "gemini_verification.json", verification)

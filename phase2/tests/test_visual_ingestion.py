@@ -412,6 +412,204 @@ class VisualIngestionTests(unittest.TestCase):
         self.assertEqual([row["comment_number"] for row in comments], ["1", "2"])
         self.assertTrue(all(row["review_status"] == "confirmed" for row in links))
 
+    def test_large_native_text_batch_is_split_before_request(self):
+        pages = []
+        for page_number in range(1, 6):
+            path = self.root / f"large-page-{page_number:04d}.jpg"
+            path.write_bytes(f"image-{page_number}".encode())
+            pages.append(PageImage(page_number, path))
+        bundle = EvidenceBundle(
+            "VI-large-batch",
+            self.source,
+            "large-batch-sha",
+            "pdf",
+            {
+                "kind": "pdf_text_pages",
+                "pages": [
+                    {"page": page_number, "text": "x" * 6000}
+                    for page_number in range(1, 6)
+                ],
+            },
+            pages,
+            self.root,
+        )
+
+        class FakeClient:
+            def __init__(inner):
+                inner.page_groups = []
+
+            def extract_document(inner, request_bundle, context):
+                inner.page_groups.append(tuple(
+                    page.page_number for page in request_bundle.pages
+                ))
+                records = []
+                for page in request_bundle.pages:
+                    box = {
+                        "page": page.page_number,
+                        "x_min": 10,
+                        "y_min": 10,
+                        "x_max": 400,
+                        "y_max": 200,
+                    }
+                    records.append(extracted_record(
+                        record_key=f"row-{page.page_number}",
+                        comment_id=str(page.page_number),
+                        comment_number=str(page.page_number),
+                        page=page.page_number,
+                        exact_comment_text=f"Comment {page.page_number}",
+                        exact_response_text="",
+                        comment_location={
+                            "pages": [page.page_number],
+                            "description": "comment",
+                            "bounding_boxes": [box],
+                        },
+                        response_location={
+                            "pages": [],
+                            "description": "",
+                            "bounding_boxes": [],
+                        },
+                        same_visible_row=False,
+                    ))
+                return extraction(records)
+
+            def verify_document(inner, request_bundle, value):
+                return verification(records=[{
+                    "record_key": row["record_key"],
+                    "comment_captured": True,
+                    "response_captured": True,
+                    "text_complete_and_verbatim": True,
+                    "pairing_correct": True,
+                    "locations_and_boxes_correct": True,
+                    "same_visible_row_or_shared_id": True,
+                    "verified": True,
+                    "uncertainty_reason": "",
+                } for row in value["records"]])
+
+        client = FakeClient()
+        pipeline = VisualIngestionPipeline(
+            client,
+            self.root / "artifacts",
+            batch_pages=4,
+            batch_overlap=1,
+        )
+        pipeline.builder.build = lambda _source: bundle
+        comments, _responses, _links, _summary, _review = pipeline.process(
+            self.source,
+            "permit.pdf",
+            {"city_hint": "Menlo Park", "review_round_hint": "3"},
+            force=True,
+        )
+        self.assertEqual(
+            client.page_groups,
+            [(1, 2, 3), (3, 4), (4, 5)],
+        )
+        self.assertEqual(
+            [row["comment_number"] for row in comments],
+            ["1", "2", "3", "4", "5"],
+        )
+
+    def test_timed_out_batch_is_retried_as_smaller_page_groups(self):
+        third_page_path = self.root / "page-0003.jpg"
+        third_page_path.write_bytes(b"image-three")
+        timeout_bundle = EvidenceBundle(
+            "VI-timeout",
+            self.source,
+            "timeout-sha",
+            "pdf",
+            {
+                "kind": "pdf_text_pages",
+                "pages": [
+                    {"page": 1, "text": "RAW ONE"},
+                    {"page": 2, "text": "RAW TWO"},
+                    {"page": 3, "text": "RAW THREE"},
+                ],
+            },
+            [
+                *self.bundle.pages,
+                PageImage(3, third_page_path),
+            ],
+            self.root,
+        )
+
+        class FakeClient:
+            def __init__(inner):
+                inner.page_groups = []
+
+            def extract_document(inner, request_bundle, context):
+                page_numbers = tuple(
+                    page.page_number for page in request_bundle.pages
+                )
+                inner.page_groups.append(page_numbers)
+                if len(page_numbers) > 1:
+                    raise RuntimeError("The read operation timed out")
+                page = page_numbers[0]
+                box = {
+                    "page": page,
+                    "x_min": 10,
+                    "y_min": 10,
+                    "x_max": 400,
+                    "y_max": 200,
+                }
+                return extraction([extracted_record(
+                    record_key=f"row-{page}",
+                    comment_id=str(page),
+                    comment_number=str(page),
+                    page=page,
+                    exact_comment_text=f"Comment {page}",
+                    exact_response_text="",
+                    comment_location={
+                        "pages": [page],
+                        "description": "comment",
+                        "bounding_boxes": [box],
+                    },
+                    response_location={
+                        "pages": [],
+                        "description": "",
+                        "bounding_boxes": [],
+                    },
+                    same_visible_row=False,
+                )])
+
+            def verify_document(inner, request_bundle, value):
+                key = value["records"][0]["record_key"]
+                return verification(records=[{
+                    "record_key": key,
+                    "comment_captured": True,
+                    "response_captured": True,
+                    "text_complete_and_verbatim": True,
+                    "pairing_correct": True,
+                    "locations_and_boxes_correct": True,
+                    "same_visible_row_or_shared_id": True,
+                    "verified": True,
+                    "uncertainty_reason": "",
+                }])
+
+        client = FakeClient()
+        pipeline = VisualIngestionPipeline(
+            client,
+            self.root / "artifacts",
+            batch_pages=2,
+            batch_overlap=1,
+        )
+        pipeline.builder.build = lambda _source: timeout_bundle
+        comments, _responses, _links, _summary, _review = pipeline.process(
+            self.source,
+            "permit.pdf",
+            {"city_hint": "Menlo Park", "review_round_hint": "3"},
+            force=True,
+        )
+        self.assertEqual(
+            client.page_groups,
+            [(1, 2), (1,), (2,), (2, 3), (2,), (3,)],
+        )
+        self.assertEqual(
+            [row["comment_number"] for row in comments],
+            ["1", "2", "3"],
+        )
+        self.assertTrue(
+            (self.root / "adaptive_split.batch-001.json").is_file(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
