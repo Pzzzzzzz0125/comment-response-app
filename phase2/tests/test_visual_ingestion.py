@@ -1,20 +1,30 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 from phase2.visual_ingestion import (
     EvidenceBundle,
+    GeminiCircuitBreaker,
+    GeminiCircuitOpenError,
     PageImage,
     VisualGeminiClient,
     VisualIngestionPipeline,
     compact_direct_text_for_gemini,
+    compact_pdf_native_text_for_model,
+    document_verified,
+    EXTRACTION_INSTRUCTION,
+    normalize_document_date_metadata,
     multimodal_parts,
     merge_visual_batches,
+    match_verified_extraction,
+    select_relevant_pages,
     page_batches,
     raw_text_for_page_batch,
     regression_against_oracle,
     results_to_dataset_rows,
+    split_embedded_response_lines,
 )
 
 
@@ -79,6 +89,102 @@ class VisualIngestionTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_pair_and_coverage_gates_are_required_for_new_verification(self):
+        value = verification(
+            verification_contract_version="pair-coverage-v1",
+            pair_verification={
+                "passed": False, "checked_record_count": 1,
+                "failed_record_ids": ["row-7"], "reason": "wrong response row",
+            },
+            coverage_verification={
+                "passed": True, "visible_comment_count": 1,
+                "visible_response_count": 1, "missing_record_ids": [], "reason": "complete",
+            },
+        )
+        self.assertFalse(document_verified(value))
+        value["pair_verification"]["passed"] = True
+        self.assertTrue(document_verified(value))
+
+    def test_dated_status_line_is_a_response_not_comment_text(self):
+        record = {
+            "record_key": "C1", "comment_number": "1",
+            "exact_comment_text": "Show the driveway connection.\n3/16/2026: complete.",
+            "normalized_comment_text": "Show the driveway connection. 3/16/2026: complete.",
+            "exact_response_text": "",
+            "page_start": 1, "page_end": 1,
+            "bounding_boxes": [{"page": 1, "x_min": 100, "y_min": 400, "x_max": 900, "y_max": 500}],
+        }
+        repaired = split_embedded_response_lines(record)
+        self.assertEqual(repaired["exact_comment_text"], "Show the driveway connection.")
+        self.assertEqual(repaired["exact_response_text"], "3/16/2026: complete.")
+        self.assertEqual(repaired["response_date_iso"], "2026-03-16")
+        self.assertTrue(repaired["response_location"]["bounding_boxes"])
+        self.assertIn("3/16/2026", repaired["raw_extracted_comment_text"])
+
+    def test_status_split_does_not_change_a_date_inside_prose(self):
+        record = {
+            "exact_comment_text": "The note references 3/16/2026: complete. as an example.",
+            "exact_response_text": "",
+        }
+        self.assertEqual(split_embedded_response_lines(record), record)
+
+    def test_response_letter_with_structural_terms_is_escalated(self):
+        screening = select_relevant_pages([
+            "1. The ST pages need to identify all beams to match the cals.\n"
+            "Response: all beam sizes match the structural calculations.\n"
+            "2. The ridge beam appears to be a 4x10.\n"
+            "Response: Structural plans and calculations have been updated."
+        ], force_response=True)
+        self.assertEqual(screening["pages_selected_for_full_analysis"], [1])
+        self.assertEqual(screening["processing_status"], "comments_and_responses_found")
+        self.assertEqual(
+            screening["page_classifications"][0]["page_class"],
+            "comment_response_table",
+        )
+
+    def test_explicit_full_read_cannot_be_vetoed_by_local_keyword_routing(self):
+        screening = select_relevant_pages([
+            "STRUCTURAL COMMENTS: Show roof framing. Clarify H25 clips."
+        ], force_full_read=True)
+        self.assertEqual(screening["pages_selected_for_full_analysis"], [1])
+        self.assertEqual(
+            screening["page_classifications"][0]["processing_decision"],
+            "full_gemini_extraction:prescan_evidence_page",
+        )
+
+    def test_long_full_read_package_skips_plain_plan_attachment_pages(self):
+        pages = [
+            "Review Comments Applicant Response\n1. Revise the wall.\nResponse: updated",
+            *["FLOOR PLAN EXISTING WALL DIMENSIONS" for _ in range(8)],
+            "Reviewer Response: PC2: the wall comment remains open",
+        ]
+        screening = select_relevant_pages(pages, force_full_read=True)
+        selected = screening["pages_selected_for_full_analysis"]
+        self.assertIn(1, selected)
+        self.assertIn(10, selected)
+        self.assertNotIn(5, selected)
+        self.assertEqual(screening["pages_screened"], list(range(1, 11)))
+
+    def test_dense_pdf_page_sends_exact_annotations_instead_of_full_plan_text(self):
+        dense = "STRUCTURAL PLAN NOTES " * 4_000
+        compact, scope = compact_pdf_native_text_for_model(
+            dense,
+            {
+                "annotation_evidence": [{
+                    "type": "FreeText",
+                    "title": "Reviewer",
+                    "subject": "Correction",
+                    "content": "PC2: Please provide the missing shear-transfer detail.",
+                }],
+            },
+            limit=2_000,
+        )
+        self.assertEqual(scope, "annotation_and_high_signal_native_text")
+        self.assertIn(
+            "PC2: Please provide the missing shear-transfer detail.", compact,
+        )
+        self.assertLess(len(compact), len(dense) // 10)
+
     def test_multimodal_request_contains_every_page_and_complete_raw_text(self):
         parts = multimodal_parts(self.bundle, {"city_hint": "Menlo Park"})
         images = [part for part in parts if "inlineData" in part]
@@ -122,7 +228,15 @@ class VisualIngestionTests(unittest.TestCase):
         parts = multimodal_parts(
             self.bundle,
             {"city_hint": "Menlo Park"},
-            {"comments": [{"exact_comment_text": "Verify me"}]},
+            {"comments": [{
+                "record_key": "c-1",
+                "exact_comment_text": "Verify me",
+                "normalized_comment_text": "verify me",
+                "bounding_boxes": [{
+                    "page": 1, "x_min": 1, "y_min": 2,
+                    "x_max": 3, "y_max": 4,
+                }],
+            }]},
         )
         request_context = json.loads(parts[0]["text"])
         self.assertNotIn("selected_page_text_complete", request_context)
@@ -133,6 +247,9 @@ class VisualIngestionTests(unittest.TestCase):
             ],
             "Verify me",
         )
+        proposal = request_context["proposed_extraction_to_verify"]
+        self.assertNotIn("normalized_comment_text", proposal["comments"][0])
+        self.assertEqual(len(proposal["comments"][0]["bounding_boxes"]), 1)
         self.assertEqual(
             len([part for part in parts if "inlineData" in part]), 2,
         )
@@ -143,6 +260,91 @@ class VisualIngestionTests(unittest.TestCase):
         self.assertEqual([[page.page_number for page in batch] for batch in batches], [
             [1, 2, 3], [3, 4, 5], [5, 6],
         ])
+
+    def test_forked_page_batches_use_two_workers(self):
+        pages = list(self.bundle.pages)
+        raw_pages = list(self.bundle.raw_text["pages"])
+        for number in (3, 4):
+            path = self.root / f"page-{number:04d}.jpg"
+            path.write_bytes(f"image-{number}".encode())
+            pages.append(PageImage(number, path))
+            raw_pages.append({"page": number, "text": f"RAW {number}"})
+        bundle = EvidenceBundle(
+            "VI-parallel", self.source, "parallel-sha", "pdf",
+            {"kind": "pdf_text_pages", "pages": raw_pages},
+            pages, self.root,
+        )
+
+        class Tracker:
+            def __init__(inner):
+                inner.lock = threading.Lock()
+                inner.barrier = threading.Barrier(2)
+                inner.active = 0
+                inner.maximum = 0
+
+        class ForkableClient:
+            inline_limit_bytes = 18_000_000
+
+            def __init__(inner, tracker):
+                inner.tracker = tracker
+
+            def fork(inner):
+                return ForkableClient(inner.tracker)
+
+            def extract_document(inner, request_bundle, _context):
+                page = request_bundle.pages[0].page_number
+                with inner.tracker.lock:
+                    inner.tracker.active += 1
+                    inner.tracker.maximum = max(
+                        inner.tracker.maximum, inner.tracker.active,
+                    )
+                try:
+                    inner.tracker.barrier.wait(timeout=1)
+                finally:
+                    with inner.tracker.lock:
+                        inner.tracker.active -= 1
+                return extraction([extracted_record(
+                    record_key=f"row-{page}", comment_id=str(page),
+                    comment_number=str(page), page=page,
+                    exact_comment_text=f"Comment {page}",
+                    exact_response_text="",
+                    comment_location={
+                        "pages": [page], "description": "comment",
+                        "bounding_boxes": [],
+                    },
+                    response_location={
+                        "pages": [], "description": "",
+                        "bounding_boxes": [],
+                    },
+                    same_visible_row=False,
+                )])
+
+            def verify_document(inner, _bundle, value):
+                key = value["records"][0]["record_key"]
+                return verification(records=[{
+                    "record_key": key, "comment_captured": True,
+                    "response_captured": True,
+                    "text_complete_and_verbatim": True,
+                    "pairing_correct": True,
+                    "locations_and_boxes_correct": True,
+                    "same_visible_row_or_shared_id": True,
+                    "verified": True, "uncertainty_reason": "",
+                }])
+
+        tracker = Tracker()
+        pipeline = VisualIngestionPipeline(
+            ForkableClient(tracker), self.root / "artifacts",
+            batch_pages=1, batch_overlap=0, batch_workers=2,
+        )
+        pipeline.builder.build = lambda _source: bundle
+        comments, _responses, _links, _summary, _review = pipeline.process(
+            self.source, "permit.pdf",
+            {"city_hint": "Menlo Park", "review_round_hint": "3"},
+            force=True,
+        )
+        self.assertEqual(len(comments), 4)
+        self.assertEqual(tracker.maximum, 2)
+        self.assertTrue(pipeline._metrics["visual_batch_parallelized"])
 
     def test_page_batch_keeps_complete_text_for_its_rendered_pages(self):
         raw = {"kind": "pdf_text_pages", "pages": [
@@ -187,6 +389,62 @@ class VisualIngestionTests(unittest.TestCase):
         self.assertEqual([part["fileData"]["fileUri"] for part in first if "fileData" in part], ["gemini://page-1", "gemini://page-2"])
         self.assertEqual(len([part for part in second if "fileData" in part]), 2)
 
+    def test_credit_circuit_is_shared_by_forked_clients(self):
+        client = VisualGeminiClient("test-key")
+        fork = client.fork()
+        self.assertIs(client.circuit_breaker, fork.circuit_breaker)
+        client.circuit_breaker.trip("prepayment credits depleted")
+        with self.assertRaises(GeminiCircuitOpenError):
+            fork.circuit_breaker.check()
+        self.assertTrue(
+            VisualGeminiClient._definitive_quota_error(
+                "Your prepayment credits are depleted"
+            )
+        )
+        self.assertFalse(
+            VisualGeminiClient._definitive_quota_error("too many requests")
+        )
+
+    def test_stage_cache_change_archives_previous_output(self):
+        client = VisualGeminiClient("test-key")
+        pipeline = VisualIngestionPipeline(client, self.root / "artifacts")
+        bundle = self.bundle
+        metadata = bundle.artifact_dir / "gemini_cache_metadata.json"
+        output = bundle.artifact_dir / "gemini_extraction.json"
+        output.write_text(json.dumps({"old": True}), encoding="utf-8")
+        first = {"stage": "extraction", "version": 1}
+        second = {"stage": "extraction", "version": 2}
+        pipeline._write_stage_cache_identity(bundle, "extraction", first)
+        pipeline._archive_stage_output_if_identity_changes(bundle, "extraction", second)
+        pipeline._write_stage_cache_identity(bundle, "extraction", second)
+        history = bundle.artifact_dir / "cache_history"
+        self.assertTrue(history.is_dir())
+        self.assertTrue(list(history.glob("gemini_extraction-*.json")))
+        self.assertFalse(pipeline._stage_cache_is_compatible(bundle, "extraction", first))
+
+    def test_page_group_checkpoint_is_written(self):
+        class FakeClient:
+            def extract_document(self, request_bundle, context):
+                return extraction()
+
+            def verify_document(self, request_bundle, value):
+                return verification()
+
+        pipeline = VisualIngestionPipeline(
+            FakeClient(), self.root / "artifacts", batch_pages=1, batch_overlap=0,
+        )
+        pipeline.builder.build = lambda _source: self.bundle
+        pipeline.process(
+            self.source, "permit.pdf",
+            {"city_hint": "Menlo Park", "review_round_hint": "3"},
+            force=True,
+        )
+        checkpoints = json.loads(
+            (self.root / "page_checkpoints.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(checkpoints["checkpoint_version"], "page-group-v1")
+        self.assertEqual(checkpoints["groups"]["1"]["group"]["status"], "complete")
+
     def test_verified_result_preserves_exact_text_and_pairing(self):
         comments, responses, links, _summary, review = results_to_dataset_rows(
             self.bundle, extraction(), verification(), "comments&response/permit.pdf",
@@ -201,6 +459,37 @@ class VisualIngestionTests(unittest.TestCase):
         self.assertTrue(comments[0]["search_eligible"])
         self.assertEqual(comments[0]["text_trust_status"], "verified")
         self.assertEqual(review, [])
+
+    def test_document_date_is_preserved_on_rows_and_audit(self):
+        value = extraction(document_date={
+            "raw": "Report Date: May 4, 2026", "iso": "2026-05-04",
+            "source": "report_date", "page": 1,
+            "evidence": "Report Date: May 4, 2026", "confidence": 0.99,
+        })
+        comments, responses, links, summary, _review = results_to_dataset_rows(
+            self.bundle, value, verification(), "comments&response/permit.pdf",
+        )
+        self.assertEqual(comments[0]["source_document_date"], "2026-05-04")
+        self.assertEqual(responses[0]["document_date"]["iso"], "2026-05-04")
+        self.assertEqual(links[0]["document_date"]["source"], "report_date")
+        self.assertEqual(summary["document_date"]["iso"], "2026-05-04")
+
+    def test_document_date_falls_back_without_overwriting_round(self):
+        value = extraction(document_date={
+            "raw": "", "iso": "", "source": "unknown", "page": 0,
+            "evidence": "", "confidence": 0,
+        }, review_round="3")
+        bundle = EvidenceBundle(
+            "VI-date", Path("2025-05-04-comments.pdf"), "date-sha", "pdf",
+            {}, self.bundle.pages[:1], self.root, document_page_count=1,
+        )
+        metadata = normalize_document_date_metadata(value, bundle)
+        self.assertEqual(metadata["iso"], "2025-05-04")
+        self.assertEqual(value["review_round"], "3")
+
+    def test_extraction_prompt_requires_physical_document_date(self):
+        self.assertIn("document_date", EXTRACTION_INSTRUCTION)
+        self.assertIn("Never use a review-round label as a date", EXTRACTION_INSTRUCTION)
 
     def test_uncertain_extraction_is_needs_review_even_if_verifier_says_true(self):
         value = extraction([extracted_record(uncertain=True, uncertainty_reason="row boundary is unclear")])
@@ -237,6 +526,104 @@ class VisualIngestionTests(unittest.TestCase):
         self.assertFalse(comments[0]["search_eligible"])
         self.assertEqual(links[0]["review_status"], "needs_review")
         self.assertIn("same-visible-row", review[0]["reason"])
+
+    def test_unnumbered_adjacent_labelled_docx_pairs_are_confirmed(self):
+        separate = {
+            "property": "1263 Flickinger Ave", "city": "San Jose",
+            "review_round": "", "document_class": "combined",
+            "comment_section_complete": True, "review_reason": "",
+            "comments": [{
+                "record_key": "comment_1", "comment_number": "",
+                "department": "", "reviewer": "",
+                "exact_comment_text": "Identify all beams.",
+                "normalized_comment_text": "Identify all beams.",
+                "page_start": 1, "page_end": 1,
+                "bounding_boxes": [{
+                    "page": 1, "x_min": 100, "y_min": 100,
+                    "x_max": 800, "y_max": 150,
+                }],
+                "confidence": 1.0, "uncertain": False,
+                "uncertainty_reason": "",
+            }],
+            "responses": [{
+                "record_key": "response_1", "response_number": "",
+                "exact_response_text": "Response: plans updated",
+                "page_start": 1, "page_end": 1,
+                "bounding_boxes": [{
+                    "page": 1, "x_min": 100, "y_min": 160,
+                    "x_max": 800, "y_max": 200,
+                }],
+                "confidence": 1.0, "uncertain": False,
+                "uncertainty_reason": "",
+            }],
+            "additional_markups_referenced": False,
+        }
+        checked = {
+            "document_verified": True, "every_comment_captured": True,
+            "every_response_captured": True, "number_sequence_correct": True,
+            "continuations_joined_correctly": True, "headers_excluded": True,
+            "neighboring_items_separate": True, "no_response_leakage": True,
+            "later_markup_check_complete": True, "verification_summary": "ok",
+            "comments": [{
+                "record_key": "comment_1", "comment_captured": True,
+                "text_complete_and_verbatim": True,
+                "locations_and_boxes_correct": True, "verified": True,
+                "uncertainty_reason": "",
+            }],
+            "responses": [{
+                "record_key": "response_1", "response_captured": True,
+                "text_complete_and_verbatim": True,
+                "locations_and_boxes_correct": True, "verified": True,
+                "uncertainty_reason": "",
+            }],
+        }
+        paired, paired_check = match_verified_extraction(separate, checked)
+        self.assertTrue(paired["records"][0]["explicit_structural_pair"])
+        bundle = EvidenceBundle(
+            "VI-docx", self.source, "docx-sha", "docx",
+            {}, self.bundle.pages[:1], self.root, document_page_count=1,
+        )
+        comments, responses, links, _summary, review = results_to_dataset_rows(
+            bundle, paired, paired_check, "new/response.docx",
+        )
+        self.assertEqual(comments[0]["comment_number"], "item-1")
+        self.assertEqual(responses[0]["original_text"], "Response: plans updated")
+        self.assertEqual(links[0]["review_status"], "confirmed")
+        self.assertEqual(review, [])
+
+    def test_one_rejected_record_does_not_quarantine_verified_siblings(self):
+        rows = [
+            extracted_record(record_key="row-1", comment_id="1", comment_number="1"),
+            extracted_record(record_key="row-2", comment_id="2", comment_number="2"),
+        ]
+        checked = verification(
+            document_verified=False,
+            document_structure_verified=True,
+            verification_summary="row 2 differs",
+            records=[
+                {
+                    "record_key": "row-1", "comment_captured": True,
+                    "response_captured": True, "text_complete_and_verbatim": True,
+                    "pairing_correct": True, "locations_and_boxes_correct": True,
+                    "same_visible_row_or_shared_id": True, "verified": True,
+                    "uncertainty_reason": "",
+                },
+                {
+                    "record_key": "row-2", "comment_captured": True,
+                    "response_captured": True, "text_complete_and_verbatim": False,
+                    "pairing_correct": True, "locations_and_boxes_correct": True,
+                    "same_visible_row_or_shared_id": True, "verified": False,
+                    "uncertainty_reason": "text differs",
+                },
+            ],
+        )
+        comments, _responses, links, _summary, _review = results_to_dataset_rows(
+            self.bundle, extraction(rows), checked, "comments&response/permit.pdf",
+        )
+        self.assertTrue(comments[0]["search_eligible"])
+        self.assertFalse(comments[1]["search_eligible"])
+        self.assertEqual(links[0]["review_status"], "confirmed")
+        self.assertEqual(links[1]["review_status"], "needs_review")
 
     def test_low_confidence_or_invalid_pdf_box_is_quarantined(self):
         low = extraction([extracted_record(confidence=0.94)])
@@ -600,7 +987,7 @@ class VisualIngestionTests(unittest.TestCase):
         )
         self.assertEqual(
             client.page_groups,
-            [(1, 2), (1,), (2,), (2, 3), (2,), (3,)],
+            [(1, 2), (1,), (2,), (2, 3), (3,)],
         )
         self.assertEqual(
             [row["comment_number"] for row in comments],

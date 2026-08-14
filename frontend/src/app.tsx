@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react"
 import { DatabaseZap, FileSpreadsheet, LibraryBig, Link2, MapPin, RefreshCw } from "lucide-react"
 import { api } from "@/lib/api"
-import type { CityAnalysis, CityData, CommentRecord } from "@/types"
+import type { CityAnalysis, CityData, CommentRecord, RecurringIssue } from "@/types"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -17,7 +17,7 @@ const ImportDialog = lazy(() => import("@/components/import-dialog").then((modul
 const ReviewLinksDialog = lazy(() => import("@/components/review-links-dialog").then((module) => ({ default: module.ReviewLinksDialog })))
 const WorkbookReviewDialog = lazy(() => import("@/components/workbook-review-dialog").then((module) => ({ default: module.WorkbookReviewDialog })))
 
-const emptyFilters: Filters = { property_project: "", discipline: "", review_round: "", match_status: "", category: "", human_review_status: "" }
+const emptyFilters: Filters = { property_project: "", discipline: "", review_round: "", match_status: "", category: "", human_review_status: "", timeline: "" }
 
 export function App() {
   const [data, setData] = useState<CityData | null>(null)
@@ -78,6 +78,18 @@ export function App() {
     setExplanations(new Map())
     window.setTimeout(() => document.getElementById("historical-results")?.scrollIntoView({ behavior: "smooth", block: "start" }), 30)
   }
+  function openRecurringIssue(issue: RecurringIssue) {
+    if (!data) return
+    const ids = new Set(issue.comment_ids)
+    const issueComments = data.comments.filter((comment) => ids.has(comment.comment_id))
+    setComments(issueComments)
+    setResultLabel(`Recurring issue: ${issue.title}`)
+    setActiveId(issueComments.find((comment) => comment.response)?.comment_id || issueComments[0]?.comment_id || null)
+    setFilters(emptyFilters)
+    setRelevance(new Map())
+    setExplanations(new Map())
+    window.setTimeout(() => document.getElementById("historical-results")?.scrollIntoView({ behavior: "smooth", block: "start" }), 30)
+  }
   async function openResultSet(resultSetId: string) {
     setLoading(true)
     try {
@@ -99,9 +111,9 @@ export function App() {
     <main className="mx-auto max-w-[1680px] space-y-7 px-4 py-6 sm:px-6">
       {error && <Alert variant="destructive"><RefreshCw /><AlertTitle>Application error</AlertTitle><AlertDescription className="flex items-center justify-between gap-3"><span>{error}</span><Button variant="outline" size="sm" onClick={() => loadCity(city)}>Retry</Button></AlertDescription></Alert>}
       {loading && !data ? <div className="space-y-5"><Skeleton className="h-[620px] rounded-xl" /><Skeleton className="h-[700px] rounded-xl" /></div> : <>
-        {data?.analysis && <CitySummary city={city} analysis={data.analysis} onOpenTopic={openCommonTopic} />}
+        {data?.analysis && <CitySummary city={city} analysis={data.analysis} onOpenTopic={openCommonTopic} onOpenRecurringIssue={openRecurringIssue} />}
         <KnowledgeChat city={city} filters={{ discipline: filters.discipline, review_round: filters.review_round, category: filters.category }} onOpenSource={openSource} onOpenResults={openResultSet} />
-        <div id="historical-results"><HistoricalResults city={city} comments={comments} loading={loading} activeId={activeId} onActive={setActiveId} filters={filters} onFilters={setFilters} relevance={relevance} explanations={explanations} resultLabel={resultLabel} onClearResultSet={() => loadCity(city)} onOpenSource={openSource} onCategoriesChanged={() => loadCity(city)} /></div>
+        <div id="historical-results"><HistoricalResults city={city} comments={comments} loading={loading} activeId={activeId} onActive={setActiveId} filters={filters} onFilters={setFilters} relevance={relevance} explanations={explanations} recurringIssues={data?.analysis?.recurring_issues || []} resultLabel={resultLabel} onClearResultSet={() => loadCity(city)} onOpenSource={openSource} onCategoriesChanged={() => loadCity(city)} /></div>
       </>}
     </main>
     <Suspense fallback={null}>

@@ -4,6 +4,7 @@ __pycache__/
 
 # Large/private original permit documents are supplied separately.
 comments&response/
+new/
 
 # Regenerable converted document previews.
 web_app/data/previews/

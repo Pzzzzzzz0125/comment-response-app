@@ -103,6 +103,28 @@ signals, pages screened/processed/escalated, wall time, Gemini call counts,
 per-request bytes/tokens/attempts/model/timing, cached and thought tokens, and
 cache-hit percentage.
 
+Each processed document also writes an append-only `straggler_trace.jsonl` and
+a compact `straggler_summary.json` in its artifact directory. The trace records
+request creation, uploads, submission attempts, first/last streamed output,
+token usage, image/evidence counts, expected versus actual records, response
+bytes, retries, finish reason, and terminal status. Summaries report overall and
+per-stage p50/p95 latency plus likely TTFT, generation, retry, and unknown-status
+stragglers. Gemini does not expose an exact server queue duration in this API,
+so `queue_duration` remains null and `pre_generation_wait`/TTFT is reported as
+the measurable client-side wait instead of presenting an estimate as fact.
+Known high-demand `429`/`503` responses receive at most one bounded retry; the
+completed page checkpoints remain available for a later resume rather than
+holding the entire site open through repeated service-capacity waits.
+
+Visual PDF batches use two isolated Gemini clients by default. Non-overlapping
+batches run concurrently; adjacent overlap batches run in separate waves so
+cross-page context is preserved without simultaneous work on the same page.
+Set `--visual-batch-workers 1` for strictly sequential processing or override
+the default with `VISUAL_BATCH_WORKERS`. Verification requests retain record
+IDs, exact source text, cited pages, and bounding boxes, while dropping
+normalized text and extraction-only metadata that the image audit does not
+need.
+
 Create or refresh the complete inventory without calling Gemini:
 
 ```sh
@@ -140,8 +162,31 @@ Benchmark new site folders locally without calling Gemini:
 ```sh
 python3 phase2/benchmark_site_intake.py \
   'comments&response/NEW_SITE_A' \
-  'comments&response/NEW_SITE_B'
+  'comments&response/NEW_SITE_B' \
+  --output phase2_dataset/site_preflight_report.json
 ```
+
+The preflight uses local file hashes, direct text, spreadsheet rows, and PDF
+page signals only. It reports which files are `visual_full_read`,
+`structured_spreadsheet`, or `context_only`, together with selected evidence
+pages/rows, low-central-high input-token and elapsed-time estimates, and a
+`requires_confirmation` flag for expensive files or unresolved cities. It does
+not call Gemini or spend API quota. Estimates are planning ranges rather than
+promises because Gemini demand, OCR escalation, and uncertain layouts can
+change the actual run.
+
+By default the preflight reads `phase2_dataset/dataset.json` and estimates only
+new files or sources whose hash changed. Unchanged files and identical-hash
+aliases are reported as `cache_reuse` with zero Gemini cost. Add
+`--ignore-dataset-cache` only when estimating a completely fresh ingestion.
+Its default visual configuration matches production: six pages per batch, one
+overlap page, and two batch workers.
+
+Full ingestion also uses two isolated file workers by default. Each file owns
+its pipeline metrics and Gemini client; a slow source therefore does not stop a
+different source from being extracted and checkpointed. Combined with the two
+page-batch workers, the default upper bound is four concurrent Gemini requests.
+Use `--folder-workers 1` when a quota requires serial source processing.
 
 Run a bounded Gemini routing benchmark for only those folders:
 
@@ -231,6 +276,101 @@ records. `--local-only --apply` safely performs only the DOCX locator correction
 legacy orphan quarantine when external Gemini processing is unavailable.
 
 The source-registry migration is the viewer-ingestion step. It preserves originals, updates opaque document/citation IDs, and regenerates hash-addressed office previews when the corresponding original changes.
+
+### Versioned evidence model and checkpoints
+
+Every incremental or selective-repair write also publishes a deterministic
+`phase2_dataset/evidence_model.json` sidecar. The legacy `dataset.json` rows are
+left intact for compatibility; the sidecar is the normalized projection:
+
+```text
+raw document → raw extraction → evidence packet → source occurrence
+→ canonical event → issue timeline → common topic → verified index
+```
+
+`source_occurrences` retain the exact quote, source hash, page/row/cell or
+paragraph locator, and date/round provenance. A `canonical_event` groups one
+same-date/same-round event while retaining every supporting source occurrence.
+The sidecar never uses confidence alone to mark a record confirmed. Its gate
+requires original text, a locator, verbatim verification, pair verification,
+coverage verification, no conflict, and an explicit date or round. Records
+missing one of these checks are marked `needs_review` in the projection and are
+not eligible for verified search.
+
+Each raw document also has a versioned checkpoint for `uploaded`, `parsed`,
+`prescanned`, `extracted`, `verified`, `deduplicated`, `timeline_linked`, and
+`indexed`, including parser, prescan, extraction, verification, and dedup
+versions. Re-running a later stage therefore does not require re-reading or
+re-sending earlier stages to Gemini. The sidecar can be rebuilt locally with
+`phase2.evidence_model.materialize_evidence_model` without any API call.
+
+### Verbatim reconstruction and non-regression migration
+
+The additive representation layer keeps one authoritative readable wording
+without replacing source evidence. Comment and response records may carry:
+
+```text
+text_raw                    immutable parser/OCR/cell text
+text_reconstructed          lexical-preserving readable text
+display_structure           paragraph/list/heading offsets for the UI
+normalized_identity_text_v2 candidate identity normalization
+normalized_search_text_v2   search/embedding normalization
+source_unit_ids             PDF span/region, spreadsheet cell/row/range,
+                            DOCX paragraph/table cell, or CSV cell/row IDs
+reconstruction              version, method, verification, and uncertainty
+```
+
+Reconstruction may remove forced line breaks and proven export noise such as
+`_x000d_`, but it cannot paraphrase, correct wording, change numbers/codes, or
+merge comment and response text. `display_structure` is presentation-only and
+never participates in canonical identity, pairing, timeline ordering, search
+identity, or topic membership. Search and display prefer verified reconstructed
+text and fall back to legacy verified/original text during migration; source
+navigation continues to use the original locator.
+
+For new documents, verification may report a layout-only reconstruction defect.
+The pipeline permits one bounded correction request in that case. A candidate
+is accepted only when its lexical token and punctuation signature is identical
+to the exact source text, followed by an independent verification pass. Missing
+records, incorrect pairings, dates, or locators never enter this correction
+path and remain `needs_review`.
+
+Existing data uses an idempotent, deterministic, additive backfill. It does not
+call Gemini, merge records, or rebuild timelines:
+
+```sh
+python3 phase2/reconstruct_existing.py \
+  --dataset phase2_dataset/dataset.json \
+  --output phase2_dataset/dataset.reconstructed.json
+```
+
+The default output is separate from the active dataset. The command writes a
+report, checkpoint, and `reconstruction-non-regression-snapshot-v1` containing
+complete before/after relationship maps (canonical IDs, issue IDs, links,
+dates, rounds, source occurrence IDs/locators, and ordered timeline arrays).
+It fails rather than accepting a changed relationship graph. Use `--in-place`
+only after reviewing the report and snapshot. A later duplicate audit may
+produce candidates, but canonical repair remains a separate explicit operation.
+
+### Cross-file issue timelines
+
+Later review files can repeat earlier issue events before appending a new
+follow-up. Build one source-preserving timeline across every city with:
+
+```sh
+python3 phase2/repair_issue_event_duplicates.py
+python3 phase2/repair_issue_event_duplicates.py --apply
+python3 web_app/migrate_sources.py
+```
+
+The dry run reports affected threads and repeated event occurrences. The
+applied repair groups only compatible records from the same site and printed
+comment number, splits explicit `PC1` / `PC2` / later-round progressions, and
+stores each unique event once in `issue_event_index`. If an event appears in
+multiple files, every file and locator is retained in `source_occurrences` and
+shown as an additional citation. Original and verified extraction text is not
+rewritten. City common-topic counts treat all snapshots in one issue timeline
+as one logical occurrence.
 
 Run tests with:
 

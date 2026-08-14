@@ -36,6 +36,290 @@ def normalize_document_text(value: Any) -> str:
     return text.strip()
 
 
+def canonical_city_key(city: Any) -> str:
+    """Return an accent- and case-insensitive identity for a city label.
+
+    City names are metadata extracted from heterogeneous source files.  The
+    same municipality can therefore arrive as ``LOS ALTOS``/``Los Altos`` or
+    ``San Jos\u00e9``/``San Jose``.  Those spelling variants must not create
+    separate application scopes, while the original source text remains
+    untouched in the raw extraction artifacts.
+    """
+    value = unicodedata.normalize("NFKD", str(city or ""))
+    value = "".join(character for character in value if not unicodedata.combining(character))
+    value = unicodedata.normalize("NFKC", value).casefold()
+    value = re.sub(r"\s+", " ", value).strip(" ,.")
+    return value or "unknown"
+
+
+_CITY_DISPLAY_NAMES = {
+    "atherton": "Atherton",
+    "cupertino": "Cupertino",
+    "los altos": "Los Altos",
+    "menlo park": "Menlo Park",
+    "san jose": "San Jose",
+    "saratoga": "Saratoga",
+    "sunnyvale": "Sunnyvale",
+}
+
+
+def canonical_city_name(city: Any) -> str:
+    """Return the stable human-readable name used by filters and summaries."""
+    key = canonical_city_key(city)
+    if key in _CITY_DISPLAY_NAMES:
+        return _CITY_DISPLAY_NAMES[key]
+    return key.title() if key != "unknown" else "Unknown"
+
+
+_ORDINAL_STREET_WORDS = {
+    "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th",
+    "fifth": "5th", "sixth": "6th", "seventh": "7th", "eighth": "8th",
+    "ninth": "9th", "tenth": "10th", "eleventh": "11th", "twelfth": "12th",
+    "thirteenth": "13th", "fourteenth": "14th", "fifteenth": "15th",
+    "sixteenth": "16th", "seventeenth": "17th", "eighteenth": "18th",
+    "nineteenth": "19th", "twentieth": "20th",
+}
+
+
+def _project_folder(record: dict[str, Any]) -> str:
+    """Return the top-level project folder for either supported corpus root."""
+    source = _first_path(record.get("source_document"))
+    parts = Path(source).as_posix().split("/")
+    for marker in ("comments&response", "new"):
+        if marker in parts:
+            index = parts.index(marker) + 1
+            if index < len(parts) and parts[index]:
+                return parts[index]
+    return ""
+
+
+def _strip_project_marker(value: str) -> str:
+    """Remove permit-case prefixes while retaining the address portion."""
+    value = value.replace("_", " ")
+    # Remove the two-part permit prefix (25-001) but retain the third
+    # numeric component: in this corpus it is also the street number
+    # (25-001-2311 -> 2311 Warner Range Ave).
+    value = re.sub(
+        r"^\s*\d{2}\s*[- ]\s*\d{3}\s*[-_]*",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return value.strip()
+
+
+def _address_candidate(value: Any, city: Any = "") -> str:
+    """Normalize an address-like project label for stable identity/display."""
+    text = _strip_project_marker(normalize_document_text(value))
+    if not text:
+        return ""
+    # Exporters sometimes spell the same street as ``El-Prado`` in one
+    # workbook and ``El Prado`` in another.  A hyphen between letters is a
+    # word separator here; retain numeric/hyphenated address semantics.
+    text = re.sub(r"(?<=[a-z])-(?=[a-z])", " ", text)
+    text = re.split(r"\s+[—–|]\s+", text, maxsplit=1)[0]
+    city_value = normalize_document_text(city)
+    if city_value:
+        text = re.sub(rf",?\s*{re.escape(city_value)}\b.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r",?\s*(?:ca|california)\s+\d{5}(?:-\d{4})?$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*,\s*", ", ", text).strip(" ,.")
+    for word, replacement in _ORDINAL_STREET_WORDS.items():
+        text = re.sub(rf"\b{word}\b", replacement, text)
+    suffixes = {
+        "avenue": "ave", "street": "st", "road": "rd", "drive": "dr",
+        "boulevard": "blvd", "lane": "ln", "court": "ct", "place": "pl",
+        "parkway": "pkwy", "highway": "hwy", "circle": "cir", "terrace": "ter",
+        "trail": "trl", "way": "way",
+    }
+    text = re.sub(
+        r"\b(" + "|".join(suffixes) + r")\b",
+        lambda match: suffixes[match.group(1).casefold()],
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", text).strip(" ,.")
+
+
+def _stable_hierarchy_id(prefix: str, *values: Any) -> str:
+    value = "|".join(normalize_document_text(item) for item in values)
+    return f"{prefix}-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:20]
+
+
+def canonical_city_id(city: Any) -> str:
+    """Return a stable city identity shared by every source format."""
+    return _stable_hierarchy_id("CITY", canonical_city_key(city))
+
+
+def canonical_site_name(record: dict[str, Any]) -> str:
+    """Extract the physical address, excluding permit/scope labels."""
+    city = record.get("city")
+    declared = _address_candidate(record.get("property_project"), city)
+    folder = _address_candidate(_project_folder(record), city)
+    # Some extracted rows contain only ``110 Glenwood`` while the project
+    # folder contains ``25-015-110 Glenwood Ave``.  Prefer the folder only
+    # when it provides a more complete address, such as a street suffix.
+    folder_suffix = bool(re.search(r"\b(?:ave|st|rd|dr|blvd|ln|ct|pl|pkwy|hwy|cir|ter|trl|way)\b", folder))
+    declared_suffix = bool(re.search(r"\b(?:ave|st|rd|dr|blvd|ln|ct|pl|pkwy|hwy|cir|ter|trl|way)\b", declared))
+    folder_number = re.match(r"\s*(\d+)", folder)
+    declared_number = re.match(r"\s*(\d+)", declared)
+    if folder and folder_suffix and (
+        not declared
+        or not declared_suffix
+        or (folder_number and declared_number and folder_number.group(1) != declared_number.group(1))
+    ):
+        declared = folder
+    return declared or folder or normalize_document_text(record.get("property_project") or "unknown")
+
+
+def display_site_name(record: dict[str, Any]) -> str:
+    """Human-readable spelling for the stable physical-site name."""
+    value = canonical_site_name(record)
+    if not value:
+        return "Unknown site"
+    display = value.title()
+    # ``str.title`` turns ``17th`` into ``17Th``.  Keep ordinal suffixes in
+    # their normal address spelling for stable, readable project labels.
+    return re.sub(
+        r"\b(\d+)(St|Nd|Rd|Th)\b",
+        lambda match: f"{match.group(1)}{match.group(2).lower()}",
+        display,
+    )
+
+
+def _source_scope(record: dict[str, Any]) -> str:
+    source = _first_path(record.get("source_document"))
+    parts = Path(source).as_posix().split("/")
+    if "comments&response" in parts:
+        index = parts.index("comments&response") + 1
+        # The project folder is followed by a discipline/scope folder in the
+        # canonical corpus.  Include it so Building, Planning, Lot 1, etc.
+        # cannot be merged just because they share a street address.
+        if index + 1 < len(parts):
+            return normalize_document_text(parts[index + 1])
+    return normalize_document_text(record.get("discipline") or "unknown")
+
+
+def canonical_project_id(record: dict[str, Any], city_id: str = "", site_id: str = "") -> str:
+    city_id = city_id or canonical_city_id(record.get("city"))
+    site_id = site_id or _stable_hierarchy_id(
+        "SITE", city_id, canonical_site_name(record)
+    )
+    application = normalize_document_text(record.get("application_number"))
+    folder_project = _project_folder(record)
+    # Prefer a permit-case marker from either corpus root.  This makes
+    # ``comments&response/25-001-...`` and ``new/25-001-...`` the same
+    # project, while keeping genuinely different permit cases at one address
+    # separate.  Discipline/scope is deliberately excluded: Building,
+    # Structural and Planning files for one permit belong to one project.
+    case_marker = ""
+    # A permit marker embedded in ``property_project`` is often just a copied
+    # display label (and can be absent on an otherwise identical row).  Use
+    # the physical project folder or an explicit application field instead;
+    # otherwise fall back to the normalized address.
+    for candidate in (folder_project, application):
+        match = re.search(
+            r"(?<![A-Za-z0-9])(\d{2})\s*[- ]\s*(\d{3})\s*[- ]\s*(\d{2,6})(?!\d)",
+            normalize_document_text(candidate),
+        )
+        if match:
+            case_marker = "-".join(match.groups())
+            break
+    if case_marker:
+        project_key = f"case:{case_marker}"
+    elif folder_project:
+        # A legacy corpus may use a generic project-folder label without a
+        # permit number.  It is still a stronger shared identity than a raw
+        # spelling variant, and scope folders are intentionally excluded.
+        project_key = f"folder:{normalize_document_text(folder_project)}"
+    else:
+        project_key = f"site:{canonical_site_name(record)}"
+    # The project key is already the permit-case/folder identity.  Including
+    # the raw site_id here would re-split one project when one extracted row
+    # contains an incomplete or noisy address label.
+    return _stable_hierarchy_id("PROJECT", city_id, project_key)
+
+
+def annotate_hierarchy_ids(record: dict[str, Any]) -> dict[str, Any]:
+    """Annotate one record with stable city → site → project identities."""
+    city_id = canonical_city_id(record.get("city"))
+    site_name = canonical_site_name(record)
+    site_id = _stable_hierarchy_id("SITE", city_id, site_name)
+    project_id = canonical_project_id(record, city_id, site_id)
+    record["city_id"] = city_id
+    record["site_id"] = site_id
+    record["site_name"] = display_site_name(record)
+    record["project_id"] = project_id
+    record["project_name"] = display_site_name(record)
+    record["project_scope"] = _source_scope(record)
+    record["project_alias"] = str(record.get("property_project") or "")
+    record["observed_in_document_round"] = str(
+        record.get("observed_in_document_round") or record.get("review_round") or ""
+    )
+    return record
+
+
+_STREET_SUFFIX_RE = re.compile(
+    r"\b(?:ave|st|rd|dr|blvd|ln|ct|pl|pkwy|hwy|cir|ter|trl|way)\b",
+    re.IGNORECASE,
+)
+
+
+def _project_label_score(value: str) -> tuple[int, int, int, int]:
+    """Prefer a complete address over an abbreviated extraction alias."""
+    normalized = normalize_document_text(value)
+    return (
+        int(bool(re.match(r"\s*\d+\b", normalized))),
+        int(bool(_STREET_SUFFIX_RE.search(normalized))),
+        len(normalized.split()),
+        len(normalized),
+    )
+
+
+def _consolidate_project_labels(comments: list[dict[str, Any]]) -> None:
+    """Give every row in one permit project one display label.
+
+    ``property_project`` is retained as an immutable/raw alias.  The
+    canonical permit identity is already in ``project_id``; this pass only
+    selects the most complete address spelling among all rows in that project
+    so ``1263 Flickinger`` and ``1263 Flickinger Ave`` cannot appear as two
+    visible project filters/cards.
+    """
+    by_project: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in comments:
+        project_id = str(record.get("project_id") or "").strip()
+        if project_id:
+            by_project[project_id].append(record)
+
+    for records in by_project.values():
+        candidates = {
+            canonical_site_name(record)
+            for record in records
+            if canonical_site_name(record)
+        }
+        if not candidates:
+            continue
+        canonical_label = max(candidates, key=_project_label_score)
+        display_label = canonical_label.title()
+        display_label = re.sub(
+            r"\b(\d+)(St|Nd|Rd|Th)\b",
+            lambda match: f"{match.group(1)}{match.group(2).lower()}",
+            display_label,
+        )
+        aliases = sorted({
+            str(record.get("property_project") or "").strip()
+            for record in records
+            if str(record.get("property_project") or "").strip()
+        } | {
+            str(record.get("project_alias") or "").strip()
+            for record in records
+            if str(record.get("project_alias") or "").strip()
+        })
+        for record in records:
+            record["site_name"] = display_label
+            record["project_name"] = display_label
+            record["project_aliases"] = aliases
+
+
 def _record_text(record: dict[str, Any]) -> str:
     return normalize_document_text(
         record.get("verified_text") or record.get("original_text") or ""
@@ -121,6 +405,9 @@ def canonicalize_documents(comments: list[dict[str, Any]]) -> dict[str, Any]:
     document and marked ``needs_review``; it must not silently affect the
     common-topic count until reviewed.
     """
+    for record in comments:
+        annotate_hierarchy_ids(record)
+    _consolidate_project_labels(comments)
     rows_by_path = _document_rows(comments)
     source_files: dict[str, dict[str, Any]] = {}
     descriptors: list[dict[str, Any]] = []

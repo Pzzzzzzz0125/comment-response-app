@@ -7,6 +7,7 @@ import difflib
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ import unicodedata
 import zipfile
 from math import ceil
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree as ET
@@ -116,6 +118,8 @@ class SourceLocation:
     viewer_type: str
     page_number: int | None = None
     pdf_bounding_boxes: list[list[float]] = field(default_factory=list)
+    # Preserve continuation-page geometry for multi-page citations.
+    pdf_bounding_boxes_by_page: dict[str, list[list[float]]] = field(default_factory=dict)
     exact_quote: str = ""
     normalized_quote: str = ""
     sheet_name: str = ""
@@ -169,6 +173,27 @@ class SourceLocation:
         if isinstance(record.get("source_locator_json"), dict):
             metadata["structured_locator_json"] = record["source_locator_json"]
             metadata["coordinate_source"] = str(record.get("extraction_method", ""))
+        source_metadata = record.get("source_metadata")
+        row_context = (
+            source_metadata.get("pdf_same_row_context")
+            if isinstance(source_metadata, dict) else None
+        )
+        if not isinstance(row_context, dict):
+            row_context = record.get("source_row_context")
+        if isinstance(row_context, dict) and row_context.get("event_date"):
+            metadata["pdf_same_row_context"] = row_context
+            # Comment rows carry city/project fields; response rows do not.
+            # Both can carry response_id, so response_id alone is not a role
+            # discriminator for a matched government comment.
+            if record.get("city") or record.get("property_project"):
+                metadata["event_date"] = str(row_context.get("event_date") or "")
+                metadata["event_date_source"] = str(
+                    row_context.get("event_date_source") or ""
+                )
+            else:
+                metadata["associated_comment_event_date"] = str(
+                    row_context.get("event_date") or ""
+                )
         return cls(
             document_id=document_id,
             original_document_type=file_type,
@@ -509,6 +534,7 @@ def _postscript_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
+@lru_cache(maxsize=8192)
 def _pdf_page_size(path: Path, page_number: int, executable: str) -> tuple[float, float]:
     script = f"({_postscript_string(str(path))}) (r) file runpdfbegin {page_number} pdfgetpage /MediaBox get == quit"
     try:
@@ -546,25 +572,36 @@ def _normalized_locator_boxes(
     path: Path, page_number: int, value: Any,
 ) -> list[list[float]]:
     """Convert Gemini's 0-1000 top-left boxes to PDF bottom-left points."""
+    return _normalized_locator_boxes_by_page(path, value).get(str(page_number), [])
+
+
+def _normalized_locator_boxes_by_page(
+    path: Path, value: Any,
+) -> dict[str, list[list[float]]]:
+    """Convert all Gemini boxes while retaining each box's source page."""
     if not isinstance(value, dict) or not isinstance(value.get("bounding_boxes"), list):
-        return []
+        return {}
     executable = shutil.which("gs")
-    if not executable or page_number < 1:
-        return []
-    width, height = _pdf_page_size(path, page_number, executable)
-    boxes: list[list[float]] = []
+    if not executable:
+        return {}
+    dimensions: dict[int, tuple[float, float]] = {}
+    grouped: dict[str, list[list[float]]] = {}
     for item in value["bounding_boxes"]:
         if not isinstance(item, dict):
             continue
         try:
-            if int(item.get("page") or 0) != page_number:
+            page = int(item.get("page") or 0)
+            if page < 1:
                 continue
+            if page not in dimensions:
+                dimensions[page] = _pdf_page_size(path, page, executable)
+            width, height = dimensions[page]
             converted = _normalized_box_to_pdf(width, height, item)
         except (KeyError, TypeError, ValueError):
             continue
         if converted:
-            boxes.append(converted)
-    return boxes
+            grouped.setdefault(str(page), []).append(converted)
+    return grouped
 
 
 def _pdf_page_layout(path: Path, page_number: int) -> tuple[float, list[dict[str, Any]]]:
@@ -611,7 +648,13 @@ def _quote_tokens(value: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", unicodedata.normalize("NFKC", value or "").casefold())
 
 
-def _boxes_for_quote(page_height: float, lines: list[dict[str, Any]], quote: str) -> list[list[float]]:
+def _matching_quote_lines(lines: list[dict[str, Any]], quote: str) -> list[int]:
+    """Return the layout-line indexes occupied by a quote.
+
+    This is shared by highlighting and PDF row-context recovery.  Keeping one
+    matcher prevents a citation from highlighting one row while its date is
+    accidentally borrowed from another row.
+    """
     wanted = _quote_tokens(quote)
     if len(wanted) < 3 or not lines:
         return []
@@ -642,6 +685,47 @@ def _boxes_for_quote(page_height: float, lines: list[dict[str, Any]], quote: str
             if matches:
                 match_slice.extend((match.group(0), line_index, match.start(), match.end()) for match in matches)
 
+    return sorted({item[1] for item in match_slice})
+
+
+def _boxes_for_line_indexes(
+    page_height: float, lines: list[dict[str, Any]], line_indexes: list[int],
+) -> list[list[float]]:
+    boxes: list[list[float]] = []
+    for line_index in line_indexes:
+        characters = lines[line_index]["characters"]
+        if not characters:
+            continue
+        x_min = min(item[0] for item in characters)
+        x_max = max(item[2] for item in characters)
+        baseline = max(item[1] for item in characters)
+        font_size = max(item[4] for item in characters)
+        top_from_page = max(0.0, baseline - font_size * 1.05)
+        bottom_from_page = baseline + font_size * 0.25
+        boxes.append([
+            round(x_min, 2), round(page_height - bottom_from_page, 2),
+            round(x_max, 2), round(page_height - top_from_page, 2),
+        ])
+    return boxes
+
+
+def _boxes_for_quote(page_height: float, lines: list[dict[str, Any]], quote: str) -> list[list[float]]:
+    wanted = _quote_tokens(quote)
+    if len(wanted) < 3 or not lines:
+        return []
+    tokens: list[tuple[str, int, int, int]] = []
+    for line_index, line in enumerate(lines):
+        for match in re.finditer(r"[a-z0-9]+", unicodedata.normalize("NFKC", line["text"]).casefold()):
+            tokens.append((match.group(0), line_index, match.start(), match.end()))
+    match_slice: list[tuple[str, int, int, int]] = []
+    for start in range(0, len(tokens) - len(wanted) + 1):
+        if [item[0] for item in tokens[start:start + len(wanted)]] == wanted:
+            match_slice = tokens[start:start + len(wanted)]
+            break
+    if not match_slice:
+        indexes = _matching_quote_lines(lines, quote)
+        return _boxes_for_line_indexes(page_height, lines, indexes)
+
     boxes: list[list[float]] = []
     for line_index in sorted({item[1] for item in match_slice}):
         selected = [item for item in match_slice if item[1] == line_index]
@@ -663,6 +747,126 @@ def _boxes_for_quote(page_height: float, lines: list[dict[str, Any]], quote: str
     return boxes
 
 
+_PDF_ROW_TIMESTAMP = re.compile(
+    r"(?<!\d)(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{2}|20\d{2})"
+    r"(?:\s+(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM))?",
+    re.IGNORECASE,
+)
+
+
+def _pdf_row_iso_date(value: str) -> tuple[str, str]:
+    match = _PDF_ROW_TIMESTAMP.search(value or "")
+    if not match:
+        return "", ""
+    year = int(match.group("year"))
+    if year < 100:
+        year += 2000
+    try:
+        from datetime import date as _date
+
+        iso = _date(year, int(match.group("month")), int(match.group("day"))).isoformat()
+    except ValueError:
+        return "", ""
+    return iso, match.group(0).strip()
+
+
+def _line_bounds(line: dict[str, Any]) -> tuple[float, float, float, float]:
+    characters = line.get("characters", [])
+    return (
+        min(item[0] for item in characters), min(item[1] for item in characters),
+        max(item[2] for item in characters), max(item[3] for item in characters),
+    )
+
+
+def pdf_same_row_context(
+    path: Path, page_number: int, quote: str, printed_comment_id: str = "",
+    *, page_layout: tuple[float, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Recover reviewer/date context adjacent to a cited PDF table cell.
+
+    ProjectDox narrative PDFs visually preserve a table row but expose only
+    independent text spans.  The source citation normally targets the comment
+    or response cell, so this helper uses the *same matched quote geometry* as
+    the viewer and inspects only a narrow horizontal row band.  It does not
+    assign the reviewer timestamp to an applicant response; callers decide
+    which event role owns the recovered date.
+    """
+    page_height, lines = page_layout or _pdf_page_layout(path, page_number)
+    matched = _matching_quote_lines(lines, quote)
+    if not page_height or not matched:
+        return {}
+    anchor_bounds = [_line_bounds(lines[index]) for index in matched]
+    anchor_top = min(item[1] for item in anchor_bounds)
+    anchor_bottom = max(item[3] for item in anchor_bounds)
+    # Dates in these forms are in the reviewer column and may sit a few text
+    # baselines below a short response.  Forty-two PDF points covers a wrapped
+    # row while avoiding the next normal-height table row.
+    nearby: list[tuple[int, float, str]] = []
+    for index, line in enumerate(lines):
+        x_min, top, _x_max, bottom = _line_bounds(line)
+        distance = 0.0 if top <= anchor_bottom and bottom >= anchor_top else min(
+            abs(top - anchor_bottom), abs(bottom - anchor_top),
+        )
+        if distance <= 42.0:
+            nearby.append((index, x_min, str(line.get("text", "")).strip()))
+    dated: list[tuple[float, int, str, str]] = []
+    for index, x_min, text in nearby:
+        iso, raw = _pdf_row_iso_date(text)
+        if not iso:
+            continue
+        _left, top, _right, bottom = _line_bounds(lines[index])
+        distance = min(abs(top - anchor_bottom), abs(bottom - anchor_top))
+        # Reviewer/date cells are normally left of comment/response text.
+        left_bonus = 0.0 if x_min < min(item[0] for item in anchor_bounds) else 20.0
+        dated.append((distance + left_bonus, index, iso, raw))
+    if not dated:
+        return {}
+    _score, date_index, iso, raw = min(dated)
+    date_left, date_top, _date_right, date_bottom = _line_bounds(lines[date_index])
+    reviewer = ""
+    reviewer_candidates: list[tuple[float, str]] = []
+    for index, x_min, text in nearby:
+        if index == date_index or _pdf_row_iso_date(text)[0] or x_min > date_left + 60:
+            continue
+        lowered = text.casefold()
+        if any(
+            marker in lowered
+            for marker in (
+                "review", "markup", "comment", "bldg", ".pdf", "response",
+            )
+        ):
+            continue
+        alpha_tokens = re.findall(r"[A-Za-z][A-Za-z'\-]*", text)
+        if not (2 <= len(alpha_tokens) <= 5):
+            continue
+        _left, top, _right, bottom = _line_bounds(lines[index])
+        vertical_distance = date_top - bottom
+        if -1.5 <= vertical_distance <= 14:
+            reviewer_candidates.append((abs(vertical_distance), text))
+    if reviewer_candidates:
+        reviewer = min(reviewer_candidates)[1]
+    comment_id_seen = False
+    if str(printed_comment_id).strip():
+        expected = str(printed_comment_id).strip()
+        comment_id_seen = any(
+            re.fullmatch(rf"\s*{re.escape(expected)}\s*", text)
+            for _index, _x, text in nearby
+        )
+    row_indexes = sorted({index for index, _x, _text in nearby})
+    return {
+        "page": page_number,
+        "event_date": iso,
+        "event_date_raw": raw,
+        "event_date_source": "pdf_adjacent_reviewer_cell",
+        "reviewer": reviewer,
+        "printed_comment_id_seen": comment_id_seen,
+        "confidence": 1.0 if reviewer and (comment_id_seen or not printed_comment_id) else 0.9,
+        "date_pdf_bounding_boxes": _boxes_for_line_indexes(page_height, lines, [date_index]),
+        "row_pdf_bounding_boxes": _boxes_for_line_indexes(page_height, lines, row_indexes),
+        "row_text": [text for _index, _x, text in nearby if text],
+    }
+
+
 class SourceRegistry:
     def __init__(
         self,
@@ -676,6 +880,14 @@ class SourceRegistry:
     ):
         self.dataset_path = dataset_path.resolve()
         self.source_root = source_root.resolve()
+        self.corpus_base = self.source_root.parent
+        self.corpus_roots = [self.source_root]
+        sibling_new = self.corpus_base / "new"
+        if (
+            self.source_root.name == "comments&response"
+            and sibling_new.is_dir()
+        ):
+            self.corpus_roots.append(sibling_new.resolve())
         self.registry_path = registry_path.resolve()
         self.preview_root = preview_root.resolve()
         self.converter = converter or LibreOfficePreviewConverter()
@@ -687,7 +899,13 @@ class SourceRegistry:
             not self.registry_path.is_file()
             or self.dataset_path.stat().st_mtime_ns > self.registry_path.stat().st_mtime_ns
         )
-        if auto_migrate and registry_is_stale:
+        # Large corpora can contain PDFs whose Ghostscript text extraction
+        # takes minutes or times out.  The browser can safely serve the last
+        # normalized registry while a separate maintenance job performs the
+        # migration.  Keep the default strict behavior; this opt-out is only
+        # for starting the read-only UI without blocking on migration.
+        skip_migration = os.getenv("PERMIT_SKIP_SOURCE_REGISTRY_MIGRATION", "").casefold() in {"1", "true", "yes"}
+        if auto_migrate and registry_is_stale and not skip_migration:
             self.migrate()
 
     @property
@@ -699,14 +917,15 @@ class SourceRegistry:
         return self.payload.setdefault("sources", {})
 
     def _relative_path(self, path: Path) -> str:
-        return path.resolve().relative_to(self.source_root.parent).as_posix()
+        return path.resolve().relative_to(self.corpus_base).as_posix()
 
     def _path_for_relative(self, relative: str) -> Path:
-        candidate = (self.source_root.parent / relative).resolve()
-        try:
-            candidate.relative_to(self.source_root)
-        except ValueError as exc:
-            raise PermissionError("Document is outside the authorized corpus") from exc
+        candidate = (self.corpus_base / relative).resolve()
+        if not any(
+            candidate == root or candidate.is_relative_to(root)
+            for root in self.corpus_roots
+        ):
+            raise PermissionError("Document is outside the authorized corpus")
         return candidate
 
     def _document_for_path(self, path: Path, previous_by_path: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -788,18 +1007,23 @@ class SourceRegistry:
         documents: dict[str, dict[str, Any]] = {}
         path_to_id: dict[str, str] = {}
         aliases: dict[str, list[str]] = {}
-        for path in sorted(self.source_root.rglob("*")):
-            if not path.is_file() or path.name.startswith("."):
-                continue
-            document = self._document_for_path(path, old_by_path)
-            documents[document["document_id"]] = document
-            path_to_id[document["relative_path"]] = document["document_id"]
-            names = {path.name.casefold()}
-            versioned = re.match(r"(.+?\.(?:pdf|docx?|xlsx?))\s+v\d+\.\w+$", path.name, re.IGNORECASE)
-            if versioned:
-                names.add(versioned.group(1).casefold())
-            for name in names:
-                aliases.setdefault(name, []).append(document["document_id"])
+        for corpus_root in self.corpus_roots:
+            for path in sorted(corpus_root.rglob("*")):
+                if not path.is_file() or path.name.startswith("."):
+                    continue
+                document = self._document_for_path(path, old_by_path)
+                documents[document["document_id"]] = document
+                path_to_id[document["relative_path"]] = document["document_id"]
+                names = {path.name.casefold()}
+                versioned = re.match(
+                    r"(.+?\.(?:pdf|docx?|xlsx?))\s+v\d+\.\w+$",
+                    path.name,
+                    re.IGNORECASE,
+                )
+                if versioned:
+                    names.add(versioned.group(1).casefold())
+                for name in names:
+                    aliases.setdefault(name, []).append(document["document_id"])
         for document in list(documents.values()):
             preview = self._ensure_word_preview(document, old_documents.get(document["document_id"], {}))
             if preview:
@@ -957,6 +1181,75 @@ class SourceRegistry:
                             "document_id": document_id,
                             "location": additional_location.to_dict(),
                         }
+
+                # A duplicate extraction row is kept for audit, but its
+                # source must still be reachable from the canonical event.
+                # These occurrence records carry their own locator because a
+                # duplicate may come from a different workbook row or PDF
+                # page; reusing the winner's locator would highlight the wrong
+                # evidence.
+                for occurrence_index, occurrence in enumerate(
+                    record.get("source_occurrences", []) or [],
+                    1,
+                ):
+                    if not isinstance(occurrence, dict):
+                        continue
+                    occurrence_path = str(
+                        occurrence.get("source_document", "")
+                    ).split(" | ", 1)[0].strip()
+                    occurrence_document_id = path_to_id.get(occurrence_path)
+                    if not occurrence_document_id:
+                        continue
+                    if occurrence_path in raw_paths and not occurrence.get("comment_id"):
+                        continue
+                    occurrence_document = documents[occurrence_document_id]
+                    occurrence_record = dict(record)
+                    occurrence_record.update(occurrence)
+                    occurrence_record["source_document"] = occurrence_path
+                    occurrence_text = str(
+                        occurrence.get("exact_text")
+                        or occurrence_record.get("verified_text")
+                        or occurrence_record.get("original_text", "")
+                    )
+                    occurrence_row = (
+                        int(occurrence_record["source_row"])
+                        if str(occurrence_record.get("source_row", "")).isdigit()
+                        else None
+                    )
+                    occurrence_cell_range = ""
+                    if occurrence_document["original_document_type"] == "xlsx":
+                        occurrence_cell_range = find_xlsx_cell(
+                            self._path_for_relative(occurrence_path),
+                            str(occurrence_record.get("source_sheet", "")),
+                            occurrence_row,
+                            occurrence_text,
+                        )
+                    occurrence_location = SourceLocation.from_record(
+                        occurrence_record,
+                        occurrence_document_id,
+                        occurrence_document["original_document_type"],
+                        occurrence_document.get("preview_document_id"),
+                        occurrence_cell_range,
+                    )
+                    occurrence_location.metadata.update({
+                        "duplicate_source": True,
+                        "duplicate_record_id": str(
+                            occurrence.get("comment_id", "")
+                        ),
+                        "canonical_owner_id": owner_id,
+                    })
+                    occurrence_source_id = stable_id(
+                        "S",
+                        f"{owner_id}|{occurrence_document_id}|duplicate|"
+                        f"{occurrence_index}|{occurrence.get('comment_id', '')}",
+                    )
+                    sources[occurrence_source_id] = {
+                        "source_id": occurrence_source_id,
+                        "owner_id": owner_id,
+                        "relation": "Additional source",
+                        "document_id": occurrence_document_id,
+                        "location": occurrence_location.to_dict(),
+                    }
                 if collection == "comments":
                     for event_index, event in enumerate(
                         record.get("issue_thread_events", []) or [], 1,
@@ -1234,8 +1527,10 @@ class SourceRegistry:
                     )
                     add_reference(candidate, f"Secondary source · sheet {sheet}", location)
 
-        # Prefer one coordinate annotation over Adobe's multi-result search
-        # highlighting. Geometry is cached per PDF page and remains optional.
+        # Prefer precise line geometry when a Gemini locator is a broad table
+        # row. The broad box remains the fallback if the PDF text layer cannot
+        # reproduce the stored quote (for example, a scanned response letter).
+        # Geometry is cached per PDF page and remains optional.
         layout_cache: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
         coordinate_sources = 0
         for source in sources.values():
@@ -1243,11 +1538,8 @@ class SourceRegistry:
             document = documents[source["document_id"]]
             page_number = int(location.get("page_number") or 0)
             quote = str(location.get("exact_quote", ""))
-            if (
-                location.get("pdf_bounding_boxes")
-                and location.get("metadata", {}).get("coordinate_source")
-                in {"document_structure_rematch", "gemini_normalized_1000"}
-            ):
+            coordinate_source = location.get("metadata", {}).get("coordinate_source")
+            if coordinate_source == "document_structure_rematch" and location.get("pdf_bounding_boxes"):
                 coordinate_sources += 1
                 continue
             if document["original_document_type"] != "pdf" or page_number < 1 or not quote:
@@ -1258,8 +1550,27 @@ class SourceRegistry:
             page_height, lines = layout_cache[key]
             boxes = _boxes_for_quote(page_height, lines, quote)
             if boxes:
-                location["pdf_bounding_boxes"] = boxes
-                location.setdefault("metadata", {})["coordinate_source"] = "ghostscript_text_geometry"
+                stored = location.get("pdf_bounding_boxes") or []
+                # Do not replace a stored locator with a fuzzy match that
+                # escaped its cited row. A small tolerance covers font and
+                # baseline rounding differences between extractors.
+                fits_stored = True
+                if stored:
+                    x_min = min(float(box[0]) for box in stored if len(box) == 4)
+                    y_min = min(float(box[1]) for box in stored if len(box) == 4)
+                    x_max = max(float(box[2]) for box in stored if len(box) == 4)
+                    y_max = max(float(box[3]) for box in stored if len(box) == 4)
+                    fits_stored = all(
+                        len(box) == 4
+                        and float(box[0]) >= x_min - 16
+                        and float(box[1]) >= y_min - 16
+                        and float(box[2]) <= x_max + 16
+                        and float(box[3]) <= y_max + 16
+                        for box in boxes
+                    )
+                if fits_stored:
+                    location["pdf_bounding_boxes"] = boxes
+                    location.setdefault("metadata", {})["coordinate_source"] = "ghostscript_text_geometry"
                 coordinate_sources += 1
 
         self.payload = {"schema_version": "1.2", "documents": documents, "sources": sources}
@@ -1283,6 +1594,116 @@ class SourceRegistry:
             except PermissionError:
                 continue
         return visible
+
+    def recover_sources_for_record(
+        self,
+        owner_id: str,
+        record: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Recover a missing primary citation from an existing document.
+
+        The source registry is a derived cache.  A server can intentionally
+        start from an older registry while a large corpus migration runs in
+        the background, so a newly ingested standalone comment may already
+        have a trustworthy document/cell locator in the dataset but no
+        ``sources[]`` entry yet.  Library details must still expose that
+        source instead of showing only a non-clickable filename.
+
+        This recovery is deliberately conservative: it only reuses documents
+        already present in the authorized registry, never registers an
+        arbitrary filesystem path, and never replaces existing citations.
+        The recovered source is kept in memory and continues through the same
+        authorization and opaque-ID APIs as migrated sources.
+        """
+        existing = self.sources_for_owner(owner_id)
+        if existing:
+            return existing
+
+        raw_paths = [
+            part.strip().replace("\\", "/")
+            for part in re.split(
+                r"\s+\|\s+", str(record.get("source_document", "")),
+            )
+            if part.strip()
+        ]
+        if not raw_paths:
+            return []
+
+        documents = {
+            document_id: document
+            for document_id, document in self.documents.items()
+            if not document.get("is_preview")
+        }
+        exact_paths = {
+            str(document.get("relative_path", "")).replace("\\", "/"): document_id
+            for document_id, document in documents.items()
+            if document.get("relative_path")
+        }
+        folded_paths = {
+            path.casefold(): document_id for path, document_id in exact_paths.items()
+        }
+        basename_ids: dict[str, list[str]] = {}
+        for path, document_id in exact_paths.items():
+            basename_ids.setdefault(Path(path).name.casefold(), []).append(document_id)
+
+        for ordinal, relative in enumerate(raw_paths):
+            document_id = exact_paths.get(relative) or folded_paths.get(relative.casefold())
+            if not document_id:
+                # A basename fallback is safe only when it identifies exactly
+                # one already-authorized corpus document.
+                candidates = basename_ids.get(Path(relative).name.casefold(), [])
+                if len(candidates) == 1:
+                    document_id = candidates[0]
+            if not document_id:
+                continue
+
+            document = documents[document_id]
+            cell_range = str(record.get("source_cell_range", "") or "")
+            structured = record.get("source_locator_json")
+            if not cell_range and isinstance(structured, dict):
+                cell_range = str(structured.get("cell_range", "") or "")
+            if (
+                not cell_range
+                and document.get("original_document_type") == "xlsx"
+                and str(record.get("source_row", "")).isdigit()
+            ):
+                try:
+                    cell_range = find_xlsx_cell(
+                        self._path_for_relative(
+                            str(document.get("relative_path", "")),
+                        ),
+                        str(record.get("source_sheet", "")),
+                        int(record["source_row"]),
+                        str(
+                            record.get("verified_text")
+                            if record.get("text_trust_status") == "verified"
+                            and record.get("verified_text")
+                            else record.get("original_text", "")
+                        ),
+                    )
+                except (OSError, PermissionError, ValueError, zipfile.BadZipFile):
+                    cell_range = ""
+
+            location = SourceLocation.from_record(
+                record,
+                document_id,
+                str(document.get("original_document_type", "unknown")),
+                document.get("preview_document_id"),
+                cell_range,
+            )
+            location.metadata["registry_recovery"] = "dataset_source_locator"
+            source_id = stable_id(
+                "S", f"{owner_id}|{document_id}|primary|{ordinal}",
+            )
+            self.sources[source_id] = {
+                "source_id": source_id,
+                "owner_id": owner_id,
+                "relation": "Primary source",
+                "document_id": document_id,
+                "location": location.to_dict(),
+            }
+
+        return self.sources_for_owner(owner_id)
 
     def _authorized_document(self, document_id: str) -> dict[str, Any]:
         document = self.documents.get(document_id)
@@ -1311,10 +1732,48 @@ class SourceRegistry:
             "is_preview": bool(document.get("is_preview")),
         }
 
+    def _ensure_pdf_page_boxes(self, source: dict[str, Any]) -> None:
+        """Attach page-aware geometry lazily for old registries.
+
+        The registry is intentionally allowed to be served without a full
+        corpus migration.  Older entries only contain the first page's PDF
+        boxes, so derive the complete map from the preserved Gemini locator
+        when a citation is opened.  This keeps startup fast while fixing
+        multi-page citations immediately.
+        """
+        location = source.get("location")
+        if not isinstance(location, dict) or location.get("viewer_type") not in {"pdf", "pdf_preview"}:
+            return
+        if isinstance(location.get("pdf_bounding_boxes_by_page"), dict) and location.get("pdf_bounding_boxes_by_page"):
+            return
+        document = self.documents.get(str(source.get("document_id", "")))
+        if not document or document.get("original_document_type") != "pdf":
+            return
+        locator = (location.get("metadata") or {}).get("structured_locator_json")
+        if isinstance(locator, dict) and isinstance(locator.get("bounding_boxes"), list):
+            try:
+                grouped = _normalized_locator_boxes_by_page(
+                    self._path_for_relative(str(document.get("relative_path", ""))),
+                    locator,
+                )
+            except (OSError, PermissionError, ValueError):
+                grouped = {}
+            if grouped:
+                location["pdf_bounding_boxes_by_page"] = grouped
+                page_key = str(location.get("page_number") or "")
+                if not location.get("pdf_bounding_boxes") and page_key:
+                    location["pdf_bounding_boxes"] = grouped.get(page_key, [])
+                return
+        page = str(location.get("page_number") or "")
+        boxes = location.get("pdf_bounding_boxes")
+        if page and isinstance(boxes, list) and boxes:
+            location["pdf_bounding_boxes_by_page"] = {page: boxes}
+
     def public_source(self, source_id: str) -> dict[str, Any]:
         source = self.sources.get(source_id)
         if not source:
             raise KeyError("Unknown source citation")
+        self._ensure_pdf_page_boxes(source)
         document = self.public_document(source["document_id"])
         location = source["location"].copy()
         location["navigation"] = pdf_navigation(location) if location["viewer_type"] in {"pdf", "pdf_preview"} else None
@@ -1387,7 +1846,7 @@ class SourceRegistry:
             "status": status,
         }
 
-    def spreadsheet(self, document_id: str, sheet: str = "", cell_range: str = "", page: int = 1, page_size: int = 100) -> dict[str, Any]:
+    def spreadsheet(self, document_id: str, sheet: str = "", cell_range: str = "", page: int = 1, page_size: int = 100, context_range: str = "") -> dict[str, Any]:
         document = self._authorized_document(document_id)
         file_type = document["original_document_type"]
         if file_type not in SPREADSHEET_TYPES:
@@ -1404,8 +1863,9 @@ class SourceRegistry:
         page = max(1, page)
         page_size = max(10, min(page_size, 250))
         selection = parse_cell_range(cell_range)
-        focus_row = selection[0] if selection else 1
-        start_row = max(1, focus_row - 12) if cell_range else (page - 1) * page_size + 1
+        context_selection = parse_cell_range(context_range) or selection
+        focus_row = context_selection[0] if context_selection else 1
+        start_row = max(1, focus_row - 12) if (cell_range or context_range) else (page - 1) * page_size + 1
         end_row = start_row + page_size - 1
         if file_type == "xlsx":
             sheets = xlsx_sheet_names(path)
@@ -1438,6 +1898,8 @@ class SourceRegistry:
             "sheet_name": selected_sheet,
             "selection": cell_range,
             "selection_bounds": selection,
+            "context_range": context_range,
+            "context_bounds": context_selection,
             "start_row": start_row,
             "page": page,
             "page_size": page_size,

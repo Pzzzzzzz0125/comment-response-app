@@ -37,6 +37,12 @@ def _read_local_env() -> dict[str, str]:
 
 def gemini_api_key() -> str:
     """Return the shared Gemini key without logging or mutating the environment."""
+    # Test and offline-retrieval runs must be able to opt out even when a
+    # developer .env file is present.  An empty GEMINI_API_KEY used to fall
+    # through to that file, which made supposedly local regression requests
+    # unexpectedly call Gemini and appear to hang.
+    if os.environ.get("PERMIT_DISABLE_GEMINI", "").casefold() in {"1", "true", "yes"}:
+        return ""
     environment_value = (
         os.environ.get("GEMINI_API_KEY")
         or os.environ.get("GOOGLE_API_KEY")

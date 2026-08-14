@@ -141,6 +141,16 @@ The current evaluation results are provisional. A larger domain-reviewed gold da
 - `GET /api/conversations/{conversation_id}` returns the server-held conversation state.
 - `GET /api/result-sets/{result_set_id}/comments` hydrates an unexpired result set through the existing comment view model.
 
+Knowledge Chat responses may also include capability-checked `actions`. These
+are not free-form questions invented by the model: each action contains an
+allowlisted `type`, a short label, the current `result_set_id`, and optional
+parameters. The React client renders them as **Explore next** buttons and
+posts the selected action back as `guided_action`, preserving the prior result
+set while the backend performs the narrower lookup, project comparison,
+timeline analysis, response analysis, or unresolved-record filter. Actions are
+generated only when the verified result set contains the data needed to carry
+them out.
+
 Counts are calculated from unique parent comment IDs in backend code. Gemini cannot provide executable SQL, counts, record IDs, source IDs, or source locations. Semantic answers use only independently verified Direct and Related records; unverified fallback candidates are excluded. Confirmed-response summaries exclude suggested and otherwise unconfirmed response links.
 
 The application enforces a data-trust boundary before building the search index.
@@ -163,7 +173,7 @@ matching, preserves raw comment text, supports verified grouped responses, and
 stores both XML and visible DOCX paragraph indices. Repeating the import creates
 no additional responses or links.
 
-Knowledge Chat routing and grounded answer summaries use `gemini-3.1-flash-lite` by default through `KNOWLEDGE_GEMINI_MODEL` or `--knowledge-gemini-model`. It shares the server-side API key but uses a separate client from Smart Search, whose model remains controlled by `GEMINI_MODEL` or `--gemini-model`. Semantic retrieval inside a conversation continues to use the existing Smart Search client.
+Knowledge Chat routing and grounded answer summaries use `gemini-3.6-flash` by default through `KNOWLEDGE_GEMINI_MODEL` or `--knowledge-gemini-model`. It shares the server-side API key but uses a separate client from Smart Search, whose model remains controlled by `GEMINI_MODEL` or `--gemini-model`. Semantic retrieval inside a conversation continues to use the existing Smart Search client.
 
 Source files remain available only through authorized in-app preview and spreadsheet endpoints. The public source model exposes no original-download action, and `/api/documents/{document_id}/original` is disabled.
 
@@ -188,6 +198,51 @@ separate documents and listed for review; only confirmed new or reissued
 comments contribute to topic frequency. The city summary reports independent
 source documents and the number of physical duplicate files excluded.
 
+### Global same-event deduplication
+
+Run the explicit repair after a batch import or after adding a new source
+folder:
+
+```bash
+python3 web_app/deduplicate_comments.py --apply
+python3 web_app/migrate_sources.py
+python3 web_app/build_search_index.py --metadata-only
+```
+
+The repair keeps one production record for a same-site, same-review-round,
+same-date, same-normalized-text event. Immutable duplicate rows remain in
+`dataset.json` with `duplicate_of` and `search_eligible=false`. Their page,
+sheet, cell, paragraph, and file locators are copied to the canonical record's
+`source_occurrences`, so the source viewer exposes every supporting file. A
+different date, review round, site, or parameterized requirement remains a
+separate event.
+
+## Cross-round issue timelines
+
+The app treats a continuing design issue as one issue thread across all sites,
+disciplines, and submission rounds. A thread is keyed from the normalized site,
+discipline, and issue identity (`issue_thread_id`); it is not limited to one
+document or to the Nature project.
+
+Rows repeated by extraction within the same source submission are suppressed.
+Rows from a later numbered submission are retained as additional members of the
+same thread, so the history shows what was requested, what was answered, and
+what remained open at each point in time. Distinct sites, distinct issues, and
+meaningfully different parameterized requirements remain separate threads.
+
+The detail view displays one representative issue card in the results list and
+combines its immutable source records into a chronological timeline. Dates are
+shown from the most reliable available evidence: reviewer/discussion date,
+document filename date, submission label, or workbook export date. Original
+comment and response text is not overwritten when a later round is added.
+
+Within a thread, events with the same event type, calendar date, and normalized
+body are displayed once even when they were extracted from multiple files. The
+canonical event keeps every source occurrence, so the UI can show one event with
+multiple source buttons. Events without a reliable date are kept separate to
+avoid accidental merging. The repair command stores this audit index in
+`issue_event_index` while leaving each raw extraction row unchanged.
+
 ## Frontend Architecture
 
 The browser interface is a React 19 + TypeScript application in `frontend/`.
@@ -204,7 +259,9 @@ The component layers are:
 - `frontend/src/components/knowledge-chat.tsx`: the existing knowledge-chat API
   rendered as a source-grounded conversational experience.
 - `frontend/src/components/history-results.tsx`: keyword/Smart Search results,
-  filters, selection, categorization, and collapsible match explanations.
+  timeline-aware filters, selection, and collapsible retrieval explanations.
+  The former manual categorization controls are intentionally no longer exposed
+  in the history library.
 - `frontend/src/components/comment-detail.tsx`: responsive, resizable comparison
   of government comments and historical company responses.
 - `frontend/src/components/source-viewer.tsx`: authorized PDF and spreadsheet

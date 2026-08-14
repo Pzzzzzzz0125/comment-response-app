@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { AlertTriangle, Check, CheckCircle2, ChevronLeft, ChevronRight, ExternalLink, FileSpreadsheet, Flag, MessageSquareMore } from "lucide-react"
+import { AlertTriangle, Check, CheckCircle2, ChevronLeft, ChevronRight, Clock3, ExternalLink, FileSpreadsheet, Flag, MessageSquareMore } from "lucide-react"
 import { api } from "@/lib/api"
 import type { CommentRecord, SourceReference } from "@/types"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -170,8 +170,8 @@ export function WorkbookReviewDialog({
               {hasHistory ? <div className="mt-3 rounded-lg border border-teal-200 bg-teal-50/40 p-4">
                 <div className="flex flex-wrap items-center gap-2"><MessageSquareMore className="size-4 text-teal-800" /><p className="text-sm font-semibold">One issue with {issueEvents.length} review events</p><Badge className="ml-auto border-amber-200 bg-amber-50 text-amber-900" variant="outline">{row.issue_thread?.status || "History detected"}</Badge></div>
                 <div className="mt-3 space-y-2">
-                  {issueEvents.map((event, eventIndex) => <div className={`rounded-md border p-3 ${event.event_type === "reviewer_follow_up" ? "border-amber-200 bg-amber-50/80" : event.actor_role === "company" ? "border-teal-200 bg-white" : "bg-white"}`} key={event.event_id}>
-                    <div className="flex flex-wrap items-center gap-2 text-xs"><span className="font-semibold">{eventIndex + 1}. {event.label}</span>{event.actor && <span className="text-muted-foreground">{event.actor}</span>}{event.occurred_at_label && <Badge variant="outline">{event.occurred_at_label}</Badge>}{event.source && <Button className="ml-auto" variant="ghost" size="sm" onClick={() => openReference(event.source)}>Open cell<ExternalLink /></Button>}</div>
+                  {issueEvents.map((event, eventIndex) => <div className={`rounded-md border p-3 ${event.event_type === "reviewer_follow_up" ? "border-amber-200 bg-amber-50/80" : event.actor_role === "company" ? "border-teal-200 bg-white" : "bg-white"}`} key={[event.event_id, event.event_type, event.review_round, eventIndex].join("|")}>
+                    <div className="flex flex-wrap items-center gap-2 text-xs"><span className="font-semibold">{eventIndex + 1}. {event.label}</span>{event.actor && <span className="text-muted-foreground">{event.actor}</span>}<Badge className={event.time_precision === "exact" || event.time_precision === "exact_date" ? "bg-white" : "bg-slate-50 text-slate-700"} variant="outline"><Clock3 />{event.time_label || event.occurred_at_label?.split(" ")[0] || (event.review_round ? `Exact date not recorded · Round ${event.review_round}` : "Exact date not recorded")}</Badge>{event.source && <Button className="ml-auto" variant="ghost" size="sm" onClick={() => openReference(event.source)}>Open cell<ExternalLink /></Button>}</div>
                     <p className="mt-2 whitespace-pre-wrap text-sm leading-6">{event.text}</p>
                   </div>)}
                 </div>

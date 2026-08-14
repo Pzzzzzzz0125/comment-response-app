@@ -125,9 +125,17 @@ def document_date(
     """Return ISO date, evidence, and method without using filesystem mtime."""
     for record in records:
         for field in ("document_date", "source_document_date", "report_date", "letter_date"):
-            parsed = _parse_date(record.get(field))
+            value = record.get(field)
+            if isinstance(value, dict):
+                parsed = _parse_date(value.get("iso") or value.get("raw") or value.get("value"))
+                evidence = str(value.get("evidence") or value.get("raw") or value.get("iso") or "")
+                source = str(value.get("source") or field)
+            else:
+                parsed = _parse_date(value)
+                evidence = str(value or "")
+                source = field
             if parsed:
-                return parsed, str(record.get(field)), f"record.{field}"
+                return parsed, evidence, f"record.{source}"
     if path.suffix.casefold() == ".docx":
         return _docx_date(path)
     return "", "", "missing"

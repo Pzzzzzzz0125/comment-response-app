@@ -28,18 +28,80 @@ if str(WORKSPACE_IMPORT) not in sys.path:
 
 from corpus_audit import audit_corpus as audit
 from phase2 import extract_dataset as base
-from phase2.visual_ingestion import (
-    PIPELINE_VERSION, PRESCAN_PROMPT_VERSION, SUPPORTED_TYPES,
-    VisualGeminiClient, VisualIngestionPipeline, atomic_json, sha256_file,
+from phase2.issue_event_dedup import (
+    assign_issue_threads,
+    build_issue_event_index,
+    collect_issue_event_review_queue,
 )
+from phase2.visual_ingestion import (
+    CHECKPOINT_SCHEMA_VERSION, EXTRACTION_PROMPT_VERSION, PAGE_SCREENING_VERSION,
+    PIPELINE_VERSION, PRESCAN_PROMPT_VERSION, SUPPORTED_TYPES,
+    TEXT_EXTRACTION_VERSION, VERIFICATION_PROMPT_VERSION,
+    GeminiCircuitOpenError, VisualGeminiClient, VisualIngestionPipeline,
+    atomic_json, sha256_file, utc_timestamp,
+)
+from phase2.straggler_monitor import summarize_request_metrics
+from phase2.evidence_model import materialize_evidence_model
 from web_app.comment_dedup import mark_duplicate_comments
 from web_app.comment_hierarchy import (
     merge_docx_comment_hierarchy,
     read_docx_paragraphs,
 )
-from web_app.source_lineage import mark_copied_source_documents
+from web_app.source_lineage import document_date as derive_document_date, mark_copied_source_documents
 from web_app.document_identity import canonicalize_documents, source_file_id
 from web_app.local_secrets import gemini_api_key
+
+
+def rebuild_issue_event_index(comments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Rebuild persisted recurring-issue history whenever the dataset is written.
+
+    ``issue_event_index`` is a derived presentation index, not an immutable
+    source field.  Recomputing it after a merge/repair keeps Recurring Issues
+    available after incremental ingestion instead of silently dropping the
+    index from the JSON envelope.
+    """
+    assign_issue_threads(comments)
+    return build_issue_event_index(comments)
+
+
+def write_pipeline_checkpoint(
+    output_dir: Path,
+    run_id: str,
+    stages: dict[str, str],
+    **details: Any,
+) -> dict[str, Any]:
+    """Persist resumable stage state independently from dataset materialization."""
+    path = output_dir / "pipeline_checkpoint.json"
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        previous = {}
+    version_map = {
+        "uploaded": "inventory-v1", "parsed": TEXT_EXTRACTION_VERSION,
+        "prescanned": PRESCAN_PROMPT_VERSION,
+        "extracted": EXTRACTION_PROMPT_VERSION,
+        "verified": VERIFICATION_PROMPT_VERSION,
+        "deduplicated": CHECKPOINT_SCHEMA_VERSION,
+        "timeline_linked": PIPELINE_VERSION,
+        "indexed": PIPELINE_VERSION,
+    }
+    entries = previous.get("stages", {}) if isinstance(previous.get("stages"), dict) else {}
+    now = utc_timestamp()
+    for name, status in stages.items():
+        entries[name] = {
+            "status": status,
+            "updated_at": now,
+            "version": version_map.get(name, PIPELINE_VERSION),
+        }
+    payload = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "run_id": run_id,
+        "updated_at": now,
+        "stages": entries,
+        **details,
+    }
+    atomic_json(path, payload)
+    return payload
 
 
 def _metadata_from_path(relative_path: str) -> dict[str, str]:
@@ -55,6 +117,21 @@ def _known_city(value: Any) -> bool:
     return bool(str(value or "").strip()) and str(value).casefold() != "unknown"
 
 
+def _explicit_city_from_site_folder(relative_path: str) -> str:
+    """Return the city explicitly encoded in ``Address, City, CA ZIP``.
+
+    Contact addresses inside Title-24 and consultant documents frequently name
+    a different city.  The project-folder address is therefore the stronger
+    site-level jurisdiction signal when it contains this complete pattern.
+    """
+    site = _site_folder(relative_path)
+    match = re.search(
+        r",\s*([^,/]+?)\s*,\s*CA\s+\d{5}(?:-\d{4})?(?:\b|$)",
+        site, re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", match.group(1)).strip().title() if match else ""
+
+
 def quick_city_for_source(
     path: Path,
     relative_path: str,
@@ -64,6 +141,13 @@ def quick_city_for_source(
 ) -> tuple[str, float, list[str], str]:
     """Determine jurisdiction from bounded local content without an AI call."""
     audit_row = audit_row or {}
+    folder_city = _explicit_city_from_site_folder(relative_path)
+    if folder_city:
+        return (
+            folder_city, 1.0,
+            [f"project folder explicitly identifies {folder_city}, CA"],
+            "explicit_site_folder_address",
+        )
     candidates: list[tuple[str, float, list[str], str]] = []
     audit_city = str(audit_row.get("likely_city", ""))
     if _known_city(audit_city):
@@ -156,9 +240,30 @@ def quick_city_for_source(
 
 def _site_folder(relative_path: str) -> str:
     parts = Path(relative_path).parts
-    return parts[1] if len(parts) > 1 and parts[0] == "comments&response" else (
+    return parts[1] if len(parts) > 1 and parts[0] in {"comments&response", "new"} else (
         parts[0] if parts else ""
     )
+
+
+def load_prescan_decisions(path: Path | None) -> dict[str, dict[str, Any]]:
+    """Load per-file routing without trusting group-level city/round hints."""
+    if path is None or not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+    decisions: dict[str, dict[str, Any]] = {}
+    for group in payload.get("groups", []) if isinstance(payload, dict) else []:
+        if not isinstance(group, dict):
+            continue
+        for row in group.get("files", []) or []:
+            if not isinstance(row, dict):
+                continue
+            relative = str(row.get("relative_path", ""))
+            if relative:
+                decisions[relative] = row
+    return decisions
 
 
 def resolve_inventory_cities(
@@ -172,6 +277,20 @@ def resolve_inventory_cities(
         by_site.setdefault(_site_folder(str(row["relative_path"])), []).append(row)
 
     for site_rows in by_site.values():
+        folder_city = _explicit_city_from_site_folder(
+            str(site_rows[0]["relative_path"]),
+        ) if site_rows else ""
+        if folder_city:
+            for row in site_rows:
+                row.update(
+                    city=folder_city,
+                    city_confidence=1.0,
+                    city_evidence=[
+                        f"project folder explicitly identifies {folder_city}, CA",
+                    ],
+                    city_resolution_method="explicit_site_folder_address",
+                )
+            continue
         strong = [
             row for row in site_rows
             if _known_city(row.get("city"))
@@ -235,7 +354,17 @@ def inventory_supported_files(
     """Register every supported source; filenames affect priority, never inclusion."""
     discovery_started = time.perf_counter()
     workspace = workspace.resolve()
-    source_root = workspace / "comments&response"
+    source_roots = [
+        root for root in (
+            workspace / "comments&response",
+            workspace / "new",
+        )
+        if root.is_dir()
+    ]
+    if not source_roots:
+        raise ValueError(
+            "No source folders found; expected comments&response/ or new/"
+        )
     previous_entries: list[dict[str, Any]] = []
     if report_path.is_file():
         try:
@@ -251,9 +380,15 @@ def inventory_supported_files(
         for row in previous_entries if isinstance(row, dict) and row.get("sha256")
     }
     files: list[dict[str, Any]] = []
-    for path in sorted(source_root.rglob("*")):
-        if not path.is_file() or path.name.startswith(".") or path.suffix.casefold() not in SUPPORTED_TYPES:
-            continue
+    discovered_paths = sorted({
+        path
+        for source_root in source_roots
+        for path in source_root.rglob("*")
+        if path.is_file()
+        and not path.name.startswith(".")
+        and path.suffix.casefold() in SUPPORTED_TYPES
+    })
+    for path in discovered_paths:
         relative = path.relative_to(workspace).as_posix()
         stat = path.stat()
         previous = previous_by_path.get(relative, {})
@@ -266,11 +401,21 @@ def inventory_supported_files(
         digest = str(previous.get("sha256")) if unchanged else sha256_file(path)
         hashing_seconds = time.perf_counter() - hash_started
         audit_row = audit_inventory.get(relative, {})
+        if not audit_row and unchanged and previous:
+            # ``new/`` sources are not necessarily present in the legacy audit
+            # workbook.  The reconciled ingestion report already stores the
+            # same cheap local classification, so reuse it when size/mtime are
+            # unchanged instead of reopening hundreds of files on every
+            # incremental site run.
+            audit_row = previous
         if not audit_row:
             # New files should receive the same cheap local classification as a
             # full audit before Gemini routing. This avoids filename-only
             # fallback decisions while keeping existing audited files cached.
-            audit_row = audit.inspect_file(path, source_root, workspace)
+            owning_root = next(
+                root for root in source_roots if path.is_relative_to(root)
+            )
+            audit_row = audit.inspect_file(path, owning_root, workspace)
         if unchanged and _known_city(previous.get("city")):
             audit_row = {
                 **audit_row,
@@ -289,7 +434,9 @@ def inventory_supported_files(
         cache_reused = bool(
             hash_cache
             and hash_cache.get("ingestion_pipeline_version") == PIPELINE_VERSION
-            and hash_cache.get("processing_status") not in {"", "pending", "failed"}
+            and hash_cache.get("processing_status") not in {
+                "", "pending", "failed", "paused_quota", "circuit_open",
+            }
         )
         status = (
             str(hash_cache.get("processing_status"))
@@ -298,7 +445,9 @@ def inventory_supported_files(
             if (
                 unchanged
                 and previous.get("ingestion_pipeline_version") == PIPELINE_VERSION
-                and previous.get("processing_status") != "failed"
+                and previous.get("processing_status") not in {
+                    "failed", "paused_quota", "circuit_open",
+                }
             )
             else "pending"
         )
@@ -358,6 +507,7 @@ def write_ingestion_report(
     report_path: Path,
     inventory_files: list[dict[str, Any]],
     source_summaries: list[dict[str, Any]],
+    run_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     by_path = {str(row.get("relative_path", "")): row for row in inventory_files}
     for summary in source_summaries:
@@ -393,6 +543,16 @@ def write_ingestion_report(
                 "pages_escalated": summary.get("pages_escalated", []),
                 "completion_status": str(summary.get("completion_status", "")),
                 "performance": summary.get("performance", {}),
+                "prescan_performance": summary.get("prescan_performance", {}),
+                "parser_version": str(summary.get("parser_version", TEXT_EXTRACTION_VERSION)),
+                "page_screening_version": str(summary.get("page_screening_version", PAGE_SCREENING_VERSION)),
+                "prescan_prompt_version": str(summary.get("prescan_prompt_version", PRESCAN_PROMPT_VERSION)),
+                "extraction_prompt_version": str(summary.get("extraction_prompt_version", EXTRACTION_PROMPT_VERSION)),
+                "verification_prompt_version": str(summary.get("verification_prompt_version", VERIFICATION_PROMPT_VERSION)),
+                "dedup_version": str(summary.get("dedup_version", CHECKPOINT_SCHEMA_VERSION)),
+                "verification_contract_version": str(summary.get("verification_contract_version", "")),
+                "pair_verification": copy.deepcopy(summary.get("pair_verification", {})),
+                "coverage_verification": copy.deepcopy(summary.get("coverage_verification", {})),
                 "ingestion_pipeline_version": PIPELINE_VERSION,
             })
     files = sorted(by_path.values(), key=lambda row: str(row.get("relative_path", "")))
@@ -405,7 +565,12 @@ def write_ingestion_report(
         not row.get("cache_reused_from") and row.get("processing_status") == "pending"
         for row in files
     )
-    processed = len(files) - cached - failed - pending
+    paused_quota = sum(
+        not row.get("cache_reused_from")
+        and row.get("processing_status") in {"paused_quota", "circuit_open"}
+        for row in files
+    )
+    processed = len(files) - cached - failed - pending - paused_quota
     by_status: dict[str, int] = {}
     for row in files:
         status = str(row.get("processing_status", "pending"))
@@ -498,6 +663,71 @@ def write_ingestion_report(
             page_count(row.get("pages_escalated", [])) for row in files
         ),
     }
+    all_request_metrics = [
+        request
+        for row in performance_rows
+        for request in row.get("request_metrics", [])
+        if isinstance(request, dict)
+    ]
+    prescan_request_rows: list[dict[str, Any]] = []
+    seen_prescan_metrics: set[str] = set()
+    for row in files:
+        value = row.get("prescan_performance", {})
+        if not isinstance(value, dict) or not value:
+            continue
+        signature = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        if signature in seen_prescan_metrics:
+            continue
+        seen_prescan_metrics.add(signature)
+        prescan_request_rows.append(value)
+    performance["prescan_request_count"] = len(prescan_request_rows)
+
+    def request_sum(field: str) -> int | float:
+        return sum(
+            float(item.get(field) or 0.0)
+            for item in all_request_metrics
+        )
+
+    def prescan_sum(field: str) -> int | float:
+        return sum(
+            float(item.get(field) or 0.0)
+            for item in prescan_request_rows
+        )
+
+    # Keep the full request-level accounting in the report.  Previously this
+    # field was hard-coded to None, which made a completed run look cheap even
+    # when prescan and visual verification consumed substantial tokens.
+    performance["gemini_input_tokens"] = int(request_sum("input_tokens") + prescan_sum("input_tokens"))
+    performance["gemini_cached_input_tokens"] = int(
+        request_sum("cached_input_tokens") + prescan_sum("cached_input_tokens")
+    )
+    performance["gemini_output_tokens"] = int(request_sum("output_tokens") + prescan_sum("output_tokens"))
+    performance["gemini_thought_tokens"] = int(request_sum("thought_tokens") + prescan_sum("thought_tokens"))
+    performance["request_count"] = len(all_request_metrics) + len(prescan_request_rows)
+    for field in (
+        "request_bytes", "response_bytes", "retry_count", "image_count",
+        "evidence_unit_count", "expected_record_count", "actual_record_count",
+    ):
+        performance[field] = int(request_sum(field) + sum(float(item.get(field) or 0.0) for item in prescan_request_rows))
+    for field in (
+        "upload_duration", "time_to_first_token", "total_time_to_first_token",
+        "pre_generation_wait", "generation_duration", "queue_duration",
+    ):
+        performance[field] = round(request_sum(field) + sum(float(item.get(field) or 0.0) for item in prescan_request_rows), 4)
+    performance["finish_reasons"] = sorted({
+        str(item.get("finish_reason", "")) for item in [*all_request_metrics, *prescan_request_rows]
+        if str(item.get("finish_reason", ""))
+    })
+    performance["models_used"] = sorted({
+        str(item.get("model", "")) for item in [*all_request_metrics, *prescan_request_rows]
+        if str(item.get("model", ""))
+    } | {
+        str(row.get("model", "")) for row in prescan_request_rows
+        if str(row.get("model", ""))
+    })
+    performance["straggler_summary"] = summarize_request_metrics(
+        all_request_metrics + prescan_request_rows
+    )
     performance["total_compute_api_seconds"] = round(
         performance["hashing_seconds"]
         + performance["canonicalization_seconds"]
@@ -519,14 +749,16 @@ def write_ingestion_report(
         2,
     ) if cache_attempts else 0.0
     payload = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "ingestion_pipeline_version": PIPELINE_VERSION,
+        "run": dict(run_metadata or {}),
         "totals": {
             "discovered_files": len(files),
             "processed_files": processed,
             "cached_files": cached,
             "failed_files": failed,
-            "pending_files": pending,
+        "pending_files": pending,
+        "paused_quota_files": paused_quota,
             "reconciles": len(files) == processed + cached + failed,
             "inventory_reconciles": len(files) == processed + cached + failed + pending,
             "by_status": dict(sorted(by_status.items())),
@@ -1384,11 +1616,62 @@ def expand_menlo_source_group(
     return list(ordered.values())
 
 
+def _annotate_legacy_source_provenance(
+    comments: list[dict[str, Any]], responses: list[dict[str, Any]],
+    links: list[dict[str, Any]], source: Path, source_relative: str,
+    summary: dict[str, Any],
+) -> None:
+    """Attach the same auditable date/round contract to local-parser output."""
+    try:
+        iso, evidence, method = derive_document_date(source, [*comments, *responses])
+    except (OSError, ValueError, TypeError, zipfile.BadZipFile, ET.ParseError):
+        iso, evidence, method = "", "", "missing"
+    explicit_round = next((
+        str(row.get("review_round") or row.get("document_round") or row.get("source_cycle") or "").strip()
+        for row in [*comments, *responses]
+        if str(row.get("review_round") or row.get("document_round") or row.get("source_cycle") or "").strip()
+    ), "")
+    round_value = explicit_round or str(summary.get("likely_review_round", "") or "").strip()
+    round_meta = {
+        "value": round_value,
+        "raw": round_value,
+        "source": "record_content" if explicit_round else (
+            "audit_or_filename_fallback" if round_value else "unknown"
+        ),
+        "confidence": 0.8 if explicit_round else (0.45 if round_value else 0.0),
+    }
+    for row in [*comments, *responses]:
+        row.setdefault("source_document", source_relative)
+        if iso:
+            row.setdefault("source_document_date", iso)
+            row.setdefault("document_date_iso", iso)
+            row.setdefault("document_date", {
+                "raw": evidence, "iso": iso, "source": method,
+                "page": 0, "evidence": evidence,
+                "confidence": 0.8 if method != "missing" else 0.0,
+            })
+            row.setdefault("document_date_raw", evidence)
+            row.setdefault("document_date_source", method)
+            row.setdefault("source_date_evidence", evidence)
+            row.setdefault("source_date_method", method)
+        row.setdefault("review_round_metadata", copy.deepcopy(round_meta))
+    for row in links:
+        row.setdefault("source_document", source_relative)
+        if iso:
+            row.setdefault("source_document_date", iso)
+            row.setdefault("document_date", {
+                "raw": evidence, "iso": iso, "source": method,
+                "page": 0, "evidence": evidence,
+                "confidence": 0.8 if method != "missing" else 0.0,
+            })
+        row.setdefault("review_round_metadata", copy.deepcopy(round_meta))
 def process_new_group(
     workspace: Path,
     summary: dict[str, str],
     records: list[dict[str, Any]],
     pipeline: VisualIngestionPipeline,
+    file_workers: int = 1,
+    prescan_decisions: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     comments: list[dict[str, Any]] = []
     responses: list[dict[str, Any]] = []
@@ -1411,6 +1694,7 @@ def process_new_group(
         workspace, summary, canonical_records, pipeline, use_gemini=False,
     )
     decisions = prescan_decision_map(prescan)
+    supplied_decisions = prescan_decisions or {}
     for alias in source_aliases:
         record = alias["record"]
         decision = {
@@ -1442,10 +1726,54 @@ def process_new_group(
             "normalized_content_fingerprint": alias["content_fingerprint"],
             "ingestion_pipeline_version": PIPELINE_VERSION,
         })
+    work_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for record in canonical_records:
-        decision = decisions.get(record["path"], fallback_prescan_decision(record))
+        decision = sanitize_prescan_decision(
+            record,
+            supplied_decisions.get(
+                record["path"],
+                decisions.get(record["path"], fallback_prescan_decision(record)),
+            ),
+        )
         source = workspace / record["path"]
         if source.suffix.casefold() not in SUPPORTED_TYPES:
+            continue
+        if source.is_file() and source.stat().st_size == 0:
+            source_summaries.append({
+                **prescan_summary_row(summary, record, {
+                    "decision": "skip",
+                    "document_role": "empty_file",
+                    "confidence": 1.0,
+                    "reason": "The source file is empty (0 bytes).",
+                    "linked_topics": [],
+                }),
+                "source_type": "empty_source_file",
+                "processing_status": "no_relevant_content",
+                "opened": False,
+                "processing_error": "",
+                "verification_result": "not_run_empty_file",
+                "pages_screened": [],
+                "pages_fully_analyzed": [],
+                "additional_markup_detected": False,
+                "ingestion_pipeline_version": PIPELINE_VERSION,
+            })
+            continue
+        if decision.get("decision") in {"context_only", "skip"}:
+            source_summaries.append({
+                **prescan_summary_row(summary, record, decision),
+                "source_type": "prescan_context_source",
+                "processing_status": (
+                    "no_relevant_content"
+                    if decision.get("decision") == "skip" else "classified"
+                ),
+                "opened": False,
+                "processing_error": "",
+                "verification_result": "not_run_context_only",
+                "pages_screened": [],
+                "pages_fully_analyzed": [],
+                "additional_markup_detected": False,
+                "ingestion_pipeline_version": PIPELINE_VERSION,
+            })
             continue
         if (
             _is_archive_path(str(record.get("path", "")))
@@ -1487,12 +1815,23 @@ def process_new_group(
                 "ingestion_pipeline_version": PIPELINE_VERSION,
             })
             continue
+        work_items.append((record, decision))
+
+    def process_record(
+        record: dict[str, Any],
+        decision: dict[str, Any],
+        worker_pipeline: VisualIngestionPipeline,
+    ) -> tuple[
+        list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+        list[dict[str, Any]], list[dict[str, Any]],
+    ]:
+        source = workspace / record["path"]
         print(
             f"Open and content-screen ({decision['decision']} priority): {record['path']}",
             file=sys.stderr, flush=True,
         )
         try:
-            result = pipeline.process(source, record["path"], {
+            result = worker_pipeline.process(source, record["path"], {
                 "property_hint": summary.get("likely_property_project", record.get("likely_property_project", "")),
                 "city_hint": summary.get("likely_city", record.get("likely_city", "")),
                 "review_round_hint": summary.get("likely_review_round", record.get("likely_review_round", "")),
@@ -1500,9 +1839,33 @@ def process_new_group(
                 "prescan_decision": decision,
                 "ingestion_pipeline_version": PIPELINE_VERSION,
             })
+        except GeminiCircuitOpenError as exc:
+            message = str(exc)
+            paused_summary = {
+                **prescan_summary_row(summary, record, decision),
+                "source_type": "paused_quota_circuit",
+                "processing_status": "paused_quota",
+                "opened": False,
+                "processing_error": message,
+                "verification_result": "paused_quota",
+                "pages_screened": [], "pages_fully_analyzed": [],
+                "additional_markup_detected": False,
+                "ingestion_pipeline_version": PIPELINE_VERSION,
+            }
+            paused_review = {
+                "item_type": "ingestion_file",
+                "item_id": base.stable_id("F", record["path"]),
+                "reason": message,
+                "source_document": record["path"],
+                "source_location": "complete document",
+                "suggested_action": "Replenish Gemini credits, then resume this checkpoint",
+                "decision": "",
+                "decision_note": "Paused by run-level Gemini credit circuit breaker",
+            }
+            return [], [], [], [paused_summary], [paused_review]
         except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, ET.ParseError) as exc:
             message = str(exc)
-            source_summaries.append({
+            failed_summary = {
                 **prescan_summary_row(summary, record, decision),
                 "source_type": "failed_content_screening",
                 "processing_status": "failed", "opened": True,
@@ -1510,17 +1873,56 @@ def process_new_group(
                 "pages_screened": [], "pages_fully_analyzed": [],
                 "additional_markup_detected": False,
                 "ingestion_pipeline_version": PIPELINE_VERSION,
-            })
-            review.append({
+            }
+            failed_review = {
                 "item_type": "ingestion_file", "item_id": base.stable_id("F", record["path"]),
                 "reason": message, "source_document": record["path"],
                 "source_location": "complete document",
                 "suggested_action": "Resolve the file-level failure and selectively retry this hash",
                 "decision": "", "decision_note": "",
-            })
-            continue
+            }
+            return [], [], [], [failed_summary], [failed_review]
         c, r, l, s, q = result
-        comments.extend(c); responses.extend(r); links.extend(l); source_summaries.append(s); review.extend(q)
+        _annotate_legacy_source_provenance(
+            c, r, l, source, record["path"], summary,
+        )
+        return c, r, l, [s], q
+
+    indexed_results: dict[int, tuple[
+        list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+        list[dict[str, Any]], list[dict[str, Any]],
+    ]] = {}
+    fork_pipeline = getattr(pipeline, "fork", None)
+    parallel = (
+        max(1, file_workers) > 1
+        and len(work_items) > 1
+        and callable(fork_pipeline)
+    )
+    if parallel:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max(1, file_workers), len(work_items)),
+            thread_name_prefix="gemini-file",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    process_record, record, decision, fork_pipeline(),
+                ): index
+                for index, (record, decision) in enumerate(work_items)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                indexed_results[futures[future]] = future.result()
+    else:
+        for index, (record, decision) in enumerate(work_items):
+            indexed_results[index] = process_record(
+                record, decision, pipeline,
+            )
+    for index in sorted(indexed_results):
+        c, r, l, s, q = indexed_results[index]
+        comments.extend(c)
+        responses.extend(r)
+        links.extend(l)
+        source_summaries.extend(s)
+        review.extend(q)
     grouped = apply_grouped_response_notes(
         summary, canonical_records, comments, responses, links,
     )
@@ -1531,6 +1933,12 @@ def process_new_group(
             performance["canonicalization_seconds"] = round(
                 canonicalization_seconds, 4,
             )
+        # Keep prescan timing/token accounting separate from the per-file
+        # extraction metrics.  The report aggregates this field once, so a
+        # multi-file prescan cannot be mistaken for repeated Gemini calls.
+        source_summaries[0]["prescan_performance"] = copy.deepcopy(
+            prescan.get("performance", {})
+        )
     return comments, responses, links, source_summaries, review
 
 
@@ -1800,6 +2208,35 @@ def sanitize_prescan_decision(record: dict[str, Any], decision: dict[str, Any]) 
         fallback = fallback_prescan_decision(record)
         fallback["reason"] = "Company response sources must be fully read"
         return fallback
+    non_comment_roles = {
+        "permit_application", "application", "application_form",
+        "authorization", "approval_document", "permit_document",
+        "permit_record", "permit_summary", "revision_documentation",
+        "revision_summary",
+    }
+    role = str(decision.get("document_role", "")).strip().casefold()
+    local_comment_signal = any(
+        record.get(field) is True
+        or str(record.get(field, "")) == "True"
+        for field in (
+            "likely_contains_city_comments",
+            "likely_contains_company_responses",
+            "likely_contains_both",
+        )
+    )
+    if value == "full_read" and role in non_comment_roles and not local_comment_signal:
+        return {
+            "decision": "context_only",
+            "document_role": role,
+            "reason": (
+                "Gemini identified an administrative/application document, "
+                "and local content signals found no government comments or "
+                "company responses"
+            ),
+            "confidence": max(float(decision.get("confidence") or 0.0), 0.9),
+            "linked_topics": decision.get("linked_topics", [])
+            if isinstance(decision.get("linked_topics"), list) else [],
+        }
     return {
         "decision": value,
         "document_role": str(decision.get("document_role", "")) or fallback_prescan_decision(record)["document_role"],
@@ -1831,12 +2268,17 @@ def prescan_source_group(
         "review_round_hint": summary.get("likely_review_round", ""),
         "prescan_prompt_version": PRESCAN_PROMPT_VERSION,
     }
-    client = (
+    shared_client = (
         getattr(pipeline, "prescan_client", None)
         or getattr(pipeline, "client", None)
     )
+    fork_client = getattr(shared_client, "fork", None)
+    # Prescan groups run concurrently.  Each request needs an isolated client
+    # so usage/timing metadata cannot be overwritten by a neighboring site.
+    client = fork_client() if callable(fork_client) else shared_client
     raw: dict[str, Any] = {}
     prescan_error = ""
+    started = time.perf_counter()
     if use_gemini and client and hasattr(client, "pre_scan_sources"):
         try:
             raw = client.pre_scan_sources(payload, context)
@@ -1848,6 +2290,10 @@ def prescan_source_group(
             {"relative_path": record["path"], **fallback_prescan_decision(record)}
             for record in records
         ]}
+    usage = getattr(client, "last_usage_metadata", {}) if client else {}
+    request = getattr(client, "last_request_metadata", {}) if client else {}
+    usage = usage if isinstance(usage, dict) else {}
+    request = request if isinstance(request, dict) else {}
     by_path = prescan_decision_map(raw)
     by_filename: dict[str, list[dict[str, Any]]] = {}
     for returned_path, decision in by_path.items():
@@ -1874,6 +2320,15 @@ def prescan_source_group(
         "routing_method": "gemini" if use_gemini else "local_deterministic",
         "returned_file_count": len(by_path),
         "requested_file_count": len(records),
+        "performance": {
+            **request,
+            "stage": "gemini_prescan",
+            "elapsed_seconds": round(time.perf_counter() - started, 4),
+            "input_tokens": int(usage.get("promptTokenCount") or request.get("input_tokens") or 0),
+            "cached_input_tokens": int(usage.get("cachedContentTokenCount") or request.get("cached_input_tokens") or 0),
+            "output_tokens": int(usage.get("candidatesTokenCount") or request.get("output_tokens") or 0),
+            "thought_tokens": int(usage.get("thoughtsTokenCount") or 0),
+        },
     }
 
 
@@ -2077,6 +2532,179 @@ def legacy_structured_refresh_paths(
     return selected
 
 
+def retryable_ingestion_paths(
+    ingestion_report: dict[str, Any],
+    site_filters: list[str] | None = None,
+) -> set[str]:
+    """Return failed source paths that a normal incremental run must resume.
+
+    Older runs could leave a failed source in ``processed_source_paths``.  That
+    made a later ``--site`` run skip the source unless the operator also knew
+    to pass ``--refresh-source``.  The ingestion report is the authoritative
+    source state, so terminal retryable states reopen the source automatically.
+    Restricting the result to the active site filters prevents a focused run
+    from unexpectedly retrying failures elsewhere in the workspace.
+    """
+    filters = [
+        value.casefold() for value in site_filters or [] if value.strip()
+    ]
+    retryable = {"failed", "paused_quota", "circuit_open"}
+    selected: set[str] = set()
+    for row in ingestion_report.get("files", []):
+        relative = str(row.get("relative_path", "")).strip()
+        if not relative:
+            continue
+        if str(row.get("processing_status", "")).strip() not in retryable:
+            continue
+        reason = str(
+            row.get("processing_error")
+            or row.get("review_reason")
+            or ""
+        ).casefold()
+        if "status is unknown after submission" in reason:
+            # The server may still have completed this request.  Reusing the
+            # same request identity is not enough to prevent a second charge,
+            # so ordinary resume runs quarantine it for explicit review.
+            continue
+        if filters and not any(value in relative.casefold() for value in filters):
+            continue
+        selected.add(relative)
+    return selected
+
+
+def ambiguous_submission_paths(
+    ingestion_report: dict[str, Any],
+    site_filters: list[str] | None = None,
+) -> set[str]:
+    filters = [
+        value.casefold() for value in site_filters or [] if value.strip()
+    ]
+    selected: set[str] = set()
+    for row in ingestion_report.get("files", []):
+        relative = str(row.get("relative_path", "")).strip()
+        reason = str(
+            row.get("processing_error")
+            or row.get("review_reason")
+            or ""
+        ).casefold()
+        if not relative or "status is unknown after submission" not in reason:
+            continue
+        if filters and not any(value in relative.casefold() for value in filters):
+            continue
+        selected.add(relative)
+    return selected
+
+
+def orphaned_pending_paths(
+    ingestion_report: dict[str, Any],
+    processed: set[str],
+    represented_paths: set[str],
+    site_filters: list[str] | None = None,
+) -> set[str]:
+    """Find pending paths incorrectly marked processed with no stored output."""
+    filters = [
+        value.casefold() for value in site_filters or [] if value.strip()
+    ]
+    selected: set[str] = set()
+    for row in ingestion_report.get("files", []):
+        relative = str(row.get("relative_path", "")).strip()
+        if (
+            not relative
+            or str(row.get("processing_status", "")) != "pending"
+            or relative not in processed
+            or relative in represented_paths
+        ):
+            continue
+        if filters and not any(value in relative.casefold() for value in filters):
+            continue
+        selected.add(relative)
+    return selected
+
+
+def upsert_ingested_group(
+    comments: list[dict[str, Any]],
+    responses: list[dict[str, Any]],
+    links: list[dict[str, Any]],
+    incoming_comments: list[dict[str, Any]],
+    incoming_responses: list[dict[str, Any]],
+    incoming_links: list[dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]],
+]:
+    """Idempotently replace cached records without overwriting confirmations."""
+    existing_comments = {
+        str(row.get("comment_id", "")): row for row in comments
+    }
+    existing_links = {
+        str(row.get("comment_id", "")): row for row in links
+    }
+    incoming_by_id: dict[str, dict[str, Any]] = {}
+    for row in incoming_comments:
+        comment_id = str(row.get("comment_id", ""))
+        previous = incoming_by_id.get(comment_id)
+        if previous is not None and str(previous.get("original_text", "")).strip() != str(
+            row.get("original_text", "")
+        ).strip():
+            raise ValueError(
+                f"Conflicting duplicate comment ID in incoming extraction: {comment_id}"
+            )
+        incoming_by_id.setdefault(comment_id, row)
+    incoming_comments = list(incoming_by_id.values())
+    incoming_ids = set(incoming_by_id)
+    preserve_confirmed: set[str] = set()
+    for comment_id in incoming_ids & set(existing_comments):
+        old_link = existing_links.get(comment_id, {})
+        confirmed = (
+            str(old_link.get("review_status", "")).casefold() == "confirmed"
+            or str(old_link.get("match_status", "")).casefold() == "confirmed"
+        )
+        if not confirmed:
+            continue
+        old_text = str(existing_comments[comment_id].get("original_text", "")).strip()
+        new_text = str(incoming_by_id[comment_id].get("original_text", "")).strip()
+        if old_text != new_text:
+            raise ValueError(
+                f"Incoming extraction conflicts with confirmed comment {comment_id}"
+            )
+        preserve_confirmed.add(comment_id)
+    replace_ids = incoming_ids - preserve_confirmed
+    removed_response_ids = {
+        str(row.get("response_id", "")) for row in responses
+        if str(row.get("comment_id", "")) in replace_ids
+    }
+    comments = [
+        row for row in comments
+        if str(row.get("comment_id", "")) not in replace_ids
+    ]
+    responses = [
+        row for row in responses
+        if str(row.get("comment_id", "")) not in replace_ids
+        and str(row.get("response_id", "")) not in removed_response_ids
+    ]
+    links = [
+        row for row in links
+        if str(row.get("comment_id", "")) not in replace_ids
+        and str(row.get("response_id", "")) not in removed_response_ids
+    ]
+    incoming_comments = [
+        row for row in incoming_comments
+        if str(row.get("comment_id", "")) not in preserve_confirmed
+    ]
+    incoming_responses = [
+        row for row in incoming_responses
+        if str(row.get("comment_id", "")) not in preserve_confirmed
+    ]
+    incoming_links = [
+        row for row in incoming_links
+        if str(row.get("comment_id", "")) not in preserve_confirmed
+    ]
+    return (
+        comments, responses, links,
+        incoming_comments, incoming_responses, incoming_links,
+    )
+
+
 def run_incremental(
     workspace: Path,
     audit_dir: Path,
@@ -2085,14 +2713,34 @@ def run_incremental(
     pipeline: VisualIngestionPipeline,
     site_filters: list[str] | None = None,
     refresh_structured_spreadsheets: bool = False,
+    file_workers: int = 1,
+    prescan_decisions: dict[str, dict[str, Any]] | None = None,
+    refresh_source_filters: list[str] | None = None,
 ) -> dict[str, int]:
+    run_started_monotonic = time.perf_counter()
+    run_id = utc_timestamp()
     workspace = workspace.resolve()
     audit_dir = audit_dir.resolve()
     output_dir = output_dir.resolve()
     dataset, existing_review = load_existing(output_dir)
     inventory, summaries = base.load_audit(audit_dir)
     ingestion_report_path = output_dir / "ingestion_report.json"
+    try:
+        previous_ingestion_report = json.loads(
+            ingestion_report_path.read_text(encoding="utf-8")
+        ) if ingestion_report_path.is_file() else {}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        previous_ingestion_report = {}
     ingestion_report = inventory_supported_files(workspace, inventory, ingestion_report_path)
+    write_pipeline_checkpoint(
+        output_dir,
+        run_id,
+        {"uploaded": "complete", "parsed": "complete", "prescanned": "in_progress",
+         "extracted": "pending", "verified": "pending", "deduplicated": "pending",
+         "timeline_linked": "pending", "indexed": "pending"},
+        source_root=str(workspace),
+        discovered_files=len(ingestion_report.get("files", [])),
+    )
     ingestion_report_by_path = {
         str(row.get("relative_path", "")): row for row in ingestion_report["files"]
     }
@@ -2116,16 +2764,84 @@ def run_incremental(
     for path in processed:
         if path not in processed_hashes and path in inventory:
             processed_hashes[path] = str(inventory[path].get("sha256", ""))
+    # A full-read prescan decision is authoritative. Re-open only sources that
+    # an older local page gate declared irrelevant without extracting records.
+    for relative, decision in (prescan_decisions or {}).items():
+        if str(decision.get("decision", "")) != "full_read":
+            continue
+        report_row = ingestion_report_by_path.get(relative, {})
+        if str(report_row.get("processing_status", "")) != "no_relevant_content":
+            continue
+        digest = str(report_row.get("sha256", ""))
+        manifest = (
+            output_dir / "ingestion_artifacts" /
+            f"VI-{digest[:20]}" / "manifest.json"
+        )
+        try:
+            screen_version = str(json.loads(
+                manifest.read_text(encoding="utf-8")
+            ).get("page_screening_version", ""))
+        except (OSError, json.JSONDecodeError, AttributeError):
+            screen_version = ""
+        if screen_version != PAGE_SCREENING_VERSION:
+            processed.discard(relative)
+            processed_hashes.pop(relative, None)
     processed_hash_values = {value for value in processed_hashes.values() if value}
     comments = list(dataset.get("comments", []))
     responses = list(dataset.get("responses", []))
     links = list(dataset.get("comment_response_links", []))
     source_rows = list(dataset.get("sources", []))
     review_rows: list[dict[str, Any]] = list(existing_review)
+    normalized_site_filters = [
+        value.casefold() for value in site_filters or [] if value.strip()
+    ]
     refresh_paths = (
         legacy_structured_refresh_paths(dataset, site_filters)
         if refresh_structured_spreadsheets else set()
     )
+    automatic_retry_paths = retryable_ingestion_paths(
+        previous_ingestion_report, site_filters,
+    )
+    ambiguous_paths = ambiguous_submission_paths(
+        previous_ingestion_report, site_filters,
+    )
+    refresh_paths.update(automatic_retry_paths)
+    represented_paths = {
+        path
+        for collection in (comments, responses, source_rows, review_rows)
+        for row in collection
+        for path in _row_source_paths(row)
+    }
+    refresh_paths.update(orphaned_pending_paths(
+        ingestion_report, processed, represented_paths, site_filters,
+    ))
+    previous_rows_by_path = {
+        str(row.get("relative_path", "")): row
+        for row in previous_ingestion_report.get("files", [])
+        if isinstance(row, dict)
+    }
+    for path in ambiguous_paths:
+        current = ingestion_report_by_path.get(path)
+        previous = previous_rows_by_path.get(path)
+        if current is not None and previous is not None:
+            current.update({
+                "processing_status": "failed",
+                "completion_status": "failed",
+                "review_reason": str(
+                    previous.get("review_reason")
+                    or previous.get("processing_error")
+                    or "Gemini request status is unknown after submission"
+                ),
+            })
+    normalized_refresh_filters = [
+        value.casefold() for value in refresh_source_filters or []
+        if value.strip()
+    ]
+    if normalized_refresh_filters:
+        refresh_paths.update({
+            path for path in processed
+            if any(token in path.casefold() for token in normalized_refresh_filters)
+        })
     if refresh_paths:
         refresh_comments = [
             row for row in comments if _row_source_paths(row) & refresh_paths
@@ -2152,7 +2868,11 @@ def run_incremental(
             refresh_responses,
             refresh_links,
             dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
-            "structured_spreadsheet_pipeline_refresh",
+            (
+                "automatic_retry_failed_source"
+                if refresh_paths.issubset(automatic_retry_paths)
+                else "structured_spreadsheet_pipeline_refresh"
+            ),
         )
         comments = [
             row for row in comments
@@ -2185,9 +2905,6 @@ def run_incremental(
     new_groups = 0
     reused_groups = 0
     new_comments = 0
-    normalized_site_filters = [
-        value.casefold() for value in site_filters or [] if value.strip()
-    ]
     for summary, records in groups:
         if normalized_site_filters:
             records = [
@@ -2282,16 +2999,23 @@ def run_incremental(
         new_records = [
             record for record in records
             if record["path"] not in processed
+            and record["path"] not in ambiguous_paths
         ]
         if not new_records:
             reused_groups += 1
             continue
-        result = process_new_group(workspace, summary, new_records, pipeline)
+        result = process_new_group(
+            workspace, summary, new_records, pipeline,
+            file_workers=max(1, file_workers),
+            prescan_decisions=prescan_decisions,
+        )
         c, r, l, s, q = result
         failed_paths = {
             path
             for source_summary in s
-            if str(source_summary.get("processing_status", "")) == "failed"
+            if str(source_summary.get("processing_status", "")) in {
+                "failed", "paused_quota", "circuit_open",
+            }
             for path in _row_source_paths(source_summary)
         }
         completed_paths = paths - failed_paths
@@ -2341,6 +3065,9 @@ def run_incremental(
                     and (_row_source_paths(row) & completed_paths)
                 )
             ]
+        comments, responses, links, c, r, l = upsert_ingested_group(
+            comments, responses, links, c, r, l,
+        )
         comments.extend(c)
         responses.extend(r)
         links.extend(l)
@@ -2370,8 +3097,11 @@ def run_incremental(
     lineage_context = {"comments": comments, "comment_response_links": links}
     lineage_report = mark_copied_source_documents(lineage_context, workspace)
     duplicate_report = mark_duplicate_comments({
-        "comments": comments, "comment_response_links": links,
+        "comments": comments, "responses": responses,
+        "comment_response_links": links,
     })
+    issue_event_index = rebuild_issue_event_index(comments)
+    issue_event_review_queue = collect_issue_event_review_queue(issue_event_index)
     comments.sort(key=lambda row: (
         str(row.get("city", "")),
         str(row.get("property_project", "")),
@@ -2406,6 +3136,8 @@ def run_incremental(
         "processed_source_hashes": dict(sorted(processed_hashes.items())),
         "repair_history": dataset.get("repair_history", []),
         "source_lineage_groups": lineage_context.get("source_lineage_groups", {}),
+        "issue_event_index": issue_event_index,
+        "issue_event_review_queue": issue_event_review_queue,
     }
     identity = merge_pre_gemini_source_aliases(
         canonicalize_documents(updated["comments"]), source_rows,
@@ -2416,13 +3148,38 @@ def run_incremental(
         "source_file_aliases": identity["source_file_aliases"],
         "near_duplicate_review": identity["near_duplicate_review"],
     })
+    # Keep the legacy dataset shape for the current app, while publishing a
+    # normalized, versioned evidence projection for the next data layer.  This
+    # is deterministic and does not re-read files or call Gemini.
+    materialize_evidence_model(updated, output_dir)
     atomic_json(output_dir / "dataset.json", updated)
     ingestion_report = write_ingestion_report(
         ingestion_report_path, ingestion_report["files"], source_rows,
+        {
+            "run_id": run_id,
+            "request_created_at": run_id,
+            "finished_at": utc_timestamp(),
+            "elapsed_seconds": round(time.perf_counter() - run_started_monotonic, 4),
+            "file_workers": max(1, file_workers),
+            "site_filters": list(site_filters or []),
+        },
     )
     base.write_report(
         output_dir / "phase2_report.md",
         comments, responses, links, source_rows, review_rows,
+    )
+    failed_stage = "needs_review" if any(
+        str(row.get("processing_status", "")) in {"failed", "paused_quota", "circuit_open", "needs_review"}
+        for row in ingestion_report.get("files", [])
+    ) else "complete"
+    write_pipeline_checkpoint(
+        output_dir,
+        run_id,
+        {"prescanned": "complete", "extracted": failed_stage, "verified": failed_stage,
+         "deduplicated": "complete", "timeline_linked": "complete", "indexed": "complete"},
+        run_elapsed_seconds=round(time.perf_counter() - run_started_monotonic, 4),
+        totals=ingestion_report.get("totals", {}),
+        evidence_model=updated.get("evidence_model", {}),
     )
     return {
         "reused_groups": reused_groups,
@@ -2716,7 +3473,8 @@ def run_offline_structured(
 
     base.validate_dataset(comments, responses, links)
     duplicate_report = mark_duplicate_comments({
-        "comments": comments, "comment_response_links": links,
+        "comments": comments, "responses": responses,
+        "comment_response_links": links,
     })
     incoming_comment_ids = {
         str(row["comment_id"]) for row in incoming_comments
@@ -2740,6 +3498,8 @@ def run_offline_structured(
         base.natural_number(row.get("source_location", "")),
         str(row.get("item_id", "")),
     ))
+    issue_event_index = rebuild_issue_event_index(comments)
+    issue_event_review_queue = collect_issue_event_review_queue(issue_event_index)
     source_rows = list(source_by_document.values())
     offline_hashes = dataset.get("offline_structured_source_hashes", {})
     if not isinstance(offline_hashes, dict):
@@ -2756,6 +3516,8 @@ def run_offline_structured(
         "sources": source_rows,
         "review_items": review_rows,
         "offline_structured_source_hashes": dict(sorted(offline_hashes.items())),
+        "issue_event_index": issue_event_index,
+        "issue_event_review_queue": issue_event_review_queue,
     })
     identity = merge_pre_gemini_source_aliases(
         canonicalize_documents(comments), source_rows,
@@ -2766,6 +3528,7 @@ def run_offline_structured(
         "source_file_aliases": identity["source_file_aliases"],
         "near_duplicate_review": identity["near_duplicate_review"],
     })
+    materialize_evidence_model(dataset, output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     backup = output_dir / (
         "dataset.pre_offline_structured-"
@@ -2907,12 +3670,26 @@ def run_prescan_only(
             "prescan_error": prescan.get("prescan_error", ""),
             "returned_file_count": prescan.get("returned_file_count", 0),
             "requested_file_count": prescan.get("requested_file_count", 0),
+            "performance": prescan.get("performance", {}),
         })
+    request_metrics = [
+        row.get("performance", {}) for row in plan
+        if isinstance(row.get("performance"), dict)
+    ]
     result = {
         "include_processed": include_processed,
         "site_filters": site_filters or [],
         "workers": workers,
         "totals": totals,
+        "performance": {
+            "request_count": len(request_metrics),
+            "elapsed_seconds": round(sum(float(row.get("elapsed_seconds") or 0.0) for row in request_metrics), 4),
+            "input_tokens": sum(int(row.get("input_tokens") or 0) for row in request_metrics),
+            "cached_input_tokens": sum(int(row.get("cached_input_tokens") or 0) for row in request_metrics),
+            "output_tokens": sum(int(row.get("output_tokens") or 0) for row in request_metrics),
+            "thought_tokens": sum(int(row.get("thought_tokens") or 0) for row in request_metrics),
+            "stragglers": summarize_request_metrics(request_metrics),
+        },
         "groups": plan,
     }
     atomic_json(output_dir / "prescan_plan.json", result)
@@ -3098,6 +3875,34 @@ def run_prescan_repair(
                     },
                     force=force,
                 )
+            except GeminiCircuitOpenError as exc:
+                message = str(exc)
+                repair_failures.append(f"{record['path']}: {message}")
+                group_summaries.append({
+                    **prescan_summary_row({
+                        "likely_city": group_city,
+                        "likely_property_project": property_project,
+                        "likely_review_round": review_round,
+                    }, record, decision),
+                    "source_type": "paused_quota_circuit",
+                    "processing_status": "paused_quota", "opened": False,
+                    "processing_error": message,
+                    "verification_result": "paused_quota",
+                    "pages_screened": [], "pages_fully_analyzed": [],
+                    "additional_markup_detected": False,
+                    "ingestion_pipeline_version": PIPELINE_VERSION,
+                })
+                group_review.append({
+                    "item_type": "ingestion_file",
+                    "item_id": base.stable_id("F", record["path"]),
+                    "reason": message,
+                    "source_document": record["path"],
+                    "source_location": "complete document",
+                    "suggested_action": "Replenish Gemini credits, then resume this checkpoint",
+                    "decision": "",
+                    "decision_note": "Paused by run-level Gemini credit circuit breaker",
+                })
+                continue
             except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, ET.ParseError) as exc:
                 message = str(exc)
                 repair_failures.append(f"{record['path']}: {message}")
@@ -3190,8 +3995,11 @@ def run_prescan_repair(
     lineage_context = {"comments": comments, "comment_response_links": links}
     lineage_report = mark_copied_source_documents(lineage_context, workspace)
     duplicate_report = mark_duplicate_comments({
-        "comments": comments, "comment_response_links": links,
+        "comments": comments, "responses": responses,
+        "comment_response_links": links,
     })
+    issue_event_index = rebuild_issue_event_index(comments)
+    issue_event_review_queue = collect_issue_event_review_queue(issue_event_index)
     comments.sort(key=lambda row: (
         row["city"], row["property_project"], base.natural_number(row["review_round"]),
         row["source_document"], base.natural_number(row.get("source_row", "")),
@@ -3214,6 +4022,8 @@ def run_prescan_repair(
         "sources": source_rows, "review_items": review_rows,
         "processed_source_hashes": dict(sorted(processed_hashes.items())),
         "source_lineage_groups": lineage_context.get("source_lineage_groups", {}),
+        "issue_event_index": issue_event_index,
+        "issue_event_review_queue": issue_event_review_queue,
     })
     identity = merge_pre_gemini_source_aliases(
         canonicalize_documents(dataset["comments"]), source_rows,
@@ -3226,6 +4036,7 @@ def run_prescan_repair(
     })
     dataset.setdefault("processed_source_paths", [])
     dataset["processed_source_paths"] = sorted(set(dataset["processed_source_paths"]) | source_paths)
+    materialize_evidence_model(dataset, output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     backup = output_dir / f"dataset.pre_prescan_repair-{run_id}.json"
     atomic_json(backup, pre_repair_dataset)
@@ -3303,6 +4114,13 @@ def main() -> int:
     parser.add_argument("--prescan-site", action="append", default=[], help="Prescan only source paths containing this text; repeatable")
     parser.add_argument("--prescan-workers", type=int, default=3, help="Maximum concurrent site-level Gemini prescan requests")
     parser.add_argument("--site", action="append", default=[], help="Fully ingest only source paths containing this text; repeatable")
+    parser.add_argument(
+        "--refresh-source", action="append", default=[],
+        help=(
+            "Rebuild existing rows for source paths containing this text, "
+            "reusing compatible extraction/verification artifacts; repeatable"
+        ),
+    )
     parser.add_argument("--repair-prescan", action="store_true", help="Replace one city's existing rows using full_read files from the prescan plan")
     parser.add_argument("--repair-city", default="Menlo Park", help="City to repair with --repair-prescan")
     parser.add_argument("--prescan-plan", type=Path, default=Path("phase2_dataset/prescan_plan.json"), help="Prescan plan used by --repair-prescan")
@@ -3312,7 +4130,28 @@ def main() -> int:
     parser.add_argument("--render-dpi", type=int, default=220, help="Resolution for selected extraction evidence pages")
     parser.add_argument("--visual-batch-pages", type=int, default=6, help="Process selected visual pages in overlapping batches; 0 sends one full request")
     parser.add_argument("--visual-batch-overlap", type=int, default=1, help="Page overlap between visual batches")
+    parser.add_argument(
+        "--visual-batch-workers",
+        type=int,
+        default=int(os.environ.get("VISUAL_BATCH_WORKERS", "2")),
+        help="Maximum independent Gemini page batches in flight (default: 2)",
+    )
+    parser.add_argument(
+        "--folder-workers",
+        type=int,
+        default=int(os.environ.get("FOLDER_INGESTION_WORKERS", "2")),
+        help=(
+            "Maximum source files processed concurrently inside one folder "
+            "group (default: 2)"
+        ),
+    )
     args = parser.parse_args()
+    command_started = time.perf_counter()
+    command_started_at = (
+        dt.datetime.now(dt.timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
     try:
         if args.inventory_only:
             result = run_inventory_only(args.workspace_root, args.audit_dir, args.output)
@@ -3343,6 +4182,7 @@ def main() -> int:
             batch_pages=args.visual_batch_pages,
             batch_overlap=args.visual_batch_overlap,
             prescan_client=prescan_client,
+            batch_workers=args.visual_batch_workers,
         )
         if args.repair_prescan:
             result = run_prescan_repair(
@@ -3357,6 +4197,10 @@ def main() -> int:
                 workers=max(1, args.prescan_workers),
             )
         else:
+            decisions = load_prescan_decisions(
+                args.prescan_plan.resolve()
+                if args.prescan_plan else None
+            )
             result = run_incremental(
                 args.workspace_root, args.audit_dir, args.output,
                 args.review_decisions,
@@ -3365,10 +4209,38 @@ def main() -> int:
                 refresh_structured_spreadsheets=(
                     args.refresh_structured_spreadsheets
                 ),
+                file_workers=max(1, args.folder_workers),
+                prescan_decisions=decisions,
+                refresh_source_filters=args.refresh_source,
             )
     except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, ET.ParseError) as exc:
         print(f"Incremental Phase 2 update failed: {exc}", file=__import__("sys").stderr)
         return 2
+    command_completed_at = (
+        dt.datetime.now(dt.timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    run_timing = {
+        "command_started_at": command_started_at,
+        "dataset_ready_at": command_completed_at,
+        "full_elapsed_seconds": round(
+            time.perf_counter() - command_started, 4,
+        ),
+        "mode": (
+            "repair_prescan" if args.repair_prescan
+            else "prescan_only" if args.prescan_only
+            else "incremental"
+        ),
+        "site_filters": list(args.site),
+        "prescan_site_filters": list(args.prescan_site),
+        "folder_workers": max(1, args.folder_workers),
+        "visual_batch_workers": max(1, args.visual_batch_workers),
+        "result_summary": result,
+    }
+    atomic_json(args.output.resolve() / "last_intake_timing.json", run_timing)
+    if isinstance(result, dict):
+        result = {**result, "run_timing": run_timing}
     print(json.dumps(result, sort_keys=True))
     return 0
 

@@ -2,25 +2,36 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from collections import defaultdict
+from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    from .document_identity import canonical_project_id
+    from .canonical_event import NORMALIZATION_VERSION, normalize_event_text
+except ImportError:  # Direct module execution.
+    from document_identity import canonical_project_id
+    from canonical_event import NORMALIZATION_VERSION, normalize_event_text
 
 
 DUPLICATE_FILLER_WORDS = {
     "a", "an", "at", "the", "to",
 }
 NEGATION_WORDS = {"no", "not", "without", "except", "exclude", "prohibit", "prohibited"}
+SUBMISSION_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?P<number>\d+)(?:st|nd|rd|th)\s+submission\b",
+    re.IGNORECASE,
+)
 
 
 def normalized_comment_text(record: dict[str, Any]) -> str:
     text = record.get("verified_text") or record.get("original_text") or ""
-    value = unicodedata.normalize("NFKC", str(text))
-    value = value.replace("_x000D_", " ").replace("_x000A_", " ")
-    return re.sub(r"\s+", " ", value).strip().casefold()
+    return normalize_event_text(text)
 
 
 def source_identity(record: dict[str, Any]) -> str:
@@ -36,14 +47,92 @@ def _normalized_identity(value: Any) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value or ""))).strip().casefold()
 
 
+def _parse_event_date(value: Any) -> str:
+    """Return an ISO date only when a source field contains a valid date.
+
+    File names are included as a fallback because spreadsheet exports often
+    keep the review timestamp only in the filename.  Invalid permit numbers
+    such as ``25-033-701`` are rejected by ``date`` validation.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    patterns = (
+        r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b",
+        r"\b(\d{1,2})[-_/.](\d{1,2})[-_/.](20\d{2})\b",
+        r"\b(\d{1,2})[-_/.](\d{1,2})[-_/.](\d{2})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        parts = [int(value) for value in match.groups()]
+        if len(match.groups()) == 3 and parts[0] >= 2000:
+            year, month, day = parts
+        else:
+            month, day, year = parts
+            year += 2000 if year < 100 else 0
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
+def event_date_key(record: dict[str, Any]) -> str:
+    """Find the date of the visible comment event, not the file mtime."""
+    source_name = Path(
+        str(record.get("source_document", "")).split(" | ", 1)[0]
+    ).name.casefold()
+    # A response letter repeats the earlier government comment beside a new
+    # applicant response.  Its report/letter date belongs to the response
+    # container, not to the repeated government-comment event.  Treating that
+    # date as the comment date prevented an otherwise exact same-round row
+    # from merging with the plan-review source.
+    response_container = bool(record.get("response_id")) and bool(
+        re.search(r"\bresponse(?:\s+letter)?\b", source_name)
+    )
+    date_fields = (
+        ()
+        if response_container
+        else (
+            "source_date_evidence", "source_document_date", "source_date",
+            "report_date", "letter_date", "document_date",
+        )
+    )
+    for field in date_fields:
+        parsed = _parse_event_date(record.get(field))
+        if parsed:
+            return parsed
+    # Spreadsheet exports commonly store the reviewer timestamp in one of
+    # these labels.  This is an event date, unlike filesystem modification
+    # time, and is safe to use for same-day duplicate detection.
+    for field in ("reviewer", "reviewer_context"):
+        parsed = _parse_event_date(record.get(field))
+        if parsed:
+            return parsed
+    return "" if response_container else _parse_event_date(record.get("source_document", ""))
+
+
+def _same_event_date(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    left, right = event_date_key(first), event_date_key(second)
+    # Fuzzy hierarchy/form matching must not bridge a known date and an
+    # undated record. Exact deduplication is already conservative for missing
+    # dates; this keeps the same rule for near-identical rows.
+    return (not left and not right) or left == right
+
+
 def site_identity(record: dict[str, Any]) -> str:
+    # Prefer the normalized hierarchy identity.  The legacy implementation
+    # used the first source-folder name, which split one permit into separate
+    # Building/Structural/Planning sites and also treated ``Ave`` and
+    # ``Avenue`` as different projects.
     city = _normalized_identity(record.get("city"))
-    source = str(record.get("source_document", "")).split(" | ", 1)[0].strip()
-    parts = Path(source).as_posix().split("/")
-    if "comments&response" in parts:
-        project_index = parts.index("comments&response") + 1
-        if project_index < len(parts) and parts[project_index]:
-            return f"{city}|project:{parts[project_index].casefold()}"
+    project_id = str(record.get("project_id") or "").strip()
+    if not project_id:
+        project_id = canonical_project_id(record)
+    if project_id:
+        return f"{city}|project:{project_id.casefold()}"
     site = _normalized_identity(
         record.get("property_project")
         or record.get("property")
@@ -60,7 +149,18 @@ def round_identity(record: dict[str, Any]) -> str:
         or record.get("source_cycle")
     )
     numbers = re.findall(r"\d+(?:\.\d+)?", value)
-    return numbers[-1] if numbers else value
+    base = numbers[-1] if numbers else value
+    # A later ProjectDox submission can repeat the same printed comment
+    # number and review-round label while representing a new attempt at the
+    # same issue.  When the visible event date is known, that date is part of
+    # the duplicate key and the submission suffix must not split an otherwise
+    # identical event.  Without a date we remain conservative and keep
+    # different submissions available to the issue timeline.
+    source = str(record.get("source_document", ""))
+    submission = SUBMISSION_PATTERN.search(source)
+    if submission and not event_date_key(record):
+        return f"{base}|submission:{int(submission.group('number'))}"
+    return base
 
 
 def extraction_fingerprint(record: dict[str, Any]) -> str:
@@ -87,7 +187,11 @@ def _hierarchy_compare_text(record: dict[str, Any]) -> str:
     text = normalized_comment_text(record)
     # A repeated copy can add a plan-label crosswalk without changing the
     # government requirement itself.
+    # ``normalization_v3`` removes punctuation before this comparison, so
+    # handle both the original parenthesized form and the punctuation-free
+    # token stream produced by an XLSX/PDF export.
     text = re.sub(r"\([^)]*\blabel(?:ed)?\b[^)]*\)", " ", text)
+    text = re.sub(r"\bthese\s+are\s+labeled\b.*?\bin\s+the\s+plan\s+set\b", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -97,6 +201,7 @@ def _hierarchy_repeat(first: dict[str, Any], second: dict[str, Any]) -> bool:
         or second.get("hierarchy_status") != "merged_parent"
         or site_identity(first) != site_identity(second)
         or round_identity(first) != round_identity(second)
+        or not _same_event_date(first, second)
     ):
         return False
     left, right = _hierarchy_compare_text(first), _hierarchy_compare_text(second)
@@ -129,7 +234,11 @@ def _form_row_repeat(first: dict[str, Any], second: dict[str, Any]) -> bool:
     Numeric parameters remain significant for similarly worded requirements
     (for example, door width 3 versus 4).
     """
-    if site_identity(first) != site_identity(second) or round_identity(first) != round_identity(second):
+    if (
+        site_identity(first) != site_identity(second)
+        or round_identity(first) != round_identity(second)
+        or not _same_event_date(first, second)
+    ):
         return False
     if _normalized_identity(first.get("discipline")) != _normalized_identity(second.get("discipline")):
         return False
@@ -182,13 +291,48 @@ def duplicate_key(record: dict[str, Any]) -> tuple[str, str, str] | None:
     if site and review_round:
         parameters = ",".join(sorted(parameter_tokens(record)))
         negations = ",".join(sorted(negation_tokens(record)))
+        event_date = event_date_key(record) or "unknown"
         return (
             f"site:{site}",
-            f"round:{review_round}",
+            f"round:{review_round}|date:{event_date}",
             f"{fingerprint}|parameters:{parameters}|negations:{negations}",
         )
     source = source_identity(record)
     return (source, "", fingerprint) if source else None
+
+
+def _document_copy_key(record: dict[str, Any]) -> tuple[str, str, str, str, str, str] | None:
+    """Identity for rows extracted from byte/content-equivalent documents.
+
+    DOCX/PDF exports of the same review letter frequently disagree about the
+    visible date and submission suffix.  When the document registry has
+    already assigned them one canonical document group, those fields are
+    provenance—not evidence of a second comment event—so use the stable
+    document id and the substantive row identity instead.
+    """
+    document_id = str(record.get("canonical_document_id", "")).strip()
+    try:
+        group_size = int(record.get("canonical_document_duplicate_group_size") or 0)
+    except (TypeError, ValueError):
+        group_size = 0
+    if not document_id or group_size < 2:
+        return None
+    fingerprint = extraction_fingerprint(record)
+    if not fingerprint:
+        return None
+    return (
+        site_identity(record),
+        _normalized_identity(
+            record.get("reviewed_plan_round")
+            or record.get("review_round")
+            or record.get("source_cycle")
+        ),
+        document_id.casefold(),
+        _normalized_identity(record.get("discipline")),
+        _normalized_identity(record.get("comment_number")),
+        f"{fingerprint}|parameters:{','.join(sorted(parameter_tokens(record)))}|"
+        f"negations:{','.join(sorted(negation_tokens(record)))}",
+    )
 
 
 def _position(record: dict[str, Any]) -> int:
@@ -253,6 +397,40 @@ def find_duplicate_comments(
             row_id = str(row.get("comment_id", ""))
             if row_id != winner_id:
                 duplicate_of[row_id] = winner_id
+
+    # The same canonical document is often present as both PDF and DOCX (or
+    # under several export filenames).  The first pass intentionally keeps
+    # dated/undated rows conservative, so collapse these proven document-copy
+    # rows here without discarding either source occurrence.
+    document_copies: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in canonical:
+        key = _document_copy_key(row)
+        if key is not None:
+            document_copies[key].append(row)
+    document_copy_losers: set[str] = set()
+    for rows in document_copies.values():
+        if len(rows) < 2:
+            continue
+        winner = min(rows, key=lambda row: _winner_sort_key(row, link_map))
+        winner_id = str(winner.get("comment_id", ""))
+        source_documents = sorted({
+            str(row.get("source_document", "")).strip()
+            for row in rows if str(row.get("source_document", "")).strip()
+        })
+        if len(source_documents) > 1:
+            winner["duplicate_source_documents"] = sorted(
+                set(winner.get("duplicate_source_documents", [])) | set(source_documents)
+            )
+        for row in rows:
+            row_id = str(row.get("comment_id", ""))
+            if row_id != winner_id:
+                duplicate_of[row_id] = winner_id
+                document_copy_losers.add(row_id)
+    if document_copy_losers:
+        canonical = [
+            row for row in canonical
+            if str(row.get("comment_id", "")) not in document_copy_losers
+        ]
 
     # Word can repeat the same complete numbered requirement under two
     # discipline headings with tiny label/crosswalk wording differences.
@@ -358,13 +536,265 @@ def find_duplicate_comments(
     return canonical, duplicate_of
 
 
+_SOURCE_OCCURRENCE_FIELDS = (
+    "source_document", "source_sha256", "source_location", "source_page",
+    "source_page_end", "source_sheet", "source_row", "source_row_end",
+    "source_cell_range", "source_locator_json", "source_bounding_boxes",
+    "source_document_date", "source_date_evidence", "comment_number",
+)
+
+
+def normalized_response_text(record: dict[str, Any]) -> str:
+    """Return response identity text without changing the stored response.
+
+    Response exports commonly add a presentation prefix (``Response:`` or
+    ``RESPONSE_``).  It is not part of the applicant's answer, so remove only
+    that known prefix for identity matching.  All other wording, numbers and
+    negations remain significant.
+    """
+    text = str(record.get("verified_text") or record.get("original_text") or "")
+    text = re.sub(r"^\s*[\"']?\s*response\s*[_:-]\s*", "", text, flags=re.IGNORECASE)
+    return normalize_event_text(text)
+
+
+def response_event_date_key(record: dict[str, Any]) -> str:
+    """Find the applicant-response date, preferring response/event fields."""
+    for field in (
+        "response_date_iso", "response_date_raw", "event_date",
+        "event_date_iso", "event_date_raw", "source_date_evidence",
+        "source_document_date", "document_date_iso", "document_date",
+    ):
+        value = record.get(field)
+        if isinstance(value, dict):
+            value = value.get("iso") or value.get("raw") or value.get("value")
+        parsed = _parse_event_date(value)
+        if parsed:
+            return parsed
+    return _parse_event_date(record.get("source_document", ""))
+
+
+def _response_round_identity(record: dict[str, Any]) -> str:
+    value = _normalized_identity(
+        record.get("response_letter_round")
+        or record.get("reviewed_plan_round")
+        or record.get("review_round")
+        or record.get("source_cycle")
+    )
+    numbers = re.findall(r"\d+(?:\.\d+)?", value)
+    return numbers[-1] if numbers else value
+
+
+def _response_parent_roots(
+    comments: Iterable[dict[str, Any]],
+    duplicate_of: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Map response/comment owners to the surviving canonical comment id."""
+    mapping = dict(duplicate_of or {})
+    for row in comments:
+        comment_id = str(row.get("comment_id", ""))
+        if not comment_id:
+            continue
+        target = str(row.get("duplicate_of") or row.get("lineage_duplicate_of") or "")
+        if target:
+            mapping.setdefault(comment_id, target)
+
+    def root(value: str) -> str:
+        seen: set[str] = set()
+        while value in mapping and mapping[value] and value not in seen:
+            seen.add(value)
+            value = mapping[value]
+        return value
+
+    return {key: root(key) for key in set(mapping) | {
+        str(row.get("comment_id", "")) for row in comments if row.get("comment_id")
+    }}
+
+
+def _response_winner_sort_key(record: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        -int(record.get("human_review_status") == "confirmed"),
+        -int(record.get("verification_status") == "confirmed"),
+        -int(record.get("text_trust_status") == "verified"),
+        -int(bool(record.get("source_locator_json") or record.get("source_location"))),
+        _position(record),
+        str(record.get("response_id", "")),
+    )
+
+
+def deduplicate_responses(
+    dataset: dict[str, Any], duplicate_of: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Collapse repeated applicant/follow-up response rows conservatively.
+
+    A response is one event only when it belongs to the same canonical
+    comment, review round, response date and normalized text.  Different dates
+    are intentionally retained: a later ``Noted`` or follow-up is historical
+    evidence, not a duplicate.  Losing rows remain immutable audit records and
+    their source locators are attached to the winner.
+    """
+    comments = dataset.get("comments", []) or []
+    responses = dataset.get("responses", []) or []
+    roots = _response_parent_roots(comments, duplicate_of)
+    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for response in responses:
+        response_id = str(response.get("response_id", ""))
+        text = normalized_response_text(response)
+        parent_id = str(response.get("comment_id", ""))
+        parent_id = roots.get(parent_id, parent_id)
+        if not response_id or not text or not parent_id:
+            continue
+        date_key = response_event_date_key(response) or "unknown"
+        round_key = _response_round_identity(response) or "unknown"
+        parameters = ",".join(sorted(parameter_tokens(response)))
+        negations = ",".join(sorted(negation_tokens(response)))
+        groups[(parent_id, round_key, date_key, f"{text}|{parameters}|{negations}")].append(response)
+
+    response_by_id = {
+        str(row.get("response_id", "")): row for row in responses
+        if str(row.get("response_id", ""))
+    }
+    response_duplicate_of: dict[str, str] = {}
+    occurrences_attached = 0
+    for rows in groups.values():
+        if len(rows) < 2:
+            continue
+        winner = min(rows, key=_response_winner_sort_key)
+        winner_id = str(winner.get("response_id", ""))
+        winner["duplicate_source_documents"] = sorted(set(
+            str(row.get("source_document", "")).strip()
+            for row in rows if str(row.get("source_document", "")).strip()
+        ))
+        for row in rows:
+            row_id = str(row.get("response_id", ""))
+            if row_id == winner_id:
+                continue
+            response_duplicate_of[row_id] = winner_id
+            _append_source_occurrence(
+                winner,
+                _source_occurrence(row, row_id),
+                field="source_occurrences",
+            )
+            occurrences_attached += 1
+            winner.setdefault("duplicate_response_ids", [])
+            if row_id not in winner["duplicate_response_ids"]:
+                winner["duplicate_response_ids"].append(row_id)
+
+    for row in responses:
+        row_id = str(row.get("response_id", ""))
+        if row_id in response_duplicate_of:
+            row["duplicate_of"] = response_duplicate_of[row_id]
+            row["duplicate_status"] = "same_parent_round_date_exact_text"
+            row["dedup_decision"] = "AUTO_MERGE"
+            row["search_eligible"] = False
+        elif row_id in response_by_id:
+            row.setdefault("dedup_decision", "DISTINCT")
+
+    # Repoint only the links/comments that owned the losing response.  This
+    # prevents a duplicate card from being recreated by the live projection.
+    for comment in comments:
+        response_id = str(comment.get("response_id", ""))
+        if response_id in response_duplicate_of:
+            comment["response_id"] = response_duplicate_of[response_id]
+    for link in dataset.get("comment_response_links", []) or []:
+        response_id = str(link.get("response_id", ""))
+        if response_id in response_duplicate_of:
+            link["response_id"] = response_duplicate_of[response_id]
+
+    return {
+        "duplicate_response_rows_suppressed": len(response_duplicate_of),
+        "duplicate_response_groups": len(set(response_duplicate_of.values())),
+        "response_duplicate_of": response_duplicate_of,
+        "response_source_occurrences_attached": occurrences_attached,
+    }
+
+
+def _source_occurrence(record: dict[str, Any], owner_id: str = "") -> dict[str, Any]:
+    """Copy only locator/provenance fields needed to reopen a duplicate source."""
+    occurrence: dict[str, Any] = {
+        "owner_id": owner_id,
+        "comment_id": str(record.get("comment_id", "")),
+        "response_id": str(record.get("response_id", "")),
+        "exact_text": str(record.get("verified_text") or record.get("original_text", "")),
+    }
+    for field in _SOURCE_OCCURRENCE_FIELDS:
+        value = record.get(field)
+        if value not in (None, "", [], {}):
+            occurrence[field] = value
+    return occurrence
+
+
+def _occurrence_key(occurrence: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    locator = occurrence.get("source_locator_json")
+    if isinstance(locator, dict):
+        locator_key = json.dumps(locator, ensure_ascii=False, sort_keys=True)
+    else:
+        locator_key = str(locator or "")
+    return (
+        str(occurrence.get("source_document", "")),
+        str(occurrence.get("source_page", "")),
+        str(occurrence.get("source_row", "")),
+        str(occurrence.get("source_cell_range", "")),
+        locator_key,
+    )
+
+
+def _append_source_occurrence(
+    owner: dict[str, Any], occurrence: dict[str, Any], field: str = "source_occurrences",
+) -> None:
+    occurrences = owner.setdefault(field, [])
+    if not isinstance(occurrences, list):
+        occurrences = []
+        owner[field] = occurrences
+    key = _occurrence_key(occurrence)
+    if any(isinstance(item, dict) and _occurrence_key(item) == key for item in occurrences):
+        return
+    occurrences.append(occurrence)
+
+
 def mark_duplicate_comments(dataset: dict[str, Any]) -> dict[str, Any]:
     """Keep raw rows for audit while excluding duplicate reads from production use."""
     comments = dataset.get("comments", [])
     canonical, duplicate_of = find_duplicate_comments(comments, dataset.get("comment_response_links", []))
     canonical_ids = {str(row.get("comment_id", "")) for row in canonical}
     comments_by_id = {str(row.get("comment_id", "")): row for row in comments}
+    responses_by_id = {
+        str(row.get("response_id", "")): row
+        for row in dataset.get("responses", [])
+        if str(row.get("response_id", ""))
+    }
+    source_occurrences_attached = 0
+    response_occurrences_attached = 0
+
+    # Keep one searchable parent, but attach every losing row's source locator
+    # to it.  The raw losing records remain immutable audit rows below.
+    for duplicate_id, winner_id in duplicate_of.items():
+        duplicate = comments_by_id.get(duplicate_id)
+        winner = comments_by_id.get(winner_id)
+        if not duplicate or not winner:
+            continue
+        _append_source_occurrence(
+            winner,
+            _source_occurrence(duplicate, duplicate_id),
+        )
+        source_occurrences_attached += 1
+        duplicate_response_id = str(duplicate.get("response_id", ""))
+        winner_response_id = str(winner.get("response_id", ""))
+        if duplicate_response_id and duplicate_response_id != winner_response_id:
+            duplicate_response = responses_by_id.get(duplicate_response_id)
+            winner_response = responses_by_id.get(winner_response_id)
+            if duplicate_response and winner_response:
+                _append_source_occurrence(
+                    winner_response,
+                    _source_occurrence(duplicate_response, duplicate_response_id),
+                    field="source_occurrences",
+                )
+                response_occurrences_attached += 1
+                winner.setdefault("duplicate_response_ids", [])
+                if duplicate_response_id not in winner["duplicate_response_ids"]:
+                    winner["duplicate_response_ids"].append(duplicate_response_id)
+
     for record in comments:
+        record["normalization_version"] = NORMALIZATION_VERSION
         record_id = str(record.get("comment_id", ""))
         if record.get("lineage_duplicate_of"):
             record["search_eligible"] = False
@@ -373,6 +803,7 @@ def mark_duplicate_comments(dataset: dict[str, Any]) -> dict[str, Any]:
             record["search_eligible"] = False
             continue
         if record_id in duplicate_of:
+            record["dedup_decision"] = "AUTO_MERGE"
             record["search_eligible"] = False
             record["duplicate_of"] = duplicate_of[record_id]
             winner = comments_by_id.get(duplicate_of[record_id], {})
@@ -394,10 +825,27 @@ def mark_duplicate_comments(dataset: dict[str, Any]) -> dict[str, Any]:
             was_deduplicated = bool(record.get("duplicate_of") or record.get("duplicate_status"))
             record.pop("duplicate_of", None)
             record.pop("duplicate_status", None)
+            record["dedup_decision"] = "AUTO_MERGE" if was_deduplicated else "DISTINCT"
             if was_deduplicated and record.get("text_trust_status") == "verified":
                 record["search_eligible"] = True
+    # Response rows can be copied into multiple cumulative workbooks even
+    # when their parent comment has already been canonicalized.  Run this
+    # after parent selection so all response owners resolve to the same
+    # canonical parent.  The raw response rows remain available for audit.
+    response_report = deduplicate_responses(dataset, duplicate_of)
+    # Enforce the invariant after all repair passes: a row explicitly marked
+    # as a duplicate can never re-enter the searchable projection on a later
+    # reload.  This protects against legacy datasets whose stale flags were
+    # written by an older repair version.
+    for record in comments:
+        if record.get("duplicate_of") or record.get("lineage_duplicate_of"):
+            record["search_eligible"] = False
     return {
         "duplicate_rows_suppressed": len(duplicate_of),
         "duplicate_groups": len(set(duplicate_of.values())),
         "duplicate_of": duplicate_of,
+        "source_occurrences_attached": source_occurrences_attached,
+        "response_occurrences_attached": response_occurrences_attached,
+        **response_report,
+        "normalization_version": NORMALIZATION_VERSION,
     }

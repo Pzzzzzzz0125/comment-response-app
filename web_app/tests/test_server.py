@@ -4,10 +4,36 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from web_app.server import DatasetStore, readable_text, tokenize, topic_tokens
+from web_app.server import (
+    DatasetStore,
+    document_date_label,
+    document_submission_label,
+    normalize_date_label,
+    embedded_date_annotation,
+    event_document_date,
+    canonical_round_label,
+    comment_display_parts,
+    readable_evidence_text,
+    readable_text,
+    reviewer_event_identity,
+    recurring_issue_title,
+    round_number,
+    merge_duplicate_issue_events,
+    merge_timeline_event_occurrences,
+    tokenize,
+    topic_tokens,
+    workbook_export_label,
+)
 from web_app.gemini_enrich import GeminiClient, normalize_result, record_digest
+from web_app.data_trust import is_general_review_text, is_malformed_rollup_comment, is_reference_note
 from web_app.import_rematched_workbook import excel_date, locator_boxes
-from web_app.knowledge_chat import PlanValidationError, fallback_query_plan, validate_query_plan
+from web_app.knowledge_chat import (
+    PlanValidationError,
+    _complete_excerpt,
+    enrich_query_plan,
+    fallback_query_plan,
+    validate_query_plan,
+)
 from web_app.rag_search import SearchIndex, coherent_units, normalize_analysis
 from web_app.source_registry import (
     SourceLocation,
@@ -128,6 +154,17 @@ def sample_dataset():
 
 
 class DatasetStoreTests(unittest.TestCase):
+    def test_chat_evidence_excerpt_never_exposes_a_cut_word_as_complete_text(self):
+        sentence = "Tree labels and circumferences were added to Sheet A1.01."
+        complete, is_complete = _complete_excerpt(sentence + " " + ("Additional context " * 80), 90)
+        self.assertEqual(complete, sentence)
+        self.assertTrue(is_complete)
+
+        fragment, is_complete = _complete_excerpt("Tree labels and ordinance-size trees " * 20, 90)
+        self.assertTrue(fragment.endswith("…"))
+        self.assertFalse(is_complete)
+        self.assertNotRegex(fragment, r"\b\w{1,2}…$")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temp.name)
@@ -156,6 +193,726 @@ class DatasetStoreTests(unittest.TestCase):
         unmatched = next(row for row in payload["comments"] if row["comment_id"] == "C-SJ-2")
         self.assertEqual(matched["response"]["original_text"], "The setback dimension was added to sheet A1.1.")
         self.assertIsNone(unmatched["response"])
+
+    def test_standalone_comment_recovers_clickable_source_from_dataset_locator(self):
+        owner_id = "C-SJ-2"
+        for source_id, source in list(self.store.source_registry.sources.items()):
+            if source.get("owner_id") == owner_id:
+                del self.store.source_registry.sources[source_id]
+
+        comment = self.store._comments_by_id[owner_id]
+        self.assertFalse(comment.get("issue_thread_id"))
+        self.assertFalse(self.store.source_registry.sources_for_owner(owner_id))
+
+        view = self.store._view_comment(comment)
+
+        self.assertEqual(len(view["sources"]), 1)
+        source = view["sources"][0]
+        self.assertEqual(source["relation"], "Primary source")
+        self.assertEqual(source["document"]["filename"], "comment.xlsx")
+        self.assertEqual(source["location"]["sheet_name"], "Comments")
+        self.assertTrue(source["source_id"].startswith("S-"))
+        self.assertNotIn("relative_path", source["document"])
+
+    def test_same_event_from_two_files_is_one_row_with_source_occurrences(self):
+        dataset = sample_dataset()
+        duplicate = dict(dataset["comments"][0])
+        duplicate["comment_id"] = "C-SJ-1-copy"
+        duplicate["source_document"] = "comments&response/San Jose/comment-copy.xlsx"
+        dataset["comments"].append(duplicate)
+        (self.source_root / "San Jose" / "comment-copy.xlsx").write_bytes(
+            (self.source_root / "San Jose" / "comment.xlsx").read_bytes()
+        )
+        self.dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+        self.store.reload(force=True)
+        payload = self.store.data("San Jose")
+        rows = [row for row in payload["comments"] if row["comment_id"] == "C-SJ-1"]
+        self.assertEqual(len(rows), 1)
+        event = rows[0]["canonical_event"]
+        self.assertEqual(event["comment_count"], 1)
+        self.assertEqual(event["source_count"], 2)
+        self.assertEqual(len(event["source_occurrences"]), 2)
+
+    def test_reference_only_reviewer_directory_is_not_a_searchable_comment(self):
+        note = {
+            "comment_id": "C-reference-note",
+            "city": "San Jose",
+            "original_text": "WC-3 Building Dept reviewers. Please contact reviewers directly. Office Phone: 925.275.1700. ** For reference use ONLY. DON'T COPY ON THE PLAN**",
+            "source_document": "comments&response/San Jose/review.pdf",
+            "search_eligible": True,
+            "text_trust_status": "verified",
+            "verified_text": "WC-3 Building Dept reviewers. Please contact reviewers directly. Office Phone: 925.275.1700. ** For reference use ONLY. DON'T COPY ON THE PLAN**",
+        }
+        self.assertTrue(is_reference_note(note))
+        dataset = sample_dataset()
+        dataset["comments"].append(note)
+        self.dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+        self.store.reload(force=True)
+        self.assertNotIn("C-reference-note", {row["comment_id"] for row in self.store.data("San Jose")["comments"]})
+        self.assertIn("C-reference-note", {row["comment_id"] for row in self.store._all_comments})
+
+    def test_malformed_response_letter_rollup_is_not_searchable(self):
+        row = {
+            "source_document": "comments&response/site/building/PC5 Response Letter.pdf",
+            "text_trust_status": "verified",
+            "verified_text": (
+                "A. PC1- Sheet A2.01: Separation is required. "
+                "PC2: revise the detail. PC3: revise the reference. PC4: update the label."
+            ),
+        }
+        self.assertTrue(is_malformed_rollup_comment(row))
+
+    def test_repeated_plan_check_fee_notice_is_not_a_review_comment(self):
+        note = {
+            "comment_id": "C-fee-notice",
+            "city": "San Jose",
+            "original_text": (
+                "Comment Hi, This letter serves as an official notification "
+                "that your plan check fees are ready to be paid. Permit Payment "
+                "options: Credit Card or EFT eCheck Payments. Please call "
+                "408-535-3555. Thank you, Chandler Ramirez Permit Specialist."
+            ),
+            "source_document": "comments&response/San Jose/fees.xlsx",
+            "search_eligible": True,
+            "text_trust_status": "verified",
+            "verified_text": (
+                "Comment Hi, This letter serves as an official notification "
+                "that your plan check fees are ready to be paid. Permit Payment "
+                "options: Credit Card or EFT eCheck Payments. Please call "
+                "408-535-3555. Thank you, Chandler Ramirez Permit Specialist."
+            ),
+        }
+        self.assertTrue(is_reference_note(note))
+        dataset = sample_dataset()
+        dataset["comments"].append(note)
+        self.dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
+        self.store.reload(force=True)
+        self.assertNotIn("C-fee-notice", {row["comment_id"] for row in self.store.data("San Jose")["comments"]})
+        self.assertIn("C-fee-notice", {row["comment_id"] for row in self.store._all_comments})
+
+    def test_generic_review_boilerplate_is_not_a_timeline_event(self):
+        self.assertTrue(is_general_review_text("Noted."))
+        self.assertTrue(is_general_review_text("This comment to remain open until all other comments are resolved."))
+        self.assertTrue(is_general_review_text(
+            "The Building Division review is limited to general compliance with the California Building Code. "
+            "This review should not be construed as a comprehensive plan check review."
+        ))
+        self.assertTrue(is_general_review_text(
+            "Comment Planning reserves the right to provide additional comments at time of resubmittal."
+        ))
+        self.assertFalse(is_general_review_text("Please provide a strap at ledger breaks."))
+
+    def test_recurring_issue_omits_generic_only_history(self):
+        store = DatasetStore.__new__(DatasetStore)
+        store._issue_event_index = {
+            "T-generic": {
+                "thread_id": "T-generic",
+                "member_comment_ids": ["C-generic"],
+                "events": [
+                    {"event_id": "E-1", "event_type": "government_comment", "effective_round": "1", "exact_text": "Planning reserves the right to provide additional comments at time of resubmittal."},
+                    {"event_id": "E-2", "event_type": "government_comment", "effective_round": "2", "exact_text": "Planning reserves the right to provide additional comments at time of resubmittal."},
+                ],
+            },
+        }
+        store._all_comments = [{
+            "comment_id": "C-generic", "city": "San Jose", "discipline": "Planning",
+            "property_project": "123 Main", "review_round": "1", "issue_status": "",
+            "source_document": "comments&response/San Jose/review.pdf",
+        }]
+        store._responses_by_id = {}
+        issues, stats = store._recurring_issues(store._all_comments)
+        self.assertEqual(issues, [])
+        self.assertEqual(stats["total"], 0)
+
+    def test_recurring_issue_keeps_design_event_but_drops_boilerplate(self):
+        store = DatasetStore.__new__(DatasetStore)
+        store._issue_event_index = {
+            "T-design": {
+                "thread_id": "T-design",
+                "member_comment_ids": ["C-design"],
+                "events": [
+                    {"event_id": "E-1", "event_type": "government_comment", "effective_round": "1", "exact_text": "Please provide a strap at ledger breaks."},
+                    {"event_id": "E-2", "event_type": "government_comment", "effective_round": "2", "exact_text": "Please provide a strap at ledger breaks."},
+                    {"event_id": "E-3", "event_type": "applicant_response", "effective_round": "2", "exact_text": "Noted."},
+                ],
+            },
+        }
+        store._all_comments = [{
+            "comment_id": "C-design", "city": "San Jose", "discipline": "Building",
+            "property_project": "123 Main", "review_round": "1", "issue_status": "",
+            "source_document": "comments&response/San Jose/review.pdf",
+        }]
+        store._responses_by_id = {}
+        issues, _stats = store._recurring_issues(store._all_comments)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual([event["comment_text"] for event in issues[0]["events"]], [
+            "Please provide a strap at ledger breaks.",
+            "Please provide a strap at ledger breaks.",
+        ])
+
+    def test_single_comment_and_ordinary_comment_response_pair_are_not_recurring(self):
+        store = DatasetStore.__new__(DatasetStore)
+        store._issue_event_index = {
+            "T-single": {
+                "member_comment_ids": ["C-single"],
+                "events": [
+                    {"event_id": "E-single", "event_type": "government_comment", "effective_round": "1", "exact_text": "Provide the wall detail.", "source_occurrences": [{"comment_id": "C-single", "source_document": "single.pdf"}]},
+                ],
+            },
+            "T-pair": {
+                "member_comment_ids": ["C-pair"],
+                "events": [
+                    {"event_id": "E-pair", "event_type": "government_comment", "effective_round": "1", "exact_text": "Provide the roof detail.", "source_occurrences": [{"comment_id": "C-pair", "source_document": "pair.pdf"}]},
+                ],
+            },
+        }
+        store._all_comments = [
+            {"comment_id": "C-single", "city": "San Jose", "discipline": "Building", "property_project": "123 Main", "review_round": "1", "issue_status": "", "source_document": "single.pdf", "response_id": ""},
+            {"comment_id": "C-pair", "city": "San Jose", "discipline": "Building", "property_project": "123 Main", "review_round": "1", "issue_status": "", "source_document": "pair.pdf", "response_id": "R-pair"},
+        ]
+        store._responses_by_id = {"R-pair": {"response_id": "R-pair", "original_text": "Detail added on A2.1."}}
+        issues, stats = store._recurring_issues(store._all_comments)
+        self.assertEqual(issues, [])
+        self.assertEqual(stats["total"], 0)
+
+    def test_same_round_reviewer_followup_makes_issue_recurring(self):
+        store = DatasetStore.__new__(DatasetStore)
+        store._issue_event_index = {
+            "T-followup": {
+                "member_comment_ids": ["C-followup"],
+                "events": [
+                    {"event_id": "E-comment", "event_type": "government_comment", "actor_role": "government", "effective_round": "1", "exact_text": "Identify the revised sheet for every response.", "source_occurrences": [{"comment_id": "C-followup", "source_document": "review.xlsx"}]},
+                    {"event_id": "E-response", "event_type": "applicant_response", "actor_role": "company", "effective_round": "1", "exact_text": "See revised plans.", "source_occurrences": [{"comment_id": "C-followup", "source_document": "review.xlsx"}]},
+                    {"event_id": "E-followup", "event_type": "reviewer_follow_up", "actor_role": "government", "effective_round": "1", "exact_text": "The response is not acceptable; identify the exact sheet.", "source_occurrences": [{"comment_id": "C-followup", "source_document": "review.xlsx"}]},
+                ],
+            },
+        }
+        store._all_comments = [{
+            "comment_id": "C-followup", "city": "San Jose", "discipline": "Building",
+            "property_project": "365 Nature", "review_round": "1", "issue_status": "Unresolved",
+            "source_document": "review.xlsx", "response_id": "R-followup",
+        }]
+        store._responses_by_id = {"R-followup": {"response_id": "R-followup", "original_text": "See revised plans."}}
+        issues, stats = store._recurring_issues(store._all_comments)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["round_count"], 1)
+        self.assertEqual(issues[0]["history_event_count"], 3)
+        self.assertEqual(issues[0]["comment_event_count"], 2)
+        self.assertEqual(issues[0]["response_event_count"], 1)
+        self.assertEqual(issues[0]["company_response_count"], 1)
+        self.assertEqual(stats["total"], 1)
+
+    def test_recurring_issue_handles_missing_round_metadata(self):
+        """A malformed/legacy thread must not make /api/data fail."""
+        store = DatasetStore.__new__(DatasetStore)
+        store._issue_event_index = {
+            "T-no-round": {
+                "member_comment_ids": ["C-no-round"],
+                "events": [
+                    {
+                        "event_id": "E-1",
+                        "event_type": "government_comment",
+                        "exact_text": "Provide the complete wall detail.",
+                        "source_occurrences": [{"comment_id": "C-no-round", "source_document": "pc.pdf"}],
+                    },
+                    {
+                        "event_id": "E-2",
+                        "event_type": "reviewer_follow_up",
+                        "exact_text": "The wall detail is still missing.",
+                        "source_occurrences": [{"comment_id": "C-no-round", "source_document": "pc.pdf"}],
+                    },
+                ],
+            },
+        }
+        store._all_comments = [{
+            "comment_id": "C-no-round",
+            "city": "San Jose",
+            "discipline": "Building",
+            "property_project": "123 Main",
+            "issue_status": "Unresolved",
+            "source_document": "pc.pdf",
+        }]
+        store._responses_by_id = {}
+
+        issues, stats = store._recurring_issues(store._all_comments)
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["first_round"], "Unknown")
+        self.assertEqual(issues[0]["latest_round"], "Unknown")
+        self.assertEqual(issues[0]["round_count"], 0)
+        self.assertEqual(stats["total"], 1)
+
+    def test_recurring_titles_and_event_dedup_keep_context(self):
+        self.assertEqual(recurring_issue_title("1. Eaves. Please provide a dimension."), "Eaves.")
+        self.assertEqual(recurring_issue_title("5. Additional Design Requirements. Provide details."), "Additional Design Requirements.")
+        self.assertEqual(round_number("Initial Review"), 1)
+        events = merge_duplicate_issue_events([
+            {
+                "event_id": "E-1",
+                "event_type": "government_comment",
+                "effective_round": "Initial Review",
+                "exact_text": "1. Eaves. Please provide a dimension.",
+                "source_occurrences": [{"comment_id": "C-1", "source_document": "one.docx"}],
+            },
+            {
+                "event_id": "E-2",
+                "event_type": "government_comment",
+                "effective_round": "Initial Review",
+                "exact_text": "Eaves. Please provide a dimension.",
+                "source_occurrences": [{"comment_id": "C-1", "source_document": "two.docx"}],
+            },
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(events[0]["source_occurrences"]), 2)
+
+    def test_event_role_and_markup_prefix_dedup(self):
+        events = merge_duplicate_issue_events([
+            {
+                "event_id": "comment-copy",
+                "event_type": "government_comment",
+                "actor_role": "government",
+                "effective_round": "2",
+                "occurred_at_label": "7/11/25 3:50 PM",
+                "exact_text": "Markup 25100917-STRC-PLANS.pdf BLDG REV-V2-C2 36 1. Provide the rack elevations.",
+                "source_occurrences": [{"comment_id": "C-1", "source_document": "a.xlsx"}],
+            },
+            {
+                "event_id": "followup-copy",
+                "event_type": "reviewer_follow_up",
+                "actor_role": "government",
+                "effective_round": "2",
+                "occurred_at_label": "7/11/25 3:50 PM",
+                "exact_text": "1. Provide the rack elevations.",
+                "source_occurrences": [{"comment_id": "C-2", "source_document": "b.xlsx"}],
+            },
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(events[0]["source_occurrences"]), 2)
+        self.assertIn("reviewer_follow_up", events[0]["merged_event_types"])
+
+    def test_timeline_merge_handles_container_date_variant(self):
+        merged = merge_timeline_event_occurrences([
+            {
+                "event_id": "opening",
+                "event_type": "government_comment",
+                "actor_role": "government",
+                "effective_round": "2",
+                "time_basis": "document_date",
+                "time_label": "Document date · 05/04/2026",
+                "source_date": "05/04/2026",
+                "text": "Markup 25100917-STRC-PLANS.pdf BLDG REV-V2-C2 36 1. Provide the rack elevations.",
+                "sources": [{"source_id": "S-1", "filename": "a.xlsx", "relation": "Primary source"}],
+            },
+            {
+                "event_id": "indexed",
+                "event_type": "reviewer_follow_up",
+                "actor_role": "government",
+                "effective_round": "2",
+                "time_basis": "event_header",
+                "time_label": "07/11/2025",
+                "source_date": "07/11/2025",
+                "text": "1. Provide the rack elevations.",
+                "sources": [{"source_id": "S-2", "filename": "b.xlsx", "relation": "Also appears in"}],
+            },
+        ])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["time_label"], "07/11/2025")
+        self.assertEqual({item["source_id"] for item in merged[0]["sources"]}, {"S-1", "S-2"})
+
+    def test_same_date_response_copies_merge_but_different_dates_do_not(self):
+        common = {
+            "event_type": "applicant_response",
+            "actor_role": "company",
+            "effective_round": "2",
+            "text": "Noted. See sheet A5.",
+        }
+        same = merge_timeline_event_occurrences([
+            {**common, "event_id": "r1", "time_basis": "response_date", "source_date": "08/06/2025"},
+            {**common, "event_id": "r2", "time_basis": "response_date", "source_date": "08/06/2025"},
+        ])
+        different = merge_timeline_event_occurrences([
+            {**common, "event_id": "r1", "time_basis": "response_date", "source_date": "08/06/2025"},
+            {**common, "event_id": "r2", "time_basis": "response_date", "source_date": "08/20/2025"},
+        ])
+        self.assertEqual(len(same), 1)
+        self.assertEqual(len(different), 2)
+
+    def test_same_date_truncated_response_merges_with_complete_response(self):
+        events = merge_timeline_event_occurrences([
+            {
+                "event_id": "short", "event_type": "applicant_response",
+                "actor_role": "company", "actor": "Applicant",
+                "effective_round": "2", "time_basis": "response_date",
+                "source_date": "09/11/2025",
+                "text": "This shearwall design for portal frame per CBC 2308.6.5.2",
+                "sources": [{"source_id": "S-short", "filename": "a.xlsx"}],
+            },
+            {
+                "event_id": "complete", "event_type": "current_applicant_response",
+                "actor_role": "company", "actor": "Applicant",
+                "effective_round": "2", "time_basis": "response_date",
+                "source_date": "09/11/2025",
+                "text": "This shearwall design for portal frame per CBC 2308.6.5.2, see detail 3/SD1. See page 33 for calculations.",
+                "sources": [{"source_id": "S-complete", "filename": "b.xlsx"}],
+            },
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertIn("calculations", events[0]["text"])
+        self.assertEqual({item["source_id"] for item in events[0]["sources"]}, {"S-short", "S-complete"})
+
+    def test_undated_discussion_copy_merges_into_indexed_round(self):
+        events = [
+            {
+                "event_type": "applicant_response",
+                "actor_role": "company",
+                "effective_round": "2",
+                "occurred_at_label": "08/06/2025",
+                "time_basis": "event_header",
+                "text": "Response: See sheet HPS-3.",
+                "sources": [{"filename": "review.xlsx"}, {"filename": "response.xlsx"}],
+            },
+            {
+                "event_type": "applicant_response",
+                "actor_role": "company",
+                "effective_round": "",
+                "occurred_at_label": "08/06/2025",
+                "time_basis": "discussion_header",
+                "text": "Response: See sheet HPS-3.",
+                "sources": [{"filename": "response.xlsx"}],
+            },
+        ]
+        merged = merge_timeline_event_occurrences(events)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(len(merged[0]["sources"]), 2)
+
+    def test_round_and_date_metadata_are_not_confused(self):
+        self.assertEqual(normalize_date_label("May 4, 2026"), "05/04/2026")
+        self.assertEqual(round_number("May 4, 2026"), None)
+        self.assertEqual(
+            canonical_round_label(
+                "May 4, 2026",
+                "new/site/4th Submission/3rd Round of Comments/review.pdf",
+            ),
+            "3",
+        )
+        body, date, note = embedded_date_annotation(
+            "On Sheet A3, connect the driveway. 3/16/2026: complete."
+        )
+        self.assertEqual(body, "On Sheet A3, connect the driveway.")
+        self.assertEqual(date, "03/16/2026")
+        self.assertEqual(note, "complete")
+
+    def test_same_date_duplicate_events_merge_even_when_copied_round_labels_differ(self):
+        events = merge_duplicate_issue_events([
+            {
+                "event_id": "E-pc2-a",
+                "event_type": "government_comment",
+                "effective_round": "May 4, 2026",
+                "exact_text": "Provide the driveway connection. 3/16/2026: complete.",
+                "source_occurrences": [{"comment_id": "C-1", "source_document": "3rd Round of Comments/a.pdf"}],
+            },
+            {
+                "event_id": "E-pc2-b",
+                "event_type": "government_comment",
+                "effective_round": "3",
+                "exact_text": "Provide the driveway connection. 3/16/2026: complete.",
+                "source_occurrences": [{"comment_id": "C-2", "source_document": "3rd Round of Comments/b.pdf"}],
+            },
+            {
+                "event_id": "E-pc3",
+                "event_type": "government_comment",
+                "effective_round": "4",
+                "exact_text": "Provide the driveway connection. 3/16/2026: complete.",
+                "source_occurrences": [{"comment_id": "C-3", "source_document": "4th Round of Comments/c.pdf"}],
+            },
+        ])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(events[0]["source_occurrences"]), 3)
+
+    def test_structured_document_dates_merge_same_day_and_split_different_day(self):
+        base = {
+            "event_type": "government_comment", "effective_round": "2",
+            "actor": "Reviewer", "exact_text": "Provide the detail.",
+        }
+        same_day = merge_duplicate_issue_events([
+            {**base, "event_id": "a", "document_date": {"iso": "2026-05-04"},
+             "source_occurrences": [{"comment_id": "c1", "source_document": "a.pdf"}]},
+            {**base, "event_id": "b", "document_date": {"iso": "2026-05-04"},
+             "source_occurrences": [{"comment_id": "c2", "source_document": "b.pdf"}]},
+        ])
+        self.assertEqual(len(same_day), 1)
+        self.assertEqual(len(same_day[0]["source_occurrences"]), 2)
+        different_day = merge_duplicate_issue_events([
+            {**base, "event_id": "a", "document_date": {"iso": "2026-05-04"}},
+            {**base, "event_id": "b", "document_date": {"iso": "2026-06-04"}},
+        ])
+        self.assertEqual(len(different_day), 2)
+        self.assertEqual(
+            event_document_date({"document_date": {"iso": "2026-05-04"}}),
+            "05/04/2026",
+        )
+
+    def test_indexed_issue_events_collapse_duplicate_source_rows(self):
+        store = DatasetStore.__new__(DatasetStore)
+        store._issue_event_index = {
+            "T-duplicate": {
+                "events": [
+                    {"event_id": "E-1", "event_type": "government_comment", "actor": "", "effective_round": "1", "review_round": "1", "exact_text": "Markup V1-C1 2 Provide the signature.", "source_occurrences": []},
+                    {"event_id": "E-1", "event_type": "government_comment", "actor": "", "effective_round": "1", "review_round": "1", "exact_text": "Markup V1-C1 2  Provide the signature.", "source_occurrences": []},
+                    {"event_id": "E-note", "event_type": "applicant_response", "actor": "", "effective_round": "1", "review_round": "1", "exact_text": "Noted.", "source_occurrences": []},
+                ],
+            },
+        }
+        events = store._indexed_issue_events({"issue_thread_id": "T-duplicate"})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["text"], "Markup V1-C1 2 Provide the signature.")
+
+    def test_applicant_response_event_uses_response_cell_not_comment_cell(self):
+        """A response citation must open E/F, never the parent comment C cell."""
+        store = DatasetStore.__new__(DatasetStore)
+        store._comments_by_id = {
+            "C-row": {"comment_id": "C-row", "response_id": "R-row"},
+        }
+        store._all_comments = list(store._comments_by_id.values())
+        store._issue_event_index = {
+            "T-row": {
+                "events": [{
+                    "event_id": "E-response",
+                    "event_type": "applicant_response",
+                    "actor_role": "company",
+                    "effective_round": "2",
+                    "exact_text": "The shearwall design was revised.",
+                    "source_occurrences": [{
+                        "comment_id": "C-row",
+                        "source_document": "review.xlsx",
+                    }],
+                }],
+            },
+        }
+
+        def source(owner_id, _text):
+            if owner_id == "R-row":
+                return [{
+                    "kind": "local", "source_id": "S-response",
+                    "filename": "review.xlsx", "relation": "Primary source",
+                    "location": {"document_id": "D-review", "cell_range": "E6"},
+                }]
+            return [
+                {
+                    "kind": "local", "source_id": "S-comment",
+                    "filename": "review.xlsx", "relation": "Primary source",
+                    "location": {"document_id": "D-review", "cell_range": "C6"},
+                },
+                {
+                    "kind": "local", "source_id": "S-discussion",
+                    "filename": "review.xlsx", "relation": "Prior applicant response",
+                    "location": {"document_id": "D-review", "cell_range": "F6"},
+                },
+            ]
+
+        store._source_references = source
+        events = store._indexed_issue_events({"issue_thread_id": "T-row"})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "applicant_response")
+        self.assertEqual(events[0]["source"]["source_id"], "S-response")
+        self.assertEqual(events[0]["source"]["location"]["cell_range"], "E6")
+        self.assertNotEqual(events[0]["source"]["location"]["cell_range"], "C6")
+
+        # Legacy rows may not have an independent response record.  Their
+        # combined discussion cell is still the correct fallback.
+        store._comments_by_id = {"C-legacy": {"comment_id": "C-legacy"}}
+        store._all_comments = list(store._comments_by_id.values())
+        store._issue_event_index["T-row"]["events"][0]["source_occurrences"][0][
+            "comment_id"
+        ] = "C-legacy"
+        def legacy_source(owner_id, _text):
+            return source("C-row", _text)
+        store._source_references = legacy_source
+        legacy_events = store._indexed_issue_events({"issue_thread_id": "T-row"})
+        self.assertEqual(
+            legacy_events[0]["source"]["location"]["cell_range"], "F6"
+        )
+
+    def test_indexed_issue_event_shows_each_source_file_once(self):
+        class Registry:
+            def sources_for_owner(self, owner_id):
+                suffix = "one" if owner_id in {"C-1", "C-2"} else "two"
+                return [{
+                    "source_id": f"S-{owner_id}",
+                    "relation": "Primary source",
+                    "document": {"filename": f"review-{suffix}.pdf"},
+                    "location": {"document_id": f"D-{suffix}"},
+                }]
+
+        store = DatasetStore.__new__(DatasetStore)
+        store.source_registry = Registry()
+        store._issue_event_index = {
+            "T-sources": {
+                "events": [{
+                    "event_id": "E-sources",
+                    "event_type": "government_comment",
+                    "actor": "",
+                    "effective_round": "1",
+                    "review_round": "1",
+                    "exact_text": "Please provide the stud bolt weld.",
+                    "source_occurrences": [
+                        {"comment_id": "C-1", "source_document": "folder/review-one.pdf"},
+                        {"comment_id": "C-2", "source_document": "folder/review-one.pdf"},
+                        {"comment_id": "C-3", "source_document": "folder/review-two.pdf"},
+                    ],
+                }],
+            },
+        }
+        events = store._indexed_issue_events({"issue_thread_id": "T-sources"})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            [source["filename"] for source in events[0]["sources"]],
+            ["review-one.pdf", "review-two.pdf"],
+        )
+
+    def test_reviewer_follow_up_event_uses_discussion_cell_not_comment_cell(self):
+        """A follow-up in the same workbook must open F6, not C6."""
+        class Registry:
+            def sources_for_owner(self, owner_id):
+                if owner_id != "C-row":
+                    return []
+                return [
+                    {
+                        "source_id": "S-comment",
+                        "relation": "Primary source",
+                        "document": {"filename": "review.xlsx"},
+                        "location": {"document_id": "D-review", "cell_range": "C6"},
+                    },
+                    {
+                        "source_id": "S-discussion",
+                        "relation": "Reviewer follow-up",
+                        "document": {"filename": "review.xlsx"},
+                        "location": {"document_id": "D-review", "cell_range": "F6"},
+                    },
+                ]
+
+        store = DatasetStore.__new__(DatasetStore)
+        store.source_registry = Registry()
+        store._comments_by_id = {"C-row": {"comment_id": "C-row"}}
+        store._all_comments = list(store._comments_by_id.values())
+        store._issue_event_index = {
+            "T-follow-up": {
+                "events": [{
+                    "event_id": "E-follow-up",
+                    "event_type": "reviewer_follow_up",
+                    "actor_role": "government",
+                    "effective_round": "2",
+                    "exact_text": "Please revise the shear wall design.",
+                    "source_document": "review.xlsx",
+                    "source_location": {"cell_range": "F6"},
+                    "source_occurrences": [{
+                        "comment_id": "C-row",
+                        "source_document": "review.xlsx",
+                        "source_location": {"cell_range": "F6"},
+                    }],
+                }],
+            },
+        }
+        events = store._indexed_issue_events({"issue_thread_id": "T-follow-up"})
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            events[0]["source"]["location"]["cell_range"], "F6"
+        )
+
+    def test_view_comment_response_history_does_not_reuse_comment_cell(self):
+        comment = self.store._comments_by_id["C-SJ-1"]
+        comment["issue_thread_events"] = [{
+            "event_id": "discussion-response",
+            "event_type": "applicant_response",
+            "actor_role": "company",
+            "occurred_at_label": "9/11/25 5:54 PM",
+            "exact_text": "The setback dimension was added to sheet A1.1.",
+            "source_document": "comments&response/San Jose/response.xlsx",
+            "source_location": {"cell_range": "F2"},
+        }]
+
+        def sources(owner_id, _text):
+            if owner_id == "R-SJ-1":
+                return [{
+                    "kind": "local", "source_id": "S-response-cell",
+                    "filename": "response.xlsx", "relation": "Primary source",
+                    "location": {"document_id": "D-response", "cell_range": "E2"},
+                }]
+            return [
+                {
+                    "kind": "local", "source_id": "S-comment-cell",
+                    "filename": "response.xlsx", "relation": "Primary source",
+                    "location": {"document_id": "D-response", "cell_range": "C2"},
+                },
+                {
+                    "kind": "local", "source_id": "S-discussion-cell",
+                    "filename": "response.xlsx", "relation": "Prior applicant response",
+                    "location": {"document_id": "D-response", "cell_range": "F2"},
+                },
+            ]
+
+        self.store._source_references = sources
+        view = self.store._view_comment(comment)
+        response_events = [
+            event for event in view["issue_thread"]["events"]
+            if event["event_type"] == "applicant_response"
+        ]
+        self.assertEqual(len(response_events), 1)
+        self.assertEqual(
+            response_events[0]["source"]["location"]["cell_range"], "E2"
+        )
+
+    def test_indexed_issue_events_make_cross_round_render_ids_unique(self):
+        store = DatasetStore.__new__(DatasetStore)
+        store._issue_event_index = {
+            "T-cross-round": {
+                "events": [
+                    {"event_id": "E-legacy", "event_type": "government_comment", "actor": "", "effective_round": "1", "review_round": "1", "exact_text": "Please specify approved hanger.", "source_occurrences": []},
+                    {"event_id": "E-legacy", "event_type": "government_comment", "actor": "", "effective_round": "2", "review_round": "2", "exact_text": "Please specify approved hanger.", "source_occurrences": []},
+                ],
+            },
+        }
+        events = store._indexed_issue_events({"issue_thread_id": "T-cross-round"})
+        self.assertEqual(len(events), 2)
+        self.assertEqual({event["review_round"] for event in events}, {"1", "2"})
+        self.assertEqual(len({event["event_id"] for event in events}), 2)
+        self.assertEqual(
+            {tuple(event["merged_event_ids"]) for event in events},
+            {("E-legacy",)},
+        )
+
+    def test_indexed_history_keeps_main_comment_and_discussion_events(self):
+        comment = self.store._comments_by_id["C-SJ-1"]
+        comment["issue_thread_id"] = "T-complete-history"
+        comment["issue_thread_events"] = [{
+            "event_id": "discussion-1",
+            "event_type": "reviewer_follow_up",
+            "actor_role": "government",
+            "actor": "Reviewer",
+            "occurred_at": "2025-08-06T09:18:00",
+            "occurred_at_label": "8/6/25 9:18 AM",
+            "exact_text": "Please identify the revised sheet.",
+            "review_round": "1",
+        }]
+        self.store._issue_event_index = {
+            "T-complete-history": {
+                "events": [{
+                    "event_id": "E-pc2",
+                    "event_type": "reviewer_follow_up",
+                    "effective_round": "2",
+                    "review_round": "2",
+                    "exact_text": "The setback dimension is still missing.",
+                    "source_occurrences": [],
+                }],
+            },
+        }
+        view = self.store._view_comment(comment)
+        events = view["issue_thread"]["events"]
+        self.assertEqual(events[0]["event_type"], "government_comment")
+        self.assertIn("front yard setback", events[0]["text"])
+        self.assertIn("Please identify the revised sheet.", {event["text"] for event in events})
+        self.assertIn("The setback dimension is still missing.", {event["text"] for event in events})
+        self.assertIn("current_applicant_response", {event["event_type"] for event in events})
 
     def test_structured_workbook_can_be_human_confirmed_as_one_unit(self):
         dataset = sample_dataset()
@@ -382,6 +1139,31 @@ class DatasetStoreTests(unittest.TestCase):
         filenames = {source["filename"] for source in view["sources"]}
         self.assertEqual(filenames, {"comment.xlsx", "fire-detail.pdf"})
 
+    def test_document_dates_and_submission_labels_are_derived_for_timeline(self):
+        self.assertEqual(
+            document_date_label(
+                "comments&response/site/4th submission/2025-102647 RS_09-24-2025_7_34_PM.xlsx"
+            ),
+            "09/24/2025",
+        )
+        self.assertEqual(
+            document_date_label("comments&response/site/2025-03-07-comments.pdf"),
+            "03/07/2025",
+        )
+        self.assertEqual(
+            document_submission_label("comments&response/site/4th submission/file.xlsx"),
+            "4th submission",
+        )
+
+    def test_view_timeline_uses_source_date_when_reviewer_date_is_missing(self):
+        comment = self.store._comments_by_id["C-SJ-1"]
+        comment["source_document"] = (
+            "comments&response/site/3rd submission/2025-03-07-comments.xlsx"
+        )
+        event = self.store._view_comment(comment)["issue_thread"]["events"][0]
+        self.assertEqual(event["time_label"], "Document date · 03/07/2025")
+        self.assertEqual(event["submission"], "3rd submission")
+
     def test_knowledge_plan_rejects_sql_and_unknown_operations(self):
         with self.assertRaises(PlanValidationError):
             validate_query_plan({"intent": "aggregate_count", "subject": "doors", "operations": ["execute_sql"], "filters": {}})
@@ -405,6 +1187,119 @@ class DatasetStoreTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertEqual(fallback_query_plan(message, has_previous)["intent"], expected)
 
+    def test_knowledge_answer_type_selects_a_question_specific_shape(self):
+        chat = self.store.knowledge_chat
+        cases = [
+            ("How many comments concern doors?", {"intent": "aggregate_count"}, "COUNT"),
+            ("What does this reviewer require?", {"intent": "precedent_search"}, "FACT_LOOKUP"),
+            ("Summarize the tree comments.", {"intent": "topic_summary"}, "HISTORY_SUMMARY"),
+            ("How have we handled tree comments?", {"intent": "historical_response_summary"}, "HOW_HANDLED"),
+            ("Compare fire separation across projects.", {"intent": "compare_groups"}, "COMPARISON"),
+            ("Show me examples of drainage comments.", {"intent": "precedent_search"}, "EXAMPLE_SEARCH"),
+            ("What happened across rounds?", {"intent": "topic_summary"}, "TIMELINE"),
+            ("What should we learn before submission?", {"intent": "topic_summary"}, "PRACTICAL_LESSONS"),
+            ("Only show those in San Jose.", {"intent": "filter_previous_results"}, "FOLLOW_UP"),
+        ]
+        for question, plan, expected in cases:
+            with self.subTest(question=question):
+                self.assertEqual(chat._presentation_type(question, plan), expected)
+
+    def test_structured_answer_keeps_backend_counts_and_allowlists_model_support_ids(self):
+        row = self.store._comments_by_id["C-SJ-1"]
+        event_id = str(row.get("canonical_event_id") or row["comment_id"])
+
+        class SynthesisClient:
+            def synthesize_knowledge_answer(self, _question, _answer_type, backend_facts, evidence):
+                # The model may explain supplied facts, but an invented event
+                # ID must never survive the backend allowlist.
+                self.backend_facts = backend_facts
+                self.evidence = evidence
+                return {
+                    "answer": "The applicant addressed the setback issue by naming a concrete sheet location.",
+                    "answer_blocks": [{
+                        "text": "Across the supplied history, the applicant addressed the setback issue by naming a concrete sheet location.",
+                        "supporting_event_ids": [event_id],
+                        "backend_fact_keys": [],
+                    }],
+                    "patterns": [
+                        {"title": "Named plan revision", "explanation": "The response identified a drawing location.",
+                         "historical_action": "The applicant named Sheet A1.1.", "supporting_event_ids": [event_id]},
+                        {"title": "Invented support", "explanation": "Unsupported.",
+                         "historical_action": "Unsupported.", "supporting_event_ids": ["EVENT-NOT-IN-EVIDENCE"]},
+                    ],
+                    "differences": [{"title": "Invented difference", "text": "Unsupported.",
+                                     "supporting_event_ids": ["EVENT-NOT-IN-EVIDENCE"]}],
+                    "takeaway": "Specific sheet references make review easier.",
+                }
+
+        client = SynthesisClient()
+        self.store.knowledge_gemini_client = client
+        metrics = self.store.knowledge_chat._metrics(["C-SJ-1"])
+        result = self.store.knowledge_chat._structured_answer(
+            "How have we handled setback comments?",
+            {"intent": "historical_response_summary", "subject": "setback comments", "_validation_status": "validated"},
+            metrics,
+            [row],
+            {"data_limitation": ""},
+            "This raw fallback includes a long evidence quotation that should not dominate the answer.",
+        )
+        self.assertEqual(result["answer_type"], "HOW_HANDLED")
+        self.assertEqual(result["coverage"]["comment_count"], 1)
+        self.assertEqual(result["coverage"]["project_count"], 1)
+        self.assertEqual([item["title"] for item in result["patterns"]], ["Named plan revision"])
+        self.assertEqual(result["patterns"][0]["supporting_event_ids"], [event_id])
+        self.assertEqual(result["differences"], [])
+        self.assertTrue(result["takeaway"]["text"].startswith("The history suggests that"))
+        self.assertEqual(
+            result["answer"],
+            "Across the supplied history, the applicant addressed the setback issue by naming a concrete sheet location. [1]",
+        )
+        self.assertEqual(result["direct_answer"], [result["answer"]])
+        self.assertIn("relatively small history", " ".join(result["limitations"]).casefold())
+        self.assertEqual(client.backend_facts["comment_count"], 1)
+        self.assertEqual([item["event_id"] for item in client.evidence], [event_id])
+        self.assertEqual(client.evidence[0]["citation_index"], 1)
+        self.assertTrue(client.evidence[0]["issue_label"])
+
+    def test_count_answer_is_compact_but_includes_grounded_analysis(self):
+        payload = self.store.knowledge_chat.chat({
+            "message": "How many comments concern setback dimensions?", "city_id": "San Jose", "filters": {},
+        })
+        self.assertEqual(payload["answer_type"], "COUNT")
+        self.assertEqual(payload["coverage"]["comment_count"], 1)
+        self.assertIn("**1 relevant comment**", payload["answer"])
+        self.assertRegex(payload["answer"], r"\[1\]")
+        self.assertTrue(payload["representative_evidence"])
+        self.assertEqual(payload["patterns"], [])
+        self.assertEqual(payload["differences"], [])
+        self.assertIsNone(payload["takeaway"])
+
+    def test_query_plan_has_progressive_retrieval_shape_without_gemini(self):
+        plan = enrich_query_plan(
+            fallback_query_plan("How have we handled tree-protection comments?", False),
+            "How have we handled tree-protection comments?",
+            False,
+            {"city": "San Jose"},
+        )
+        self.assertEqual(plan["mode"], "SUMMARY")
+        self.assertEqual(plan["primary_topics"], ["tree_protection"])
+        self.assertEqual(plan["response_requirements"]["confirmed_responses_required"], True)
+        self.assertEqual(plan["scope"], {"city_ids": ["San Jose"]})
+
+    def test_follow_up_inherits_previous_scope_before_revalidation(self):
+        first = self.store.knowledge_chat.chat({
+            "message": "How many comments mention setback dimensions?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        second = self.store.knowledge_chat.chat({
+            "conversation_id": first["conversation_id"],
+            "previous_result_set_id": first["result_set_id"],
+            "message": "Show those without responses.",
+        })
+        self.assertEqual(second["query_plan"]["filters"]["city"], "San Jose")
+        self.assertEqual(second["query_plan"]["scope"]["city_ids"], ["San Jose"])
+
     def test_knowledge_count_is_backend_calculated_and_parent_deduplicated(self):
         payload = self.store.knowledge_chat.chat({
             "message": "How many comments concern setback dimensions?", "city_id": "San Jose", "filters": {},
@@ -414,6 +1309,34 @@ class DatasetStoreTests(unittest.TestCase):
         self.assertEqual(payload["metrics"]["projects"], 1)
         result = self.store.knowledge_chat.result_comments(payload["result_set_id"])
         self.assertEqual([row["comment_id"] for row in result["comments"]], ["C-SJ-1"])
+
+    def test_guided_exploration_actions_are_capability_aware_and_reuse_result_set(self):
+        class ChatClient:
+            def plan_knowledge_query(self, _message, _has_previous):
+                return {
+                    "intent": "topic_summary",
+                    "subject": "permit comments",
+                    "operations": ["load_filtered_comments", "group_by_discipline", "group_by_response_status"],
+                    "filters": {}, "needs_clarification": False, "clarification_question": "",
+                }
+
+        self.store.knowledge_gemini_client = ChatClient()
+        first = self.store.knowledge_chat.chat({"message": "Summarize permit comments", "city_id": "", "filters": {}})
+        action_types = {item["type"] for item in first["actions"]}
+        self.assertIn("compare_projects", action_types)
+        self.assertIn("timeline_analysis", action_types)
+        self.assertTrue(all(item["result_set_id"] == first["result_set_id"] for item in first["actions"]))
+        guided = next(item for item in first["actions"] if item["type"] == "timeline_analysis")
+        second = self.store.knowledge_chat.chat({
+            "conversation_id": first["conversation_id"],
+            "message": guided["label"],
+            "city_id": "",
+            "filters": {},
+            "guided_action": guided,
+        })
+        self.assertEqual(second["intent"], "topic_summary")
+        self.assertEqual(self.store.knowledge_chat.result_sets[second["result_set_id"]]["parent_result_set_id"], first["result_set_id"])
+        self.assertEqual(self.store.knowledge_chat.result_sets[second["result_set_id"]]["guided_action"], "timeline_analysis")
 
     def test_knowledge_followup_filters_previous_verified_ids(self):
         first = self.store.knowledge_chat.chat({
@@ -440,7 +1363,30 @@ class DatasetStoreTests(unittest.TestCase):
         })
         self.assertEqual(payload["metrics"]["parent_comments"], 0)
         self.assertEqual(payload["citations"], [])
-        self.assertTrue(any("Semantic verification was unavailable" in item for item in payload["warnings"]))
+        self.assertTrue(any("Evidence validation was incomplete" in item for item in payload["warnings"]))
+
+    def test_chat_requires_explicit_eligibility_for_normalized_rows(self):
+        # New canonical events must carry the full evidence gate.  A confirmed
+        # response link alone is not enough when the event is quarantined or
+        # has not been admitted to the verified search index.
+        row = dict(self.store._comments_by_id["C-SJ-1"])
+        row.update({
+            "comment_id": "C-SJ-NORMALIZED-REVIEW",
+            "canonical_event_id": "CE-review",
+            "verification_status": "needs_review",
+            "text_trust_status": "quarantined",
+            "search_eligible": False,
+        })
+        self.store._comments.append(row)
+        self.store._comments_by_id[row["comment_id"]] = row
+        self.assertFalse(self.store.knowledge_chat._chat_evidence_eligible(row))
+
+        row.update({
+            "verification_status": "confirmed",
+            "text_trust_status": "verified",
+            "search_eligible": True,
+        })
+        self.assertTrue(self.store.knowledge_chat._chat_evidence_eligible(row))
 
     def test_result_set_expiration_is_enforced(self):
         now = [1000.0]
@@ -481,6 +1427,39 @@ class DatasetStoreTests(unittest.TestCase):
         self.assertEqual(len(client.evidence), 1)
         self.assertIn("Plans were revised", sections["historical_pattern"])
 
+    def test_knowledge_evidence_levels_distinguish_revision_and_later_confirmation(self):
+        chat = self.store.knowledge_chat
+        row = self.store._comments_by_id["C-SJ-1"]
+        response = self.store._responses_by_id["R-SJ-1"]
+        level, reason = chat._evidence_level(row, response)
+        self.assertEqual(level, 3)
+        self.assertIn("concrete revision", reason.casefold())
+
+        # Normalized imports may keep events under issue_thread instead of the
+        # legacy issue_thread_events field.  A later reviewer confirmation must
+        # upgrade the same evidence to level 4 in either representation.
+        row["issue_thread"] = {"events": [{
+            "event_type": "reviewer_follow_up",
+            "text": "Complete; no further comments.",
+        }]}
+        level, reason = chat._evidence_level(row, response)
+        self.assertEqual(level, 4)
+        self.assertIn("confirms", reason.casefold())
+
+    def test_knowledge_structured_answer_contains_clickable_representative_evidence(self):
+        payload = self.store.knowledge_chat.chat({
+            "message": "How have we handled setback comments?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        self.assertTrue(payload["evidence"])
+        item = payload["evidence"][0]
+        self.assertTrue(item["comment_excerpt"])
+        self.assertTrue(item["response_excerpt"])
+        self.assertIn("evidence_level_reason", item)
+        self.assertTrue(item["comment_source_id"])
+        self.assertTrue(item["response_source_id"])
+
     def test_suggested_response_is_excluded_from_metrics_and_response_citations(self):
         self.store._links_by_comment["C-SJ-1"]["review_status"] = "suggested"
         payload = self.store.knowledge_chat.chat({
@@ -509,25 +1488,25 @@ class DatasetStoreTests(unittest.TestCase):
         class SmartClient:
             model = "smart-search-model"
 
-            def plan_knowledge_query(self, *_args):
-                raise AssertionError("Smart Search client must not route Knowledge Chat")
+            def summarize_database_scope(self, *_args):
+                raise AssertionError("Smart Search client must not synthesize Knowledge Chat answers")
 
         class ChatClient:
-            model = "gemini-3.1-flash-lite"
+            model = "gemini-3.6-flash"
 
             def __init__(self):
                 self.called = False
 
-            def plan_knowledge_query(self, _message, _has_previous):
+            def summarize_database_scope(self, _message, _facts):
                 self.called = True
-                return {"intent": "aggregate_count", "subject": "setback", "operations": ["keyword_search", "count_parent_comments"], "filters": {}, "needs_clarification": False, "clarification_question": ""}
+                return "The San Jose scope contains two verified comments."
 
         chat_client = ChatClient()
         self.store.gemini_client = SmartClient()
         self.store.knowledge_gemini_client = chat_client
-        payload = self.store.knowledge_chat.chat({"message": "Count setback comments", "city_id": "San Jose", "filters": {}})
+        payload = self.store.knowledge_chat.chat({"message": "Give me a summary of San Jose comments", "city_id": "San Jose", "filters": {}})
         self.assertTrue(chat_client.called)
-        self.assertEqual(payload["metrics"]["parent_comments"], 1)
+        self.assertEqual(payload["metrics"]["parent_comments"], 2)
 
     def test_model_cannot_apply_nonexistent_category_as_a_hard_filter(self):
         class ChatClient:
@@ -569,7 +1548,7 @@ class DatasetStoreTests(unittest.TestCase):
         self.assertIn("spans Planning and Fire", payload["answer_sections"]["historical_pattern"])
         self.assertFalse(any("semantically verified" in item for item in payload["warnings"]))
 
-    def test_failed_semantic_tree_search_keeps_literal_comments_without_claiming_handling(self):
+    def test_tree_chat_does_not_ground_candidates_when_gemini_is_unavailable(self):
         self.store._comments_by_id["C-SJ-2"]["original_text"] = "Label every existing tree and identify trees proposed for removal."
 
         class ChatClient:
@@ -577,12 +1556,189 @@ class DatasetStoreTests(unittest.TestCase):
                 return {"intent": "historical_response_summary", "subject": "tree protection", "operations": ["smart_search", "summarize_confirmed_responses"], "filters": {}, "needs_clarification": False, "clarification_question": ""}
 
         self.store.knowledge_gemini_client = ChatClient()
-        self.store.gemini_search = lambda *_args, **_kwargs: {"results": [], "engine_label": "Hybrid database fallback", "gemini_failures": ["verification"]}
+        self.store.gemini_search = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Knowledge Chat must not invoke the multi-stage Smart Search pipeline"))
         payload = self.store.knowledge_chat.chat({"message": "How have we handled tree-protection comments?", "city_id": "San Jose", "filters": {}})
-        self.assertEqual(payload["metrics"]["parent_comments"], 1)
-        self.assertEqual(payload["query_plan"]["evidence_scope"], "literal_unverified")
+        self.assertEqual(payload["metrics"]["parent_comments"], 0)
+        self.assertEqual(payload["validation_summary"]["candidate_comments"], 0)
+        self.assertEqual(payload["query_plan"]["evidence_scope"], "validated_insufficient")
+        self.assertEqual(payload["validation_status"], "no_validated_evidence")
         self.assertEqual(payload["metrics"]["confirmed_responses"], 0)
-        self.assertIn("no company-handling conclusion", payload["answer_sections"]["historical_pattern"].casefold())
+        self.assertEqual(payload["citations"], [])
+        self.assertTrue(any("none has a confirmed company response" in item.casefold() for item in payload["warnings"]))
+
+    def test_tree_inventory_and_removal_are_excluded_from_tree_protection(self):
+        self.store._comments_by_id["C-SJ-1"]["original_text"] = "Label every existing tree and identify trees proposed for removal."
+        self.store._comments_by_id["C-SJ-2"]["original_text"] = "Provide tree protection fencing and root protection measures during construction."
+        self.store._responses_by_id["R-SJ-2"] = {
+            "response_id": "R-SJ-2", "comment_id": "C-SJ-2",
+            "original_text": "Tree protection fencing was added to the plan.",
+            "human_review_status": "confirmed",
+        }
+        self.store._links_by_comment["C-SJ-2"] = {
+            "comment_id": "C-SJ-2", "response_id": "R-SJ-2",
+            "review_status": "confirmed", "match_status": "confirmed",
+        }
+
+        class ChatClient:
+            def validate_knowledge_evidence(self, _subject, candidates):
+                return [{
+                    "candidate_id": item["candidate_id"],
+                    "is_relevant": "protection" in item["comment_text"].casefold(),
+                    "matched_concept": "tree protection measures" if "protection" in item["comment_text"].casefold() else "tree inventory or removal",
+                    "supporting_excerpt": item["comment_text"],
+                    "confidence": 0.98,
+                    "exclude_reason": "Tree inventory and removal are adjacent to, but not evidence of, construction tree protection.",
+                } for item in candidates]
+
+        self.store.knowledge_gemini_client = ChatClient()
+        payload = self.store.knowledge_chat.chat({"message": "How have we handled tree-protection comments?", "city_id": "San Jose", "filters": {}})
+        result = self.store.knowledge_chat.result_sets[payload["result_set_id"]]
+        self.assertEqual(payload["validation_status"], "validated")
+        self.assertEqual(result["comment_ids"], ["C-SJ-2"])
+        self.assertEqual(payload["metrics"]["parent_comments"], 1)
+        self.assertTrue(any(item["comment_id"] == "C-SJ-1" for item in payload["excluded_records"]))
+
+    def test_chat_topic_validation_prefers_dedicated_chat_model(self):
+        self.store._comments_by_id["C-SJ-1"]["original_text"] = "Provide tree protection fencing during construction."
+
+        class SmartSearchClient:
+            def validate_knowledge_evidence(self, *_args):
+                raise AssertionError("Chat validation must not use the slower Smart Search client when Chat is configured")
+
+        class ChatClient:
+            def validate_knowledge_evidence(self, _subject, candidates):
+                return [{
+                    "candidate_id": item["candidate_id"],
+                    "is_relevant": True,
+                    "matched_concept": "tree protection measures",
+                    "supporting_excerpt": item["comment_text"],
+                    "confidence": 0.99,
+                    "exclude_reason": "",
+                } for item in candidates]
+
+        self.store.gemini_client = SmartSearchClient()
+        self.store.knowledge_gemini_client = ChatClient()
+        payload = self.store.knowledge_chat.chat({"message": "How have we handled tree-protection comments?", "city_id": "San Jose", "filters": {}})
+        self.assertEqual(payload["validation_status"], "validated")
+        self.assertEqual(payload["metrics"]["parent_comments"], 1)
+
+    def test_incomplete_evidence_validation_never_produces_citations(self):
+        self.store._comments_by_id["C-SJ-1"]["original_text"] = "Provide tree protection fencing during construction."
+        self.store._comments_by_id["C-SJ-2"]["original_text"] = "Protect roots within the tree protection zone."
+        self.store._responses_by_id["R-SJ-2"] = {
+            "response_id": "R-SJ-2", "comment_id": "C-SJ-2",
+            "original_text": "Root protection was added to the plan.",
+            "human_review_status": "confirmed",
+        }
+        self.store._links_by_comment["C-SJ-2"] = {
+            "comment_id": "C-SJ-2", "response_id": "R-SJ-2",
+            "review_status": "confirmed", "match_status": "confirmed",
+        }
+
+        class ChatClient:
+            def validate_knowledge_evidence(self, _subject, candidates):
+                if len(candidates) == 1:
+                    return []
+                item = candidates[0]
+                return [{
+                    "candidate_id": item["candidate_id"], "is_relevant": True,
+                    "matched_concept": "tree protection", "supporting_excerpt": item["comment_text"],
+                    "confidence": 0.99, "exclude_reason": "",
+                }]
+
+        self.store.knowledge_gemini_client = ChatClient()
+        payload = self.store.knowledge_chat.chat({"message": "How have we handled tree-protection comments?", "city_id": "San Jose", "filters": {}})
+        self.assertEqual(payload["validation_status"], "unverified")
+        self.assertEqual(payload["metrics"]["parent_comments"], 0)
+        self.assertEqual(payload["validation_summary"]["candidate_comments"], 2)
+        self.assertEqual(payload["citations"], [])
+        self.assertIn("incomplete", " ".join(payload["warnings"]).casefold())
+
+    def test_incomplete_evidence_batch_retries_only_missing_candidates(self):
+        chat = self.store.knowledge_chat
+
+        class IncompleteThenCompleteClient:
+            def __init__(self):
+                self.calls = []
+
+            def validate_knowledge_evidence(self, _subject, candidates):
+                self.calls.append([item["candidate_id"] for item in candidates])
+                selected = candidates[:1] if len(self.calls) == 1 else candidates
+                return [{
+                    "candidate_id": item["candidate_id"],
+                    "is_relevant": True,
+                    "matched_concept": "tree protection",
+                    "supporting_excerpt": item["comment_text"],
+                    "confidence": 0.99,
+                    "exclude_reason": "",
+                } for item in selected]
+
+        client = IncompleteThenCompleteClient()
+        candidates = [
+            {"candidate_id": "one", "comment_text": "Protect tree roots."},
+            {"candidate_id": "two", "comment_text": "Install tree protection fencing."},
+        ]
+        decisions = chat._verify_candidate_batch(client, "tree protection", candidates)
+        self.assertEqual([item["candidate_id"] for item in decisions], ["one", "two"])
+        self.assertEqual(client.calls, [["one", "two"], ["two"]])
+
+    def test_verification_batches_are_record_and_size_bounded(self):
+        candidates = [
+            {"candidate_id": str(index), "comment_text": "x" * 9_000}
+            for index in range(7)
+        ]
+        batches = self.store.knowledge_chat._verification_batches(candidates)
+        self.assertEqual([len(batch) for batch in batches], [2, 2, 2, 1])
+
+    def test_broad_tree_related_handling_uses_tagged_response_events_not_stage_three(self):
+        self.store._comments_by_id["C-SJ-1"]["original_text"] = (
+            "Label every existing tree and identify trees proposed for removal."
+        )
+        self.store._comments_by_id["C-SJ-2"]["original_text"] = (
+            "Provide tree protection fencing and root protection measures during construction."
+        )
+
+        class ChatClient:
+            def __init__(self):
+                self.candidates = []
+
+            def plan_knowledge_query(self, _message, _has_previous):
+                # A model may over-narrow the subject. The local scope guard
+                # must preserve the user's broader "tree-related" wording.
+                return {
+                    "intent": "historical_response_summary",
+                    "subject": "tree protection",
+                    "operations": ["smart_search", "summarize_confirmed_responses"],
+                    "filters": {},
+                    "needs_clarification": False,
+                    "clarification_question": "",
+                }
+
+            def validate_knowledge_evidence(self, subject, candidates):
+                self.candidates.extend(candidates)
+                self.subject = subject
+                return [{
+                    "candidate_id": item["candidate_id"],
+                    "is_relevant": True,
+                    "matched_concept": "tree inventory and removal",
+                    "supporting_excerpt": item["comment_text"],
+                    "confidence": 0.98,
+                    "exclude_reason": "",
+                } for item in candidates]
+
+        client = ChatClient()
+        self.store.knowledge_gemini_client = client
+        payload = self.store.knowledge_chat.chat({
+            "message": "How have we handled tree-related comments?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        self.assertNotEqual(payload["retrieval"]["stage"], 3)
+        self.assertEqual([item["candidate_id"] for item in client.candidates], ["C-SJ-1"])
+        self.assertEqual(payload["validation_status"], "validated")
+        self.assertEqual(payload["metrics"]["confirmed_responses"], 1)
+        self.assertTrue(any("canonical candidates" in item for item in payload["warnings"]))
+        self.assertFalse(any("selected validated canonical" in item for item in payload["warnings"]))
 
     def test_chat_model_can_verify_bounded_literal_fallback(self):
         self.store._comments_by_id["C-SJ-1"]["original_text"] = "Show tree protection measures and label every tree proposed for removal."
@@ -598,7 +1754,7 @@ class DatasetStoreTests(unittest.TestCase):
                 return "The confirmed response records the plan revision."
 
         self.store.knowledge_gemini_client = ChatClient()
-        self.store.gemini_search = lambda *_args, **_kwargs: {"results": [], "engine_label": "Hybrid database fallback", "gemini_failures": ["verification"]}
+        self.store.gemini_search = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Knowledge Chat must not invoke the multi-stage Smart Search pipeline"))
         payload = self.store.knowledge_chat.chat({"message": "How have we handled tree-protection comments?", "city_id": "San Jose", "filters": {}})
         result = self.store.knowledge_chat.result_sets[payload["result_set_id"]]
         self.assertEqual(result["direct_comment_ids"], ["C-SJ-1"])
@@ -633,6 +1789,135 @@ class DatasetStoreTests(unittest.TestCase):
         result = self.store.knowledge_chat.result_sets[payload["result_set_id"]]
         self.assertEqual(result["direct_comment_ids"], ["C-SJ-1"])
         self.assertEqual(result["related_comment_ids"], ["C-SJ-2"])
+
+    def test_comparison_excludes_off_topic_grading_record_before_answer(self):
+        # Regression for the false "fire separation" comparison that used a
+        # confirmed grading/drainage response as its only evidence.
+        grading = {
+            "comment_id": "C-SJ-GRADING",
+            "city": "San Jose",
+            "property_project": "7298 Queensbridge Way",
+            "review_round": "1",
+            "discipline": "Grading",
+            "original_text": "A Grading Permit is needed for the proposed grading. Provide a grading and drainage site plan.",
+            "response_id": "R-SJ-GRADING",
+            "human_review_status": "confirmed",
+        }
+        response = {
+            "response_id": "R-SJ-GRADING",
+            "comment_id": "C-SJ-GRADING",
+            "original_text": "Noted, a separate grading permit will be submitted.",
+            "human_review_status": "confirmed",
+        }
+        self.store._comments.append(grading)
+        self.store._comments_by_id[grading["comment_id"]] = grading
+        self.store._responses_by_id[response["response_id"]] = response
+
+        class ChatClient:
+            def plan_knowledge_query(self, _message, _has_previous):
+                return {"intent": "compare_groups", "subject": "fire separation", "operations": ["smart_search", "group_by_city", "summarize_confirmed_responses"], "filters": {}, "needs_clarification": False, "clarification_question": ""}
+
+            def validate_knowledge_evidence(self, _subject, candidates):
+                return [{
+                    "candidate_id": item["candidate_id"],
+                    "is_relevant": "fire separation" in item["comment_text"].casefold(),
+                    "matched_concept": "fire separation" if "fire separation" in item["comment_text"].casefold() else "different permit topic",
+                    "supporting_excerpt": item["comment_text"],
+                    "confidence": 0.98,
+                    "exclude_reason": "Evidence does not concern fire separation.",
+                } for item in candidates]
+
+        self.store.knowledge_gemini_client = ChatClient()
+        self.store.gemini_search = lambda *_args, **_kwargs: {
+            "results": [{"comment_id": "C-SJ-GRADING", "match_class": "direct"}],
+            "engine_label": "Gemini accuracy-verified RAG",
+            "gemini_failures": [],
+        }
+        payload = self.store.knowledge_chat.chat({"message": "Compare fire-separation comments across projects.", "city_id": "San Jose", "filters": {}})
+        # The local-first gate finds the existing fixture's fire record and
+        # never lets the injected grading record enter the evidence pool.
+        self.assertEqual(payload["metrics"]["parent_comments"], 1)
+        self.assertEqual(payload["metrics"]["projects"], 1)
+        self.assertEqual(payload["validation_status"], "insufficient_comparison")
+        self.assertNotIn("C-SJ-GRADING", self.store.knowledge_chat.result_sets[payload["result_set_id"]]["comment_ids"])
+        self.assertIn("only **1 relevant project**", payload["answer"].casefold())
+
+    def test_door_size_and_rating_distinction_is_not_a_corpus_summary(self):
+        self.store._comments_by_id["C-SJ-1"]["original_text"] = "Please revise the door width to 32 inches."
+        self.store._comments_by_id["C-SJ-2"]["original_text"] = "Provide the one-hour fire-rated door assembly and label its rating."
+
+        class ChatClient:
+            def plan_knowledge_query(self, _message, _has_previous):
+                return {"intent": "topic_summary", "subject": "door", "operations": ["smart_search"], "filters": {}, "needs_clarification": False, "clarification_question": ""}
+
+            def verify_knowledge_topic(self, _subject, candidates):
+                return [{"candidate_id": row["candidate_id"], "match_class": "direct", "confidence": 0.95, "reason": "Door attribute distinction"} for row in candidates]
+
+        self.store.knowledge_gemini_client = ChatClient()
+        self.store.gemini_search = lambda *_args, **_kwargs: {
+            "results": [
+                {"comment_id": "C-SJ-1", "match_class": "direct"},
+                {"comment_id": "C-SJ-2", "match_class": "direct"},
+            ],
+            "engine_label": "Gemini accuracy-verified RAG",
+            "gemini_failures": [],
+        }
+        payload = self.store.knowledge_chat.chat({"message": "Separate door-size comments from door-rating comments.", "city_id": "San Jose", "filters": {}})
+        self.assertEqual(payload["intent"], "compare_groups")
+        self.assertIn("door size", payload["answer_sections"]["historical_pattern"].casefold())
+        self.assertIn("door rating", payload["answer_sections"]["historical_pattern"].casefold())
+
+    def test_door_size_count_excludes_incidental_door_mentions(self):
+        # These records are deliberately near-neighbours for lexical search:
+        # only the first one actually requests a door dimension.
+        extra = [
+            {
+                "comment_id": "C-SJ-DOOR-SIZE",
+                "city": "San Jose",
+                "property_project": "100 Main St — Building",
+                "review_round": "1",
+                "discipline": "Building",
+                "original_text": "Please revise the door width to 32 inches.",
+                "match_status": "unmatched",
+            },
+            {
+                "comment_id": "C-SJ-BIRD-DOOR",
+                "city": "San Jose",
+                "property_project": "100 Main St — Building",
+                "review_round": "1",
+                "discipline": "Planning",
+                "original_text": "New or replacement glass windows, doors, or features shall be the same size.",
+                "match_status": "unmatched",
+            },
+            {
+                "comment_id": "C-SJ-OUTLET-DOOR",
+                "city": "San Jose",
+                "property_project": "100 Main St — Building",
+                "review_round": "1",
+                "discipline": "Electrical",
+                "original_text": "Provide a receptacle outlet near door D10; door hardware is not part of this review.",
+                "match_status": "unmatched",
+            },
+            {
+                "comment_id": "C-SJ-DOOR-RATING",
+                "city": "San Jose",
+                "property_project": "100 Main St — Building",
+                "review_round": "1",
+                "discipline": "Fire",
+                "original_text": "Provide the one-hour fire-rated door assembly and label its rating.",
+                "match_status": "unmatched",
+            },
+        ]
+        self.store._comments.extend(extra)
+        self.store._comments_by_id.update({row["comment_id"]: row for row in extra})
+        payload = self.store.knowledge_chat.chat({
+            "message": "How many historical comments concern door size?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        self.assertEqual(payload["metrics"]["parent_comments"], 1)
+        result = self.store.knowledge_chat.result_comments(payload["result_set_id"])
+        self.assertEqual([row["comment_id"] for row in result["comments"]], ["C-SJ-DOOR-SIZE"])
 
     def test_explain_selected_comment_is_grounded_to_selected_record(self):
         class ExplainGemini:
@@ -747,11 +2032,46 @@ class SearchIndexTests(unittest.TestCase):
         self.assertEqual([row["comment_id"] for row in rows], ["C-1"])
 
 class TokenizeTests(unittest.TestCase):
+    def test_issue_event_times_use_source_labels(self):
+        actor, timestamp = reviewer_event_identity(
+            "Zoning Conformance\nEric Morgan\n4/3/26 10:17 AM"
+        )
+        self.assertEqual(actor, "Eric Morgan")
+        self.assertEqual(timestamp, "4/3/26 10:17 AM")
+        self.assertEqual(
+            workbook_export_label(
+                "2025-147142  RS_07-01-2026_11_52_AM.xlsx"
+            ),
+            "By workbook export · 07/01/2026",
+        )
+
     def test_tokenize_normalizes_and_removes_common_words(self):
         self.assertEqual(tokenize("Please SHOW the Front-Yard setback."), ["front-yard", "setback"])
 
     def test_readable_text_joins_extraction_line_breaks(self):
         self.assertEqual(readable_text("The door should be at\nlength 10._x000D_ Please revise."), "The door should be at length 10. Please revise.")
+
+    def test_markup_prefix_is_hidden_from_display_but_exposes_compact_label(self):
+        body, label = comment_display_parts(
+            "Markup 25102647-STRC-CALCS.pdf Bldg Review V1-C1 39 "
+            "PLEASE SHOW THE VERTICAL DISTRIBUTION OF SEISMIC FORCES "
+            "PER ASCE 7-16 12.8.3.*x000d* *x000d* "
+            "THE DERIVATION OF SEISMIC LOADS SHOULD BE PERFORMED USING "
+            "THE ENTIRE BUILDING AS A WHOLE.",
+            "comments&response/25102647-STRC-CALCS.pdf",
+            "39",
+        )
+        self.assertEqual(label, "Markup · V1-C1 39")
+        self.assertTrue(body.startswith("PLEASE SHOW THE VERTICAL"))
+        self.assertNotIn("25102647-STRC-CALCS.pdf", body)
+        self.assertIn("\n\n", body)
+
+    def test_evidence_formatter_keeps_paragraphs_and_removes_separators(self):
+        formatted = readable_evidence_text(
+            "First sentence.*x000d* *x000d* Second sentence.\n"
+            "----------------------------------------------------------"
+        )
+        self.assertEqual(formatted, "First sentence.\n\nSecond sentence.")
 
     def test_topic_tokens_ignore_changed_measurement_values(self):
         self.assertEqual(topic_tokens("The door length is 10"), topic_tokens("The door length is 4"))
@@ -790,6 +2110,87 @@ class TokenizeTests(unittest.TestCase):
         self.assertEqual(topics[0]["occurrences"], 2)
         self.assertEqual(topics[0]["independent_source_documents"], 2)
         self.assertEqual(topics[0]["physical_duplicate_files_excluded"], 1)
+
+    def test_common_topic_counts_later_thread_snapshots_once(self):
+        store = DatasetStore.__new__(DatasetStore)
+        store._document_identity = {"canonical_documents": {
+            "CD-one": {"duplicate_group_size": 1},
+            "CD-two": {"duplicate_group_size": 1},
+            "CD-three": {"duplicate_group_size": 1},
+        }}
+        comments = [
+            {"comment_id": "C-1", "issue_thread_id": "T-shared",
+             "canonical_document_id": "CD-one", "canonical_comment_id": "CC-one",
+             "original_text": "Provide the surveyor signature on sheet C1.",
+             "property_project": "Site A", "review_round": "1"},
+            {"comment_id": "C-1-later", "issue_thread_id": "T-shared",
+             "canonical_document_id": "CD-two", "canonical_comment_id": "CC-two",
+             "original_text": "Provide the surveyor signature on sheet C1. Comment remains.",
+             "property_project": "Site A", "review_round": "2"},
+            {"comment_id": "C-2", "issue_thread_id": "T-independent",
+             "canonical_document_id": "CD-three", "canonical_comment_id": "CC-three",
+             "original_text": "Provide the surveyor signature on sheet C1.",
+             "property_project": "Site B", "review_round": "1"},
+        ]
+        _count, topics = store._common_topics(comments)
+        self.assertEqual(len(topics), 1)
+        self.assertEqual(topics[0]["occurrences"], 2)
+        self.assertEqual(
+            set(topics[0]["comment_ids"]),
+            {"C-1", "C-1-later", "C-2"},
+        )
+
+    def test_recurring_issues_are_separate_round_timelines(self):
+        store = DatasetStore.__new__(DatasetStore)
+        comments = [
+            {
+                "comment_id": "C-1",
+                "city": "Menlo Park",
+                "site_name": "2311 Warner Range Ave",
+                "project_id": "P-1",
+                "site_id": "S-1",
+                "discipline": "Building",
+                "original_text": "PC1: Provide a rated wall assembly.",
+                "review_round": "1",
+                "issue_status": "Unresolved",
+                "source_document": "pc1.pdf",
+                "response_id": "",
+            },
+            {
+                "comment_id": "C-2",
+                "city": "Menlo Park",
+                "site_name": "2311 Warner Range Ave",
+                "project_id": "P-1",
+                "site_id": "S-1",
+                "discipline": "Building",
+                "original_text": "PC2: The rated wall assembly is still not correct.",
+                "review_round": "2",
+                "issue_status": "Unresolved",
+                "source_document": "pc2.pdf",
+                "response_id": "",
+            },
+        ]
+        store._all_comments = comments
+        store._comments_by_id = {row["comment_id"]: row for row in comments}
+        store._responses_by_id = {}
+        store._issue_event_index = {
+            "T-1": {
+                "member_comment_ids": ["C-1", "C-2"],
+                "events": [
+                    {"event_id": "E-1", "effective_round": "1", "event_type": "government_comment", "exact_text": "Provide a rated wall assembly.", "source_occurrences": [{"comment_id": "C-1", "source_document": "pc1.pdf"}]},
+                    {"event_id": "E-2", "effective_round": "2", "event_type": "reviewer_follow_up", "exact_text": "The rated wall assembly is still not correct.", "source_occurrences": [{"comment_id": "C-2", "source_document": "pc2.pdf"}]},
+                ],
+            },
+        }
+        issues, stats = store._recurring_issues(comments)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["issue_thread_id"], "T-1")
+        self.assertEqual(issues[0]["first_round"], 1)
+        self.assertEqual(issues[0]["latest_round"], 2)
+        self.assertEqual(issues[0]["round_count"], 2)
+        self.assertEqual(issues[0]["source_document_count"], 2)
+        self.assertEqual(issues[0]["status"], "open")
+        self.assertEqual(stats["open"], 1)
 
     def test_rematch_import_converts_excel_dates_and_top_left_coordinates(self):
         comment_locator = [{"page": 1, "top_left_bbox": [10, 20, 110, 70]}]
@@ -830,6 +2231,28 @@ class SourceViewerTests(unittest.TestCase):
         self.assertEqual(viewer_type_for("docx"), "pdf_preview")
         self.assertEqual(viewer_type_for("xlsx"), "spreadsheet")
         self.assertEqual(viewer_type_for("eml"), "unsupported")
+
+    def test_sibling_new_corpus_is_registered_without_authorizing_workspace(self):
+        new_root = self.workspace / "new"
+        new_root.mkdir()
+        new_source = new_root / "new-comments.pdf"
+        new_source.write_bytes(b"%PDF-1.4\nnew evidence\n%%EOF")
+        registry = SourceRegistry(
+            self.dataset,
+            self.source_root,
+            self.workspace / "new-source-registry.json",
+            self.preview_root,
+        )
+        document = next(
+            row for row in registry.documents.values()
+            if row.get("relative_path") == "new/new-comments.pdf"
+        )
+        self.assertEqual(
+            registry.delivery(document["document_id"], "preview")["status"],
+            200,
+        )
+        with self.assertRaises(PermissionError):
+            registry._path_for_relative("dataset.json")
 
     def test_secondary_source_name_and_sheet_reference_resolution(self):
         folder = self.source_root / "San Jose"
@@ -1008,7 +2431,10 @@ class SourceViewerTests(unittest.TestCase):
         self.assertIn("Ask Permit History", chat)
         self.assertIn("/api/knowledge-chat", chat)
         self.assertIn("/api/result-sets/", app)
-        self.assertIn("At a glance", chat)
+        self.assertIn("Supporting sources", chat)
+        self.assertIn("View evidence", chat)
+        self.assertIn("Retrieval diagnostics", chat)
+        self.assertNotIn("What the history shows", chat)
         self.assertIn("SourcesTrigger", chat)
         self.assertIn("/api/sources/", viewer)
         self.assertNotIn("Download original", chat + app + viewer)

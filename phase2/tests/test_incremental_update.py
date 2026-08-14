@@ -1,6 +1,7 @@
 import unittest
 import json
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
@@ -41,6 +42,54 @@ def make_xlsx(path: Path, rows: list[list[str]]) -> None:
 
 
 class IncrementalParserTests(unittest.TestCase):
+    def test_file_workers_allow_fast_source_to_finish_while_slow_source_waits(self):
+        records = [
+            {
+                "path": "comments&response/site/slow.pdf", "sha256": "slow",
+                "document_type": "city_comments",
+            },
+            {
+                "path": "comments&response/site/fast.pdf", "sha256": "fast",
+                "document_type": "city_comments",
+            },
+        ]
+        release_slow = threading.Event()
+        completion_order = []
+
+        class Pipeline:
+            def fork(self):
+                return Pipeline()
+
+            def process(self, _source, relative, _context):
+                if relative.endswith("slow.pdf"):
+                    release_slow.wait(1)
+                else:
+                    completion_order.append("fast")
+                    release_slow.set()
+                if relative.endswith("slow.pdf"):
+                    completion_order.append("slow")
+                return [], [], [], {
+                    "source_document": relative,
+                    "processing_status": "completed",
+                }, []
+
+        with patch.object(
+            incremental, "canonicalize_records_before_gemini",
+            return_value=(records, []),
+        ), patch.object(
+            incremental, "prescan_source_group",
+            return_value={"files": []},
+        ):
+            _c, _r, _l, summaries, _q = incremental.process_new_group(
+                Path("."), {"likely_city": "Test"}, records, Pipeline(),
+                file_workers=2,
+            )
+        self.assertEqual(completion_order, ["fast", "slow"])
+        self.assertEqual(
+            [row["source_document"] for row in summaries],
+            [records[0]["path"], records[1]["path"]],
+        )
+
     def test_structured_refresh_preserves_manual_confirmed_rematches(self):
         legacy_path = "comments&response/new/site-comments.xlsx"
         confirmed_path = "comments&response/verified/response.xlsx"
@@ -106,6 +155,127 @@ class IncrementalParserTests(unittest.TestCase):
             ),
             set(),
         )
+
+    def test_retryable_ingestion_paths_respects_site_scope(self):
+        report = {"files": [
+            {
+                "relative_path": "new/site-a/comments.pdf",
+                "processing_status": "failed",
+            },
+            {
+                "relative_path": "new/site-a/responses.pdf",
+                "processing_status": "paused_quota",
+            },
+            {
+                "relative_path": "new/site-b/comments.pdf",
+                "processing_status": "circuit_open",
+            },
+            {
+                "relative_path": "new/site-a/complete.pdf",
+                "processing_status": "completed",
+            },
+            {
+                "relative_path": "new/site-a/ambiguous.pdf",
+                "processing_status": "failed",
+                "review_reason": (
+                    "Gemini request status is unknown after submission; "
+                    "automatic resubmission was blocked"
+                ),
+            },
+        ]}
+        self.assertEqual(
+            incremental.retryable_ingestion_paths(report, ["site-a"]),
+            {
+                "new/site-a/comments.pdf",
+                "new/site-a/responses.pdf",
+            },
+        )
+        self.assertEqual(
+            len(incremental.retryable_ingestion_paths(report)), 3,
+        )
+        self.assertEqual(
+            incremental.ambiguous_submission_paths(report, ["site-a"]),
+            {"new/site-a/ambiguous.pdf"},
+        )
+
+    def test_retryable_ingestion_paths_uses_pre_inventory_failure_state(self):
+        previous = {"files": [{
+            "relative_path": "new/site/failed.pdf",
+            "processing_status": "failed",
+        }]}
+        rebuilt = {"files": [{
+            "relative_path": "new/site/failed.pdf",
+            "processing_status": "pending",
+        }]}
+        self.assertEqual(
+            incremental.retryable_ingestion_paths(previous, ["new/"]),
+            {"new/site/failed.pdf"},
+        )
+        self.assertEqual(
+            incremental.retryable_ingestion_paths(rebuilt, ["new/"]),
+            set(),
+        )
+
+    def test_orphaned_pending_processed_path_is_reopened(self):
+        report = {"files": [
+            {"relative_path": "new/site/orphan.pdf", "processing_status": "pending"},
+            {"relative_path": "new/site/represented.pdf", "processing_status": "pending"},
+            {"relative_path": "new/other/orphan.pdf", "processing_status": "pending"},
+        ]}
+        self.assertEqual(
+            incremental.orphaned_pending_paths(
+                report,
+                {
+                    "new/site/orphan.pdf", "new/site/represented.pdf",
+                    "new/other/orphan.pdf",
+                },
+                {"new/site/represented.pdf"},
+                ["new/site/"],
+            ),
+            {"new/site/orphan.pdf"},
+        )
+
+    def test_group_upsert_replaces_unconfirmed_stable_id(self):
+        old_comment = {"comment_id": "C-1", "original_text": "old"}
+        old_response = {"response_id": "R-1", "comment_id": "C-1"}
+        old_link = {
+            "comment_id": "C-1", "response_id": "R-1",
+            "match_status": "matched", "review_status": "needs_review",
+        }
+        new_comment = {"comment_id": "C-1", "original_text": "new"}
+        new_response = {"response_id": "R-2", "comment_id": "C-1"}
+        new_link = {
+            "comment_id": "C-1", "response_id": "R-2",
+            "match_status": "matched", "review_status": "needs_review",
+        }
+        values = incremental.upsert_ingested_group(
+            [old_comment], [old_response], [old_link],
+            [new_comment], [new_response], [new_link],
+        )
+        comments, responses, links, incoming_comments, incoming_responses, incoming_links = values
+        self.assertEqual(comments, [])
+        self.assertEqual(responses, [])
+        self.assertEqual(links, [])
+        self.assertEqual(incoming_comments, [new_comment])
+        self.assertEqual(incoming_responses, [new_response])
+        self.assertEqual(incoming_links, [new_link])
+
+    def test_group_upsert_rejects_conflicting_confirmed_text(self):
+        with self.assertRaisesRegex(ValueError, "conflicts with confirmed"):
+            incremental.upsert_ingested_group(
+                [{"comment_id": "C-1", "original_text": "verified"}],
+                [],
+                [{
+                    "comment_id": "C-1", "response_id": "",
+                    "match_status": "unmatched", "review_status": "confirmed",
+                }],
+                [{"comment_id": "C-1", "original_text": "different"}],
+                [],
+                [{
+                    "comment_id": "C-1", "response_id": "",
+                    "match_status": "unmatched", "review_status": "needs_review",
+                }],
+            )
 
     def test_local_prescan_keeps_archives_as_context(self):
         archive = incremental.fallback_prescan_decision({
@@ -260,6 +430,22 @@ class IncrementalParserTests(unittest.TestCase):
         self.assertEqual(
             files[1]["city_resolution_method"], "site_folder_propagation",
         )
+
+    def test_explicit_site_folder_city_overrides_consultant_address(self):
+        relative = (
+            "new/25-004-18255 Clemson Ave, Saratoga, CA 95070/"
+            "Title 24 report.pdf"
+        )
+        city, confidence, evidence, method = incremental.quick_city_for_source(
+            Path(relative), relative, {
+                "likely_city": "Redwood City", "city_confidence": 0.99,
+                "city_evidence": ["consultant postal address names Redwood City"],
+            },
+        )
+        self.assertEqual(city, "Saratoga")
+        self.assertEqual(confidence, 1.0)
+        self.assertEqual(method, "explicit_site_folder_address")
+        self.assertIn("project folder", evidence[0])
 
     def test_discovered_city_overrides_stale_unknown_audit_group(self):
         relative = "comments&response/site/review.xlsx"
@@ -457,8 +643,123 @@ class IncrementalParserTests(unittest.TestCase):
         _comments, _responses, _links, summaries, _review = incremental.process_new_group(
             Path("."), {"likely_city": "Menlo Park"}, [correction, support], pipeline,
         )
-        self.assertEqual(pipeline.processed, [correction["path"], support["path"]])
+        self.assertEqual(pipeline.processed, [correction["path"]])
         self.assertEqual(len(summaries), 2)
+        support_summary = next(
+            row for row in summaries
+            if row.get("source_document") == support["path"]
+        )
+        self.assertEqual(support_summary["processing_status"], "classified")
+        self.assertFalse(support_summary["opened"])
+
+    def test_inventory_discovers_legacy_and_new_source_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            legacy = workspace / "comments&response" / "legacy" / "review.pdf"
+            incoming = workspace / "new" / "incoming" / "review.pdf"
+            legacy.parent.mkdir(parents=True)
+            incoming.parent.mkdir(parents=True)
+            legacy.write_bytes(b"legacy")
+            incoming.write_bytes(b"incoming")
+            report = incremental.inventory_supported_files(
+                workspace, {}, workspace / "report.json",
+            )
+            paths = {row["relative_path"] for row in report["files"]}
+            self.assertEqual(paths, {
+                "comments&response/legacy/review.pdf",
+                "new/incoming/review.pdf",
+            })
+
+    def test_new_source_paths_group_by_actual_site_folder(self):
+        self.assertEqual(
+            incremental._site_folder("new/site-a/subfolder/review.pdf"),
+            "site-a",
+        )
+
+    def test_supplied_prescan_context_only_does_not_open_source(self):
+        record = {
+            "path": "new/site/report.pdf", "sha256": "report",
+            "document_type": "supporting_document",
+        }
+
+        class Pipeline:
+            def process(self, *_args, **_kwargs):
+                raise AssertionError("context-only source must not be opened")
+
+        with patch.object(
+            incremental, "canonicalize_records_before_gemini",
+            return_value=([record], []),
+        ):
+            _c, _r, _l, summaries, _q = incremental.process_new_group(
+                Path("."), {"likely_city": "Test"}, [record], Pipeline(),
+                prescan_decisions={record["path"]: {
+                    "relative_path": record["path"],
+                    "decision": "context_only",
+                    "document_role": "supporting_document",
+                    "reason": "No comments or responses",
+                    "confidence": 0.95,
+                    "linked_topics": [],
+                }},
+            )
+        self.assertEqual(summaries[0]["processing_status"], "classified")
+        self.assertFalse(summaries[0]["opened"])
+
+    def test_empty_source_is_skipped_before_visual_ingestion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            relative = "new/site/empty-comments.pdf"
+            source = root / relative
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"")
+            record = {
+                "path": relative,
+                "sha256": "e3b0c442",
+                "document_type": "combined_comment_response",
+            }
+
+            class Pipeline:
+                def process(self, *_args, **_kwargs):
+                    raise AssertionError("Visual ingestion must not open a 0-byte source")
+
+            with patch.object(
+                incremental, "canonicalize_records_before_gemini",
+                return_value=([record], []),
+            ), patch.object(
+                incremental, "prescan_source_group",
+                return_value={"files": []},
+            ):
+                _c, _r, _l, summaries, _q = incremental.process_new_group(
+                    root,
+                    {"likely_city": "Menlo Park", "likely_review_round": "2"},
+                    [record],
+                    Pipeline(),
+                    prescan_decisions={relative: {
+                        "decision": "full_read",
+                        "document_role": "combined_comment_response",
+                        "reason": "Filename looks relevant",
+                        "confidence": 0.9,
+                        "linked_topics": [],
+                    }},
+                )
+            self.assertEqual(summaries[0]["processing_status"], "no_relevant_content")
+            self.assertEqual(summaries[0]["verification_result"], "not_run_empty_file")
+            self.assertFalse(summaries[0]["opened"])
+
+    def test_administrative_prescan_full_read_is_downgraded_without_comment_signal(self):
+        for role in (
+            "permit_application", "permit_summary",
+            "revision_documentation", "revision_summary",
+        ):
+            decision = incremental.sanitize_prescan_decision({
+                "document_type": "unknown",
+                "likely_contains_city_comments": False,
+                "likely_contains_company_responses": False,
+            }, {
+                "decision": "full_read", "document_role": role,
+                "reason": "Important project metadata", "confidence": 0.9,
+                "linked_topics": ["application"],
+            })
+            self.assertEqual(decision["decision"], "context_only")
 
     def test_prescan_repair_archives_old_rows_and_replaces_source(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -608,6 +909,50 @@ class IncrementalParserTests(unittest.TestCase):
                     )
             saved = json.loads((output / "dataset.json").read_text(encoding="utf-8"))
             self.assertEqual(saved, original)
+
+    def test_ingestion_report_aggregates_request_tokens_and_straggler_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "ingestion_report.json"
+            report = incremental.write_ingestion_report(
+                report_path,
+                [{"relative_path": "a.pdf", "processing_status": "pending"}],
+                [{
+                    "source_document": "a.pdf", "processing_status": "complete",
+                    "comment_count": 2, "performance": {
+                        "gemini_calls": 1,
+                        "request_metrics": [{
+                            "input_tokens": 100, "cached_input_tokens": 40,
+                            "output_tokens": 20, "thought_tokens": 3,
+                            "request_bytes": 7, "response_bytes": 8,
+                            "retry_count": 1, "image_count": 2,
+                            "evidence_unit_count": 2, "expected_record_count": 2,
+                            "actual_record_count": 2, "upload_duration": 0.5,
+                            "time_to_first_token": 1.0, "generation_duration": 2.0,
+                            "queue_duration": 0.25, "finish_reason": "STOP",
+                            "model": "test-model",
+                        }],
+                    },
+                }],
+            )
+            performance = report["performance"]
+            self.assertEqual(performance["gemini_input_tokens"], 100)
+            self.assertEqual(performance["gemini_cached_input_tokens"], 40)
+            self.assertEqual(performance["gemini_output_tokens"], 20)
+            self.assertEqual(performance["retry_count"], 1)
+            self.assertEqual(performance["image_count"], 2)
+            self.assertEqual(performance["response_bytes"], 8)
+            self.assertEqual(performance["finish_reasons"], ["STOP"])
+            self.assertEqual(performance["models_used"], ["test-model"])
+
+    def test_pipeline_checkpoint_keeps_stage_versions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            value = incremental.write_pipeline_checkpoint(
+                output, "run-1", {"uploaded": "complete", "parsed": "complete"},
+            )
+            self.assertEqual(value["schema_version"], incremental.CHECKPOINT_SCHEMA_VERSION)
+            self.assertEqual(value["stages"]["parsed"]["status"], "complete")
+            self.assertTrue(value["stages"]["parsed"]["version"])
 
 
 if __name__ == "__main__":

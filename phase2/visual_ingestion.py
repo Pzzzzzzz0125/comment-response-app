@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import copy
 import csv
 import hashlib
@@ -16,9 +17,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -37,21 +40,165 @@ from phase2.spreadsheet_ingestion import (
     detect_spreadsheet_schemas,
     local_verification_result,
 )
-from web_app.source_registry import _xlsx_cells, xlsx_sheet_names
+from phase2.straggler_monitor import (
+    append_trace_event,
+    finished_request_events,
+    image_dimensions,
+    summarize_request_metrics,
+    utc_timestamp,
+)
+from web_app.source_lineage import document_date as derive_document_date
+from web_app.source_registry import (
+    _xlsx_cells,
+    pdf_same_row_context,
+    xlsx_sheet_names,
+)
+from web_app.text_reconstruction import (
+    attach_reconstruction,
+    is_lexically_safe_reconstruction,
+)
 
 
 SUPPORTED_TYPES = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv"}
-PIPELINE_VERSION = "adaptive-document-ingestion-v4"
+PIPELINE_VERSION = "adaptive-document-ingestion-v6-embedded-response-repair"
 TEXT_EXTRACTION_VERSION = "native-text-v3-exact-xlsx-cells"
-PAGE_SCREENING_VERSION = "all-page-routing-v3"
+PAGE_SCREENING_VERSION = "all-page-routing-v8-compact-native-annotation-evidence"
 PAGE_RENDER_VERSION = "selected-page-render-v2"
-EXTRACTION_PROMPT_VERSION = "adaptive-extraction-v4"
-VERIFICATION_PROMPT_VERSION = "adaptive-verification-v4-visual-only-context"
+EXTRACTION_PROMPT_VERSION = "adaptive-extraction-v6-embedded-response-status"
+VERIFICATION_PROMPT_VERSION = "adaptive-verification-v6-embedded-response-status"
+RECONSTRUCTION_CORRECTION_PROMPT_VERSION = "reconstruction-correction-v1"
 PRESCAN_PROMPT_VERSION = "content-page-screening-v2"
+CHECKPOINT_SCHEMA_VERSION = "pipeline-checkpoint-v1"
+VERIFICATION_CONTRACT_VERSION = "pair-coverage-v1"
 MIN_VERIFIED_CONFIDENCE = 0.95
 INITIAL_SCREEN_PAGES = 8
 SCREENING_DPI = 120
 LOW_TEXT_CHARACTER_LIMIT = 80
+
+
+DOCUMENT_DATE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "raw": {"type": "STRING"},
+        "iso": {"type": "STRING"},
+        "source": {"type": "STRING"},
+        "page": {"type": "INTEGER"},
+        "evidence": {"type": "STRING"},
+        "confidence": {"type": "NUMBER"},
+    },
+    "required": ["raw", "iso", "source", "page", "evidence", "confidence"],
+}
+
+
+def _parse_document_date(value: Any) -> str:
+    """Parse a document date into ISO without treating a round as a date."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    iso = re.search(r"\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", text)
+    numeric = re.search(r"\b(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2,4})\b", text)
+    month_names = {
+        name.casefold(): index for index, name in enumerate((
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ), start=1)
+    }
+    month_names.update({name[:3].casefold(): value for name, value in list(month_names.items())})
+    values: tuple[int, int, int] | None = None
+    if iso:
+        values = (int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+    elif numeric:
+        year = int(numeric.group(3))
+        values = (year + (2000 if year < 100 else 0), int(numeric.group(1)), int(numeric.group(2)))
+    else:
+        words = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(20\d{2})\b", text)
+        if words and words.group(1).casefold() in month_names:
+            values = (int(words.group(3)), month_names[words.group(1).casefold()], int(words.group(2)))
+    if not values:
+        return ""
+    try:
+        return date(values[0], values[1], values[2]).isoformat()
+    except ValueError:
+        return ""
+
+
+def normalize_document_date_metadata(
+    extraction: dict[str, Any], bundle: EvidenceBundle,
+) -> dict[str, Any]:
+    """Validate Gemini's file date and add a deterministic, auditable fallback."""
+    candidate = extraction.get("document_date")
+    if isinstance(candidate, dict):
+        raw = str(candidate.get("raw") or candidate.get("value") or "").strip()
+        iso = _parse_document_date(candidate.get("iso") or raw)
+        source = str(candidate.get("source") or "unknown").strip() or "unknown"
+        evidence = str(candidate.get("evidence") or "").strip()
+        try:
+            page = max(0, int(candidate.get("page") or 0))
+        except (TypeError, ValueError):
+            page = 0
+        try:
+            confidence = max(0.0, min(1.0, float(candidate.get("confidence") or 0.0)))
+        except (TypeError, ValueError):
+            confidence = 0.0
+    else:
+        raw = str(candidate or "").strip()
+        iso = _parse_document_date(raw)
+        source, evidence, page, confidence = ("legacy_extraction", raw, 0, 0.0) if iso else ("unknown", "", 0, 0.0)
+    if not iso:
+        try:
+            iso, evidence, method = derive_document_date(bundle.source_path, [])
+        except (OSError, ValueError, TypeError):
+            iso, evidence, method = "", "", "missing"
+    if not iso:
+        iso = _parse_document_date(bundle.source_path.name)
+        if iso:
+            evidence = bundle.source_path.name
+            method = "filename_date_fallback"
+    if iso and source in {"unknown", "legacy_extraction"}:
+        source = f"fallback_{method}"
+        raw = raw or evidence
+        page = 0
+        confidence = max(confidence, 0.75)
+    metadata = {
+        "raw": raw,
+        "iso": iso,
+        "source": source if iso else "unknown",
+        "page": page,
+        "evidence": evidence,
+        "confidence": confidence if iso else 0.0,
+    }
+    extraction["document_date"] = metadata
+    extraction["document_date_iso"] = iso
+    extraction["document_date_raw"] = raw
+    extraction["document_date_source"] = metadata["source"]
+    extraction["document_date_page"] = page
+    extraction["document_date_confidence"] = metadata["confidence"]
+    extraction["source_document_date"] = iso
+    return metadata
+
+
+def normalize_round_metadata(
+    extraction: dict[str, Any], result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return round value plus provenance without allowing filename hints to win."""
+    result = result or {}
+    value = str(result.get("review_round") or extraction.get("review_round") or "").strip()
+    candidate = result.get("review_round_metadata") or extraction.get("review_round_metadata")
+    if isinstance(candidate, dict):
+        source = str(candidate.get("source") or "unknown").strip() or "unknown"
+        raw = str(candidate.get("raw") or candidate.get("value") or value).strip()
+        try:
+            confidence = max(0.0, min(1.0, float(candidate.get("confidence") or 0.0)))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return {"value": value or raw, "raw": raw, "source": source, "confidence": confidence}
+    if value:
+        return {
+            "value": value, "raw": value,
+            "source": "document_content_unattributed",
+            "confidence": 0.7,
+        }
+    return {"value": "", "raw": "", "source": "unknown", "confidence": 0.0}
 
 PROCESSING_STATUSES = {
     "pending", "classified", "comments_found", "responses_found",
@@ -122,6 +269,11 @@ EXTRACTION_SCHEMA = {
     "properties": {
         "property": {"type": "STRING"}, "city": {"type": "STRING"},
         "review_round": {"type": "STRING"},
+        "review_round_metadata": {"type": "OBJECT", "properties": {
+            "value": {"type": "STRING"}, "raw": {"type": "STRING"},
+            "source": {"type": "STRING"}, "confidence": {"type": "NUMBER"},
+        }, "required": ["value", "raw", "source", "confidence"]},
+        "document_date": DOCUMENT_DATE_SCHEMA,
         "document_class": {"type": "STRING", "enum": [
             "government_comments", "company_response", "combined", "supporting", "uncertain",
         ]},
@@ -130,6 +282,15 @@ EXTRACTION_SCHEMA = {
             "record_key": {"type": "STRING"}, "comment_number": {"type": "STRING"},
             "department": {"type": "STRING"}, "reviewer": {"type": "STRING"},
             "exact_comment_text": {"type": "STRING"}, "normalized_comment_text": {"type": "STRING"},
+            # Optional representation fields are additive.  Exact text
+            # remains the source-of-truth transcription; these describe only
+            # visually reconstructed reading order/structure.
+            "text_reconstructed": {"type": "STRING"},
+            "display_structure": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+                "type": {"type": "STRING", "enum": ["paragraph", "list_item", "heading"]},
+                "label": {"type": "STRING"}, "start": {"type": "INTEGER"}, "end": {"type": "INTEGER"},
+            }, "required": ["type", "start", "end"]}},
+            "source_unit_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
             "page_start": {"type": "INTEGER"}, "page_end": {"type": "INTEGER"},
             "bounding_boxes": LOCATION_SCHEMA["properties"]["bounding_boxes"],
             "continues_from_previous_page": {"type": "BOOLEAN"},
@@ -145,6 +306,15 @@ EXTRACTION_SCHEMA = {
         "responses": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
             "record_key": {"type": "STRING"}, "response_number": {"type": "STRING"},
             "exact_response_text": {"type": "STRING"},
+            "response_date_raw": {"type": "STRING"},
+            "response_date_iso": {"type": "STRING"},
+            "response_type": {"type": "STRING"},
+            "text_reconstructed": {"type": "STRING"},
+            "display_structure": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+                "type": {"type": "STRING", "enum": ["paragraph", "list_item", "heading"]},
+                "label": {"type": "STRING"}, "start": {"type": "INTEGER"}, "end": {"type": "INTEGER"},
+            }, "required": ["type", "start", "end"]}},
+            "source_unit_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
             "page_start": {"type": "INTEGER"}, "page_end": {"type": "INTEGER"},
             "bounding_boxes": LOCATION_SCHEMA["properties"]["bounding_boxes"],
             "confidence": {"type": "NUMBER"}, "uncertain": {"type": "BOOLEAN"},
@@ -157,7 +327,7 @@ EXTRACTION_SCHEMA = {
         "review_reason": {"type": "STRING"},
     },
     "required": [
-        "property", "city", "review_round", "document_class", "comment_section_complete",
+        "property", "city", "review_round", "review_round_metadata", "document_date", "document_class", "comment_section_complete",
         "comments", "responses", "additional_markups_referenced", "review_reason",
     ],
 }
@@ -165,14 +335,32 @@ EXTRACTION_SCHEMA = {
 VERIFICATION_SCHEMA = {
     "type": "OBJECT",
     "properties": {
+        "verification_contract_version": {"type": "STRING"},
         "document_verified": {"type": "BOOLEAN"}, "every_comment_captured": {"type": "BOOLEAN"},
         "every_response_captured": {"type": "BOOLEAN"}, "verification_summary": {"type": "STRING"},
+        "pair_verification": {"type": "OBJECT", "properties": {
+            "passed": {"type": "BOOLEAN"},
+            "checked_record_count": {"type": "INTEGER"},
+            "failed_record_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "reason": {"type": "STRING"},
+        }, "required": ["passed", "checked_record_count", "failed_record_ids", "reason"]},
+        "coverage_verification": {"type": "OBJECT", "properties": {
+            "passed": {"type": "BOOLEAN"},
+            "visible_comment_count": {"type": "INTEGER"},
+            "visible_response_count": {"type": "INTEGER"},
+            "missing_record_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "reason": {"type": "STRING"},
+        }, "required": ["passed", "visible_comment_count", "visible_response_count", "missing_record_ids", "reason"]},
+        "document_date_verified": {"type": "BOOLEAN"},
+        "document_date_reason": {"type": "STRING"},
         "number_sequence_correct": {"type": "BOOLEAN"},
         "continuations_joined_correctly": {"type": "BOOLEAN"},
         "headers_excluded": {"type": "BOOLEAN"},
         "neighboring_items_separate": {"type": "BOOLEAN"},
         "no_response_leakage": {"type": "BOOLEAN"},
         "later_markup_check_complete": {"type": "BOOLEAN"},
+        "correction_required": {"type": "BOOLEAN"},
+        "correction_codes": {"type": "ARRAY", "items": {"type": "STRING"}},
         "verified_record_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
         "rejected_record_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
         "missing_visible_comments": {"type": "ARRAY", "items": {"type": "STRING"}},
@@ -201,7 +389,9 @@ VERIFICATION_SCHEMA = {
         ]}},
     },
     "required": [
-        "document_verified", "every_comment_captured", "every_response_captured",
+        "verification_contract_version", "document_verified", "every_comment_captured", "every_response_captured",
+        "pair_verification", "coverage_verification",
+        "document_date_verified", "document_date_reason",
         "number_sequence_correct", "continuations_joined_correctly", "headers_excluded",
         "neighboring_items_separate", "no_response_leakage", "later_markup_check_complete",
         "verified_record_ids", "rejected_record_ids", "missing_visible_comments",
@@ -209,6 +399,28 @@ VERIFICATION_SCHEMA = {
         "duplicate_fragments", "continuation_errors",
         "verification_summary", "comments", "responses",
     ],
+}
+
+# A bounded repair response is deliberately smaller than a fresh extraction.
+# It can only propose representation-layer text/layout corrections for an
+# already extracted record.  It cannot create records or change locators.
+RECONSTRUCTION_CORRECTION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "correction_required": {"type": "BOOLEAN"},
+        "correction_codes": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "corrections": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "record_key": {"type": "STRING"},
+            "role": {"type": "STRING", "enum": ["comment", "response"]},
+            "corrected_text_reconstructed": {"type": "STRING"},
+            "display_structure": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+                "type": {"type": "STRING", "enum": ["paragraph", "list_item", "heading"]},
+                "label": {"type": "STRING"}, "start": {"type": "INTEGER"}, "end": {"type": "INTEGER"},
+            }, "required": ["type", "start", "end"]}},
+            "reason_code": {"type": "STRING"},
+        }, "required": ["record_key", "role", "corrected_text_reconstructed", "reason_code"]}},
+    },
+    "required": ["correction_required", "correction_codes", "corrections"],
 }
 
 PRESCAN_SCHEMA = {
@@ -234,9 +446,22 @@ When `known_context_hints.visual_batch` is present, the supplied images are one 
 
 Visually understand the actual document structure: tables, rows, numbering, headings, columns, form fields, continuation pages, and the spatial relationship between government comments and applicant/company responses.
 
+Before extracting records, identify the date of this physical source file/document. Return it in the required `document_date` object. Prefer a printed report date, letter date, workbook/export date, or explicit date in the document header over a date in a referenced plan or comment body. `raw` is the exact date text as printed, `iso` is `YYYY-MM-DD`, `source` identifies the field or location (for example `report_date`, `letter_date`, `workbook_filename`, `document_header`, or `unknown`), `page` is the page where the evidence appears (0 when the evidence is not on a page), and `evidence` is a short exact excerpt. If no document date is visible, return empty `raw`, `iso`, and `evidence`, `page: 0`, `source: "unknown"`, and `confidence: 0`. Never use a review-round label as a date, and never use a date found only inside a comment as the file date.
+
+Return the review round from the document content, not the filename hint. Also return `review_round_metadata` with `value`, the exact `raw` label, `source` (`body`, `table`, `document_header`, `pdf_metadata`, `filename`, or `unknown`), and `confidence`. A filename round is only a fallback when the document itself has no round; it must never overwrite an explicit body/table/header round.
+
 Classify the document, then extract government comments and company responses into separate arrays. Do not match them in this step. Copy every item verbatim. Never summarize, paraphrase, correct spelling, improve grammar, merge neighboring items, include a reviewer header, include the tail of a previous row, omit repeated text, or invent missing text. Raw/OCR text is screening evidence only; page images control boundaries.
 
+Important response-boundary rule for incomplete letters and review forms: a dated/status line that follows a government requirement is a separate response or review-status event, not part of the government comment. For example, if the page shows a black comment followed by a differently colored line such as `3/16/2026: complete.`, extract the comment only up to the preceding line and create a response with exact text `3/16/2026: complete.`. Set `response_date_raw` to `3/16/2026`, `response_date_iso` to `2026-03-16`, and `response_type` to `applicant_status` (use `review_status` only when the page explicitly identifies it as a reviewer status). The same rule applies to `not done`, `incomplete`, `pending`, `addressed`, `resolved`, and similar dated status lines. Preserve every dated line in the response, in order, when a comment has more than one status update. Lines explicitly beginning `RE:`, `Response:`, `Applicant response:`, `Company response:`, or `SC:` are also responses and must not be appended to the government comment. Use the printed color, column, label, and vertical position as boundary evidence. Give each embedded response the same printed comment number/record key as its parent comment so the verification pass can check the pairing and location.
+
 Join a comment that visibly continues across a page boundary, retaining every original character and line break. Keep neighboring comments separate. Record the printed comment/response number exactly. `normalized_comment_text` is additional retrieval text and must never replace `exact_comment_text`.
+Optionally return `text_reconstructed` and `display_structure` when visual
+reading-order repair is needed. These are representation-only fields and
+must contain the exact same words, numbers, measurements, code/sheet
+references, punctuation, and negations as `exact_comment_text`. If lexical
+identity cannot be proven, omit them and let the deterministic local
+reconstruction run. Return `source_unit_ids` only when they are present in
+the supplied evidence packet; never invent a unit or locator.
 
 Locations must identify every source page and complete visible item using normalized coordinates from 0 to 1000 (top-left origin). Set uncertainty whenever any character, boundary, numbering, completeness, or location is not visually certain. Report whether later drawing markups are referenced. `review_reason` must be empty when the document is complete and certain; never use it to describe the document's subject. Return only the required JSON."""
 
@@ -244,7 +469,17 @@ VERIFICATION_INSTRUCTION = """Independently audit the proposed extraction agains
 
 When `known_context_hints.visual_batch` is present, independently verify completeness for every supplied batch page. Other document pages are verified in separate batches and their absence from this request is not a failure.
 
-Verify that every numbered comment and response was captured, text is complete and verbatim, cross-page continuations were joined correctly, headers were excluded, neighboring comments remain separate, response text did not leak into a government comment, the visible number sequence agrees with the extraction, and later drawing-markup references were handled. Mark the entire document unverified if any item is missing, duplicated, combined incorrectly, truncated, paraphrased, or incorrectly located. Explicitly return verified and rejected record IDs plus every missing visible comment/response, incorrect link/location, duplicate fragment, and continuation error; use empty arrays when none exist. Do not perform comment-response matching. Return only the required JSON."""
+Verify that every numbered comment and response was captured, text is complete and verbatim, cross-page continuations were joined correctly, headers were excluded, neighboring comments remain separate, response text did not leak into a government comment, the visible number sequence agrees with the extraction, and later drawing-markup references were handled. Also verify that `document_date` is the date of this physical source file (not a review round or a date quoted inside a comment); if it is missing or unsupported by the page image, set `document_date_verified` false and explain why.
+
+Return two independent gates. `pair_verification` checks that every extracted applicant response is paired with the correct visible comment (same visible row, explicit shared printed ID, or an explicitly labelled adjacent response) and lists failed record IDs. `coverage_verification` checks the original page images for omitted comments, omitted responses, duplicated fragments, or unprocessed relevant pages and reports the visible counts and missing record IDs. A document is not verified unless both gates pass, every comment/response is captured, and there are no contradiction arrays. Set `verification_contract_version` to `pair-coverage-v1`.
+
+Mark the entire document unverified if any item is missing, duplicated, combined incorrectly, truncated, paraphrased, or incorrectly located. Explicitly return verified and rejected record IDs plus every missing visible comment/response, incorrect link/location, duplicate fragment, and continuation error; use empty arrays when none exist. Do not perform new semantic matching beyond the visible-row/shared-ID evidence. Return only the required JSON."""
+
+RECONSTRUCTION_CORRECTION_INSTRUCTION = """You are performing one bounded repair of the readable text representation for records that were already extracted from this document.
+
+Use the original rendered page images and the supplied extraction/verification JSON. Correct only artificial line wrapping, export artifacts, reading order, and paragraph/list boundaries. Keep every original word, number, measurement, code, sheet reference, punctuation mark, negation, and repeated phrase exactly unchanged. Do not summarize, paraphrase, spell-correct, merge records, split records, change roles, change dates or rounds, change record keys, or change page/bounding-box/source locations.
+
+Return only corrections for existing record keys. A correction is valid only when its lexical tokens and punctuation are identical to the corresponding exact source text; if that cannot be proven, return an empty corrected text for that record. Use short reason codes such as `artificial_line_break`, `export_noise`, `reading_order`, or `list_boundary`. This is the single allowed automatic correction cycle; it must be followed by a fresh verification pass."""
 
 PRESCAN_INSTRUCTION = """You are prioritizing permit-review files before local content/page screening.
 
@@ -280,6 +515,9 @@ class VisualClient(Protocol):
     def pre_scan_sources(self, files: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]: ...
     def extract_document(self, bundle: EvidenceBundle, context: dict[str, Any]) -> dict[str, Any]: ...
     def verify_document(self, bundle: EvidenceBundle, extraction: dict[str, Any]) -> dict[str, Any]: ...
+    def reconstruct_correction(
+        self, bundle: EvidenceBundle, extraction: dict[str, Any], verification: dict[str, Any],
+    ) -> dict[str, Any]: ...
     def verify_spreadsheet_units(
         self, packet: dict[str, Any], context: dict[str, Any],
     ) -> dict[str, Any]: ...
@@ -389,17 +627,58 @@ def pdf_page_features(path: Path, page_count: int) -> dict[str, Any]:
             "document_markers": markers,
             "conservative_full_document_escalation": bool(markers),
         }
-    document = fitz.open(path)
+    try:
+        document = fitz.open(path)
+    except Exception:
+        # A file can have PDF markers but still be malformed or only partially
+        # written.  Treat it like an unsupported PDF and conservatively retain
+        # the document for full review instead of failing the intake scan.
+        payload = path.read_bytes()
+        markers = [
+            marker for marker, token in (
+                ("annotations", b"/Annots"),
+                ("acroform", b"/AcroForm"),
+            )
+            if token in payload
+        ]
+        return {
+            "supported": False,
+            "pages": empty,
+            "document_markers": markers,
+            "conservative_full_document_escalation": bool(markers),
+        }
     pages: list[dict[str, Any]] = []
     try:
         for page_number in range(document.page_count):
             page = document.load_page(page_number)
-            annotations = list(page.annots() or [])
+            annotations: list[dict[str, Any]] = []
+            annotation_types: set[str] = set()
+            for annotation in page.annots() or []:
+                annotation_type = str(
+                    getattr(annotation, "type", ("", ""))[1] or ""
+                )
+                annotation_types.add(annotation_type)
+                info = getattr(annotation, "info", {}) or {}
+                rectangle = getattr(annotation, "rect", None)
+                page_rect = page.rect
+                annotations.append({
+                    "type": annotation_type,
+                    "content": str(info.get("content", "")),
+                    "title": str(info.get("title", "")),
+                    "subject": str(info.get("subject", "")),
+                    "bounding_box": ({
+                        "page": page_number + 1,
+                        "x_min": round(1000.0 * rectangle.x0 / page_rect.width, 2),
+                        "y_min": round(1000.0 * rectangle.y0 / page_rect.height, 2),
+                        "x_max": round(1000.0 * rectangle.x1 / page_rect.width, 2),
+                        "y_max": round(1000.0 * rectangle.y1 / page_rect.height, 2),
+                    } if rectangle is not None and page_rect.width and page_rect.height else {}),
+                })
             widgets = list(page.widgets() or [])
-            annotation_types = sorted({
-                str(getattr(annotation, "type", ("", ""))[1] or "")
-                for annotation in annotations
-            })
+            widget_values = [{
+                "field_name": str(getattr(widget, "field_name", "") or ""),
+                "field_value": str(getattr(widget, "field_value", "") or ""),
+            } for widget in widgets]
             try:
                 drawings = len(page.get_drawings())
             except (AttributeError, RuntimeError, ValueError):
@@ -409,7 +688,9 @@ def pdf_page_features(path: Path, page_count: int) -> dict[str, Any]:
                 "annotation_count": len(annotations),
                 "form_field_count": len(widgets),
                 "drawing_object_count": drawings,
-                "annotation_types": annotation_types,
+                "annotation_types": sorted(annotation_types),
+                "annotation_evidence": annotations,
+                "widget_evidence": widget_values,
             })
     finally:
         document.close()
@@ -527,12 +808,29 @@ def page_signal_classification(
 
 def select_relevant_pages(
     page_texts: list[str], initial_pages: int = INITIAL_SCREEN_PAGES,
+    *, force_response: bool = False, force_full_read: bool = False,
 ) -> dict[str, Any]:
     """Select the complete first comment section and conservatively flag uncertainty."""
     classifications = [
         page_signal_classification(text, index)
         for index, text in enumerate(page_texts, 1)
     ]
+    if force_response:
+        # A one-page response letter can look like a drawing when it contains
+        # structural terms (beams, ridge, plans). Numbered requirements paired
+        # with literal "Response:" lines are still visible comment/response
+        # units and must not be discarded by lightweight routing.
+        for row, text in zip(classifications, page_texts):
+            if (
+                row.get("detected_comment_numbers")
+                and re.search(r"\bresponse\s*:", text or "", re.IGNORECASE)
+            ):
+                row["page_class"] = "comment_response_table"
+                row["confidence"] = 0.92
+                row["signals"] = sorted(set([
+                    *row.get("signals", []),
+                    "forced_response_letter_escalation",
+                ]))
     relevant_classes = {"comment_list", "response_list", "comment_response_table"}
     initial = classifications[:initial_pages]
     initial_relevant = [row["page"] for row in initial if row["page_class"] in relevant_classes]
@@ -563,6 +861,35 @@ def select_relevant_pages(
             int(row["page"]) for row in classifications
             if row["page_class"] == "drawing_markup"
         )
+    if force_full_read and len(classifications) <= initial_pages:
+        # A paid/explicit prescan has already identified this document as a
+        # comment/response source. Local keyword routing must not silently
+        # veto unnumbered lists or alternating DOCX comment/response blocks.
+        selected = set(range(1, len(classifications) + 1))
+    elif force_full_read:
+        # Long response packages often append entire plan sets.  Screen every
+        # page, but send the strong model only pages that visibly behave like
+        # comment/response evidence.  High-precision PC/reviewer/markup labels
+        # preserve correction callouts embedded on drawing sheets without
+        # treating ordinary plan notes as independent government comments.
+        explicit_evidence = re.compile(
+            r"\b(?:PC\s*\d+|V\d+\s*-\s*C\d+|reviewer\s+response|"
+            r"applicant\s+response|review\s+comments|corrections\s+required|"
+            r"bldg\s+review)\b",
+            re.IGNORECASE,
+        )
+        selected = {
+            int(row["page"]) for row, text in zip(classifications, page_texts)
+            if row["page_class"] in relevant_classes
+            or row["page_class"] == "drawing_markup"
+            or row.get("additional_markup_referenced") is True
+            or bool(explicit_evidence.search(text or ""))
+        }
+        if not selected:
+            # The explicit prescan remains authoritative for unusual unnumbered
+            # sources.  Escalate the bounded initial pages for review instead
+            # of silently declaring the document irrelevant.
+            selected.update(range(1, min(initial_pages, len(classifications)) + 1))
     uncertain_later = [
         int(row["page"]) for row in classifications[initial_pages:]
         if additional_markup and row["page_class"] == "uncertain"
@@ -583,7 +910,7 @@ def select_relevant_pages(
         status = (
             "comments_and_responses_found" if has_comments and has_responses
             else "comments_found" if has_comments else "responses_found"
-        )
+        ) if (has_comments or has_responses) else "classified"
     reason = ""
     if uncertain_later:
         reason = f"Could not rule out additional marked comments on pages {uncertain_later}"
@@ -592,7 +919,10 @@ def select_relevant_pages(
     for row in classifications:
         page = int(row["page"])
         if page in selected:
-            row["processing_decision"] = "full_gemini_extraction"
+            row["processing_decision"] = (
+                "full_gemini_extraction:prescan_evidence_page"
+                if force_full_read else "full_gemini_extraction"
+            )
         elif row["page_class"] == "uncertain":
             row["processing_decision"] = "lightweight_screen_needs_review"
         else:
@@ -1056,7 +1386,7 @@ class DocumentEvidenceBuilder:
         raw_text = self._raw_text(source, digest, directory)
         return digest, normalized_content_fingerprint(raw_text, digest)
 
-    def build(self, source: Path) -> EvidenceBundle:
+    def build(self, source: Path, *, force_full_read: bool = False) -> EvidenceBundle:
         source = source.resolve()
         extension = source.suffix.casefold()
         if extension not in SUPPORTED_TYPES:
@@ -1077,6 +1407,7 @@ class DocumentEvidenceBuilder:
             source_cache_valid
             and old_manifest.get("page_screening_version") == PAGE_SCREENING_VERSION
             and int(old_manifest.get("screening_dpi") or 0) == SCREENING_DPI
+            and bool(old_manifest.get("force_full_read")) == force_full_read
         )
         render_cache_valid = (
             source_cache_valid
@@ -1106,13 +1437,36 @@ class DocumentEvidenceBuilder:
                 selected = {page.page_number for page in cached_pages}
                 raw_for_gemini = compact_direct_text_for_gemini(raw_text)
                 if raw_text.get("kind") == "pdf_text_pages":
+                    metadata_by_page = {
+                        int(row.get("page") or 0): row
+                        for row in screening.get("page_classifications", [])
+                        if isinstance(row, dict)
+                    }
+                    selected_rows: list[dict[str, Any]] = []
+                    for row in raw_text.get("pages", []):
+                        if not isinstance(row, dict):
+                            continue
+                        page_number = int(row.get("page") or 0)
+                        if page_number not in selected:
+                            continue
+                        model_text, text_scope = compact_pdf_native_text_for_model(
+                            str(row.get("text", "")),
+                            metadata_by_page.get(page_number, {}),
+                        )
+                        selected_rows.append({
+                            **row,
+                            "text": model_text,
+                            "text_scope": text_scope,
+                        })
                     raw_for_gemini = {
                         "kind": "pdf_text_pages",
-                        "pages": [
-                            row for row in raw_text.get("pages", [])
-                            if isinstance(row, dict) and int(row.get("page") or 0) in selected
-                        ],
-                        "selection_note": "Only adaptively selected comment/response pages are supplied for full analysis.",
+                        "pages": selected_rows,
+                        "selection_note": (
+                            "Only adaptively selected comment/response pages are supplied. "
+                            "Dense plan-sheet native text is represented by exact PDF annotation "
+                            "content and high-signal windows; raw_text.json retains the complete "
+                            "immutable extraction."
+                        ),
                     }
                 screening = copy.deepcopy(screening)
                 screening["current_run_stage_timings"] = {
@@ -1193,7 +1547,11 @@ class DocumentEvidenceBuilder:
                         effective_pages[index - 1] = ocr_cache[key]
                         ocr_pages.append(index)
                 atomic_json(ocr_cache_path, ocr_cache)
-                screening = select_relevant_pages(effective_pages)
+                screening = select_relevant_pages(
+                    effective_pages,
+                    force_response=("response" in source.name.casefold()),
+                    force_full_read=force_full_read,
+                )
                 screening["ocr_pages"] = ocr_pages
                 screening["ocr_attempted_pages"] = ocr_attempted_pages
                 screening["screening_dpi"] = SCREENING_DPI
@@ -1214,6 +1572,12 @@ class DocumentEvidenceBuilder:
                     )
                     row["annotation_types"] = features.get(
                         "annotation_types", []
+                    )
+                    row["annotation_evidence"] = features.get(
+                        "annotation_evidence", []
+                    )
+                    row["widget_evidence"] = features.get(
+                        "widget_evidence", []
                     )
                     row["annotation_inspection_supported"] = bool(
                         native_features.get("supported")
@@ -1278,13 +1642,36 @@ class DocumentEvidenceBuilder:
             )
             selected_render_seconds = time.perf_counter() - render_started
             selected_set = set(selected_numbers)
+            metadata_by_page = {
+                int(row.get("page") or 0): row
+                for row in screening.get("page_classifications", [])
+                if isinstance(row, dict)
+            }
+            selected_rows: list[dict[str, Any]] = []
+            for row in raw_text.get("pages", []):
+                if not isinstance(row, dict):
+                    continue
+                page_number = int(row.get("page") or 0)
+                if page_number not in selected_set:
+                    continue
+                model_text, text_scope = compact_pdf_native_text_for_model(
+                    str(row.get("text", "")),
+                    metadata_by_page.get(page_number, {}),
+                )
+                selected_rows.append({
+                    **row,
+                    "text": model_text,
+                    "text_scope": text_scope,
+                })
             raw_text_for_gemini = {
                 "kind": "pdf_text_pages",
-                "pages": [
-                    row for row in raw_text.get("pages", [])
-                    if isinstance(row, dict) and int(row.get("page") or 0) in selected_set
-                ],
-                "selection_note": "Only adaptively selected comment/response pages are supplied for full analysis.",
+                "pages": selected_rows,
+                "selection_note": (
+                    "Only adaptively selected comment/response pages are supplied. "
+                    "Dense plan-sheet native text is represented by exact PDF annotation "
+                    "content and high-signal windows; raw_text.json retains the complete "
+                    "immutable extraction."
+                ),
             }
         else:
             # Preserve the structured DOCX/XLSX/CSV extraction as Gemini input,
@@ -1314,7 +1701,11 @@ class DocumentEvidenceBuilder:
                             rendered_from, thumbnails_dir, SCREENING_DPI,
                         )
                     ]
-                screening = select_relevant_pages(native_pages)
+                screening = select_relevant_pages(
+                    native_pages,
+                    force_response=("response" in source.name.casefold()),
+                    force_full_read=force_full_read,
+                )
                 screening["ocr_pages"] = []
                 screening["ocr_attempted_pages"] = []
                 screening["screening_dpi"] = SCREENING_DPI
@@ -1413,6 +1804,7 @@ class DocumentEvidenceBuilder:
             "page_screening_version": PAGE_SCREENING_VERSION,
             "page_render_version": PAGE_RENDER_VERSION,
             "screening_dpi": SCREENING_DPI,
+            "force_full_read": force_full_read,
             "normalized_content_fingerprint": normalized_content_fingerprint(
                 raw_text, digest
             ),
@@ -1449,8 +1841,46 @@ def multimodal_context(bundle: EvidenceBundle, context: dict[str, Any], extracte
             "Verify against the original rendered page images. The complete "
             "direct-text payload was used only by the extraction pass."
         )
-        introduction["proposed_extraction_to_verify"] = extracted
+        introduction["verification_proposal_format"] = (
+            "record-ids-exact-text-and-locations-v1"
+        )
+        introduction["proposed_extraction_to_verify"] = (
+            compact_extraction_for_verification(extracted)
+        )
     return introduction
+
+
+def compact_extraction_for_verification(
+    extracted: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep only fields required for image-authoritative verification."""
+    result = {
+        key: extracted[key]
+        for key in (
+            "document_class", "comment_section_complete", "document_date",
+            "review_round", "review_round_metadata",
+            "additional_markups_referenced",
+        )
+        if key in extracted
+    }
+    field_map = {
+        "comments": (
+            "record_key", "comment_number", "exact_comment_text",
+            "page_start", "page_end", "bounding_boxes",
+            "continues_from_previous_page", "continues_to_next_page",
+        ),
+        "responses": (
+            "record_key", "response_number", "exact_response_text",
+            "page_start", "page_end", "bounding_boxes",
+        ),
+    }
+    for collection, fields in field_map.items():
+        result[collection] = [
+            {key: row[key] for key in fields if key in row}
+            for row in extracted.get(collection, [])
+            if isinstance(row, dict)
+        ]
+    return result
 
 
 def multimodal_parts(bundle: EvidenceBundle, context: dict[str, Any], extracted: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -1466,8 +1896,51 @@ def multimodal_parts(bundle: EvidenceBundle, context: dict[str, Any], extracted:
     return parts
 
 
+class RequestStatusUnknownError(RuntimeError):
+    """The request may have reached Gemini, so automatic resubmission is unsafe."""
+
+
+class GeminiCircuitOpenError(RuntimeError):
+    """Gemini calls are paused after a definitive quota/credit failure."""
+
+
+class GeminiCircuitBreaker:
+    """Thread-safe run-level breaker shared by all file/page workers."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._reason = ""
+        self._opened_at = ""
+
+    @property
+    def reason(self) -> str:
+        with self._lock:
+            return self._reason
+
+    def check(self) -> None:
+        with self._lock:
+            if self._reason:
+                raise GeminiCircuitOpenError(
+                    f"Gemini circuit open: {self._reason}"
+                )
+
+    def trip(self, reason: str) -> None:
+        with self._lock:
+            if not self._reason:
+                self._reason = reason
+                self._opened_at = utc_timestamp()
+
+    def snapshot(self) -> dict[str, str]:
+        with self._lock:
+            return {"reason": self._reason, "opened_at": self._opened_at}
+
+
 class VisualGeminiClient:
-    def __init__(self, api_key: str, model: str = "gemini-3.6-flash", timeout: int = 600, inline_limit_bytes: int = 18_000_000):
+    def __init__(
+        self, api_key: str, model: str = "gemini-3.6-flash", timeout: int = 600,
+        inline_limit_bytes: int = 18_000_000,
+        circuit_breaker: GeminiCircuitBreaker | None = None,
+    ):
         if not api_key:
             raise ValueError("GEMINI_API_KEY is required for visual ingestion")
         self.api_key = api_key
@@ -1477,9 +1950,148 @@ class VisualGeminiClient:
         self._uploaded_pages: dict[tuple[str, int], tuple[str, str]] = {}
         self.last_usage_metadata: dict[str, Any] = {}
         self.last_request_metadata: dict[str, Any] = {}
+        self._trace_path: Path | None = None
+        self._pending_request_context: dict[str, Any] = {}
+        self._active_uploads: list[dict[str, Any]] = []
+        self.circuit_breaker = circuit_breaker or GeminiCircuitBreaker()
+
+    def fork(self) -> "VisualGeminiClient":
+        """Create an isolated request client for one concurrent page batch."""
+        return VisualGeminiClient(
+            self.api_key,
+            self.model,
+            timeout=self.timeout,
+            inline_limit_bytes=self.inline_limit_bytes,
+            circuit_breaker=self.circuit_breaker,
+        )
+
+    @staticmethod
+    def _definitive_quota_error(detail: str) -> bool:
+        lowered = detail.casefold()
+        return any(marker in lowered for marker in (
+            "prepayment credits depleted", "prepaid credits depleted",
+            "prepayment", "spending cap", "billing account",
+            "quota exceeded", "quota has been exceeded",
+        ))
+
+    def _append_request_ledger(self, event: dict[str, Any]) -> None:
+        if self._trace_path is None:
+            return
+        append_trace_event(self._trace_path.parent / "request_ledger.jsonl", event)
+
+    @staticmethod
+    def _actual_record_count(result: dict[str, Any]) -> int:
+        records = result.get("records")
+        if isinstance(records, list):
+            return len(records)
+        count = sum(
+            len(result.get(key, []))
+            for key in ("comments", "responses")
+            if isinstance(result.get(key), list)
+        )
+        if count:
+            return count
+        verified = result.get("verified_group_ids", [])
+        rejected = result.get("rejected_group_ids", [])
+        return (
+            len(verified) if isinstance(verified, list) else 0
+        ) + (
+            len(rejected) if isinstance(rejected, list) else 0
+        )
+
+    @staticmethod
+    def _render_dpi(bundle: EvidenceBundle) -> int | None:
+        manifest_path = bundle.artifact_dir / "manifest.json"
+        if not manifest_path.is_file():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            value = int(manifest.get("render_dpi") or 0)
+            return value or None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _expected_record_count(bundle: EvidenceBundle) -> tuple[int, str]:
+        selected = {page.page_number for page in bundle.pages}
+        total = 0
+        for row in bundle.screening.get("page_manifest", []):
+            if not isinstance(row, dict) or int(row.get("page") or 0) not in selected:
+                continue
+            comments = row.get("detected_comment_numbers", [])
+            responses = row.get("detected_response_numbers", [])
+            total += len(set(str(value) for value in comments if str(value)))
+            total += len(set(str(value) for value in responses if str(value)))
+        return total, "local_page_number_signals"
+
+    def _begin_bundle_request(
+        self,
+        bundle: EvidenceBundle,
+        context: dict[str, Any],
+        stage: str,
+    ) -> None:
+        expected, expected_source = self._expected_record_count(bundle)
+        dpi = self._render_dpi(bundle)
+        resolutions = []
+        for page in bundle.pages:
+            width, height = image_dimensions(page.path)
+            resolutions.append({
+                "page": page.page_number,
+                "width": width,
+                "height": height,
+                "dpi": dpi,
+                "bytes": page.path.stat().st_size if page.path.is_file() else 0,
+            })
+        self._trace_path = bundle.artifact_dir / "straggler_trace.jsonl"
+        self._pending_request_context = {
+            "stage": stage,
+            "artifact_id": bundle.artifact_id,
+            "page_numbers": [page.page_number for page in bundle.pages],
+            "image_count": len(bundle.pages),
+            "image_resolution": resolutions,
+            "evidence_unit_count": len(bundle.pages),
+            "evidence_unit_type": "rendered_page",
+            "expected_record_count": expected,
+            "expected_record_count_source": expected_source,
+            "visual_batch": context.get("visual_batch", {}),
+            "request_created_at": utc_timestamp(),
+            "logical_request_started_monotonic": time.monotonic(),
+        }
+        self._active_uploads = []
+
+    def prepare_spreadsheet_trace(
+        self,
+        artifact_dir: Path,
+        artifact_id: str,
+        packet: dict[str, Any],
+    ) -> None:
+        groups = packet.get("groups", [])
+        group_count = len(groups) if isinstance(groups, list) else 0
+        self._trace_path = artifact_dir / "straggler_trace.jsonl"
+        self._pending_request_context = {
+            "stage": "gemini_spreadsheet_verification",
+            "artifact_id": artifact_id,
+            "page_numbers": [],
+            "image_count": 0,
+            "image_resolution": [],
+            "evidence_unit_count": group_count,
+            "evidence_unit_type": "spreadsheet_row_group",
+            "expected_record_count": group_count,
+            "expected_record_count_source": "deterministic_spreadsheet_groups",
+            "visual_batch": {},
+            "request_created_at": utc_timestamp(),
+            "logical_request_started_monotonic": time.monotonic(),
+            "upload_mode": "none",
+            "upload_duration": 0.0,
+        }
+        self._active_uploads = []
 
     def _upload_file(self, page: PageImage) -> tuple[str, str]:
+        self.circuit_breaker.check()
         size = page.path.stat().st_size
+        started = time.monotonic()
+        started_at = utc_timestamp()
+        status = "failed"
         start = Request(
             "https://generativelanguage.googleapis.com/upload/v1beta/files",
             data=json.dumps({"file": {"display_name": page.path.name}}).encode("utf-8"),
@@ -1504,9 +2116,29 @@ class VisualGeminiClient:
             with urlopen(upload, timeout=self.timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
             file = body["file"]
+            status = "completed"
             return str(file["uri"]), str(file.get("mimeType") or page.mime_type)
-        except (HTTPError, OSError, URLError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1200]
+            if exc.code == 429 and self._definitive_quota_error(detail):
+                self.circuit_breaker.trip(detail.replace("\n", " ").strip())
+                raise GeminiCircuitOpenError(
+                    f"Gemini page upload HTTP {exc.code}: {detail}"
+                ) from exc
+            raise RuntimeError(
+                f"Gemini page upload failed for page {page.page_number}: {exc}"
+            ) from exc
+        except (OSError, URLError, KeyError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Gemini page upload failed for page {page.page_number}: {exc}") from exc
+        finally:
+            self._active_uploads.append({
+                "page": page.page_number,
+                "started_at": started_at,
+                "completed_at": utc_timestamp(),
+                "duration_seconds": round(time.monotonic() - started, 4),
+                "bytes": size,
+                "status": status,
+            })
 
     def _parts(self, bundle: EvidenceBundle, context: dict[str, Any], extracted: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         introduction = multimodal_context(bundle, context, extracted)
@@ -1514,6 +2146,11 @@ class VisualGeminiClient:
             ((page.path.stat().st_size + 2) // 3) * 4 for page in bundle.pages
         )
         if estimated_inline <= self.inline_limit_bytes:
+            self._pending_request_context.update({
+                "upload_mode": "inline_request",
+                "upload_duration": 0.0,
+                "inline_payload_upload_included_in_time_to_first_token": True,
+            })
             return multimodal_parts(bundle, context, extracted)
         parts: list[dict[str, Any]] = [{"text": json.dumps(introduction, ensure_ascii=False)}]
         total_pages = int(context.get("document_page_count") or bundle.document_page_count or len(bundle.pages))
@@ -1524,26 +2161,98 @@ class VisualGeminiClient:
             uri, mime_type = self._uploaded_pages[key]
             parts.append({"text": f"ORIGINAL RENDERED PAGE {page.page_number} OF {total_pages} — inspect the entire image."})
             parts.append({"fileData": {"mimeType": mime_type, "fileUri": uri}})
+        self._pending_request_context.update({
+            "upload_mode": "files_api",
+            "upload_duration": round(sum(
+                float(row.get("duration_seconds") or 0.0)
+                for row in self._active_uploads
+            ), 4),
+            "uploaded_image_count": len(self._active_uploads),
+            "reused_uploaded_image_count": max(
+                0, len(bundle.pages) - len(self._active_uploads)
+            ),
+        })
         return parts
 
     @staticmethod
-    def _read_with_deadline(response: Any, deadline: float) -> bytes:
-        """Read a response with a true wall-clock deadline, not idle timeout."""
-        chunks: list[bytes] = []
+    def _read_sse_with_deadline(
+        response: Any,
+        deadline: float,
+    ) -> dict[str, Any]:
+        """Read structured-output SSE while retaining only timing and bytes."""
+        raw_bytes = bytearray()
+        event_lines: list[bytes] = []
+        text_chunks: list[str] = []
+        usage: dict[str, Any] = {}
+        finish_reason = ""
+        first_token_monotonic: float | None = None
+        last_token_monotonic: float | None = None
+        first_token_at = ""
+        last_token_at = ""
+
+        def consume_event() -> None:
+            nonlocal usage, finish_reason
+            nonlocal first_token_monotonic, last_token_monotonic
+            nonlocal first_token_at, last_token_at
+            if not event_lines:
+                return
+            payload = json.loads(b"\n".join(event_lines).decode("utf-8"))
+            event_lines.clear()
+            if isinstance(payload.get("usageMetadata"), dict):
+                usage = payload["usageMetadata"]
+            for candidate in payload.get("candidates", []):
+                if not isinstance(candidate, dict):
+                    continue
+                if candidate.get("finishReason") is not None:
+                    finish_reason = str(candidate.get("finishReason") or "")
+                content = candidate.get("content", {})
+                for part in content.get("parts", []) if isinstance(content, dict) else []:
+                    if not isinstance(part, dict) or part.get("thought") is True:
+                        continue
+                    chunk = str(part.get("text", ""))
+                    if not chunk:
+                        continue
+                    now = time.monotonic()
+                    if first_token_monotonic is None:
+                        first_token_monotonic = now
+                        first_token_at = utc_timestamp()
+                    last_token_monotonic = now
+                    last_token_at = utc_timestamp()
+                    text_chunks.append(chunk)
+
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("Gemini response exceeded the hard deadline")
+                raise TimeoutError("Gemini stream exceeded the hard deadline")
             socket = getattr(
                 getattr(getattr(response, "fp", None), "raw", None),
                 "_sock", None,
             )
             if socket is not None:
-                socket.settimeout(max(1.0, min(30.0, remaining)))
-            chunk = response.read(64 * 1024)
-            if not chunk:
-                return b"".join(chunks)
-            chunks.append(chunk)
+                # A long wait before the first SSE event is a valid TTFT
+                # measurement. A short socket timeout would create an unsafe
+                # second submission while the first request may still run.
+                socket.settimeout(max(1.0, remaining))
+            line = response.readline()
+            if not line:
+                consume_event()
+                break
+            raw_bytes.extend(line)
+            if not line.strip():
+                consume_event()
+                continue
+            if line.startswith(b"data:"):
+                event_lines.append(line[5:].lstrip().rstrip(b"\r\n"))
+        return {
+            "text": "".join(text_chunks),
+            "usage_metadata": usage,
+            "finish_reason": finish_reason,
+            "response_bytes": len(raw_bytes),
+            "first_token_monotonic": first_token_monotonic,
+            "last_token_monotonic": last_token_monotonic,
+            "first_token_at": first_token_at,
+            "last_token_at": last_token_at,
+        }
 
     def _request(
         self,
@@ -1551,6 +2260,7 @@ class VisualGeminiClient:
         parts: list[dict[str, Any]],
         schema: dict[str, Any],
         max_output_tokens: int = 32768,
+        stage: str = "gemini_request",
     ) -> dict[str, Any]:
         payload = {
             "systemInstruction": {"parts": [{"text": instruction}]},
@@ -1561,99 +2271,364 @@ class VisualGeminiClient:
                 "responseMimeType": "application/json", "responseSchema": schema,
             },
         }
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{quote(self.model, safe='')}:generateContent"
+        endpoint = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{quote(self.model, safe='')}:streamGenerateContent?alt=sse"
+        )
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request_started = time.monotonic()
-        deadline = request_started + self.timeout
+        request_context = dict(self._pending_request_context)
+        logical_started = float(
+            request_context.pop("logical_request_started_monotonic", request_started)
+        )
+        request_context["stage"] = stage
+        request_created_at = str(
+            request_context.get("request_created_at") or utc_timestamp()
+        )
+        idempotency_key = hashlib.sha256(
+            b"request-identity-v2\0" + self.model.encode("utf-8")
+            + b"\0" + stage.encode("utf-8") + b"\0" + encoded
+        ).hexdigest()
+        # The request ID is deliberately deterministic.  A process restart or
+        # a retry of the same packet must not create a new billable identity.
+        request_id = f"RQ-{idempotency_key[:24]}"
+        deadline = logical_started + self.timeout
         attempts = 0
+        attempt_metrics: list[dict[str, Any]] = []
+        first_request_sent_at = ""
+
+        def finish_metadata(status: str, **values: Any) -> dict[str, Any]:
+            usage = self.last_usage_metadata
+            metadata = {
+                **request_context,
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "request_created_at": request_created_at,
+                "request_sent_at": first_request_sent_at,
+                "completed_at": utc_timestamp(),
+                "attempts": attempts,
+                "retry_count": max(0, attempts - 1),
+                "attempt_metrics": attempt_metrics,
+                "request_bytes": len(encoded),
+                "elapsed_seconds": round(time.monotonic() - logical_started, 4),
+                "request_transport_seconds": round(
+                    time.monotonic() - request_started, 4
+                ),
+                "model": self.model,
+                "status": status,
+                "input_tokens": int(usage.get("promptTokenCount") or 0),
+                "cached_input_tokens": int(
+                    usage.get("cachedContentTokenCount") or 0
+                ),
+                "output_tokens": int(usage.get("candidatesTokenCount") or 0),
+                **values,
+            }
+            self.last_request_metadata = metadata
+            append_trace_event(self._trace_path, {
+                "event": "request_finished",
+                **metadata,
+            })
+            self._append_request_ledger({
+                "event": "request_finished",
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "status": status,
+                "completed_at": metadata["completed_at"],
+                "attempts": attempts,
+                "finish_reason": metadata.get("finish_reason", ""),
+            })
+            return metadata
+
+        append_trace_event(self._trace_path, {
+            "event": "request_created",
+            **request_context,
+            "request_id": request_id,
+            "idempotency_key": idempotency_key,
+            "request_created_at": request_created_at,
+            "model": self.model,
+            "request_bytes": len(encoded),
+        })
+        self._append_request_ledger({
+            "event": "request_created",
+            "request_id": request_id,
+            "idempotency_key": idempotency_key,
+            "stage": stage,
+            "created_at": request_created_at,
+            "model": self.model,
+        })
+        try:
+            self.circuit_breaker.check()
+        except GeminiCircuitOpenError as exc:
+            finish_metadata(
+                "circuit_open", finish_reason="CIRCUIT_OPEN",
+                error=str(exc), timed_out=False,
+            )
+            raise
         for attempt in range(5):
+            self.circuit_breaker.check()
             attempts = attempt + 1
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            request = Request(endpoint, data=encoded, headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key}, method="POST")
+            attempt_started = time.monotonic()
+            attempt_sent_at = utc_timestamp()
+            if not first_request_sent_at:
+                first_request_sent_at = attempt_sent_at
+            request = Request(
+                endpoint,
+                data=encoded,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                    "x-goog-api-key": self.api_key,
+                },
+                method="POST",
+            )
+            append_trace_event(self._trace_path, {
+                "event": "attempt_submitted",
+                "request_id": request_id,
+                "attempt": attempts,
+                "submitted_at": attempt_sent_at,
+            })
             try:
                 with urlopen(
-                    # Gemini may legitimately spend several minutes before
-                    # sending the first response byte. Use the remaining hard
-                    # deadline here; short idle timeouts created false retries
-                    # and multiplied both latency and cost.
                     request, timeout=max(1.0, remaining),
                 ) as response:
-                    body = json.loads(
-                        self._read_with_deadline(
-                            response, deadline,
-                        ).decode("utf-8")
-                    )
-                self.last_usage_metadata = (
-                    body.get("usageMetadata", {})
-                    if isinstance(body.get("usageMetadata"), dict) else {}
-                )
-                self.last_request_metadata = {
-                    "attempts": attempts,
-                    "request_bytes": len(encoded),
-                    "elapsed_seconds": round(
-                        time.monotonic() - request_started, 4,
-                    ),
-                    "model": self.model,
-                }
-                candidate = body["candidates"][0]
-                finish = str(candidate.get("finishReason", "STOP"))
-                if finish not in {"STOP", ""}:
-                    raise RuntimeError(f"Gemini stopped before a complete result: {finish}")
-                raw = "".join(str(part.get("text", "")) for part in candidate["content"]["parts"])
-                result = json.loads(raw)
-                if not isinstance(result, dict):
-                    raise TypeError("Gemini result is not an object")
-                return result
+                    response_headers_at = utc_timestamp()
+                    streamed = self._read_sse_with_deadline(response, deadline)
             except HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:1200]
-                self.last_request_metadata = {
-                    "attempts": attempts,
-                    "request_bytes": len(encoded),
-                    "elapsed_seconds": round(
-                        time.monotonic() - request_started, 4,
-                    ),
-                    "model": self.model,
+                attempt_metrics.append({
+                    "attempt": attempts,
+                    "submitted_at": attempt_sent_at,
+                    "completed_at": utc_timestamp(),
+                    "elapsed_seconds": round(time.monotonic() - attempt_started, 4),
+                    "status": "failed_definitive",
                     "http_status": exc.code,
-                    "timed_out": False,
-                }
-                if exc.code == 429 and "monthly spending cap" in detail.casefold():
-                    raise RuntimeError(
+                })
+                append_trace_event(self._trace_path, {
+                    "event": "attempt_failed_definitive",
+                    "request_id": request_id,
+                    **attempt_metrics[-1],
+                })
+                if exc.code == 429 and self._definitive_quota_error(detail):
+                    reason = detail.replace("\n", " ").strip()[:1200]
+                    self.circuit_breaker.trip(reason)
+                    finish_metadata(
+                        "failed_definitive", http_status=exc.code,
+                        finish_reason="CREDITS_OR_QUOTA_EXHAUSTED", timed_out=False,
+                        circuit_breaker=self.circuit_breaker.snapshot(),
+                    )
+                    raise GeminiCircuitOpenError(
                         f"Gemini visual ingestion HTTP {exc.code}: {detail}"
                     ) from exc
-                if exc.code not in {429, 500, 502, 503, 504} or attempt == 4:
+                retryable_http = exc.code in {429, 500, 502, 503, 504}
+                # A known 429/503 response is safe to retry, but repeated
+                # high-demand retries only hold the site open. Try once more
+                # and leave the checkpoint for a later resume.
+                attempt_limit = 2 if exc.code in {429, 503} else 3
+                if not retryable_http or attempts >= attempt_limit:
+                    finish_metadata(
+                        "failed_definitive", http_status=exc.code,
+                        finish_reason="HTTP_ERROR", timed_out=False,
+                    )
                     raise RuntimeError(f"Gemini visual ingestion HTTP {exc.code}: {detail}") from exc
-            except (OSError, URLError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-                if attempt == 4 or time.monotonic() >= deadline:
-                    raise RuntimeError(f"Gemini visual ingestion failed: {exc}") from exc
+            except (OSError, URLError) as exc:
+                attempt_metrics.append({
+                    "attempt": attempts,
+                    "submitted_at": attempt_sent_at,
+                    "completed_at": utc_timestamp(),
+                    "elapsed_seconds": round(time.monotonic() - attempt_started, 4),
+                    "status": "status_unknown",
+                    "error_type": type(exc).__name__,
+                })
+                finish_metadata(
+                    "status_unknown",
+                    finish_reason="TRANSPORT_STATUS_UNKNOWN",
+                    timed_out=isinstance(exc, TimeoutError),
+                    time_to_first_token=None,
+                    generation_duration=None,
+                    queue_duration=None,
+                )
+                raise RequestStatusUnknownError(
+                    "Gemini request status is unknown after submission; "
+                    "automatic resubmission was blocked"
+                ) from exc
+            except json.JSONDecodeError as exc:
+                attempt_metrics.append({
+                    "attempt": attempts,
+                    "submitted_at": attempt_sent_at,
+                    "completed_at": utc_timestamp(),
+                    "elapsed_seconds": round(time.monotonic() - attempt_started, 4),
+                    "status": "failed_definitive",
+                    "error_type": type(exc).__name__,
+                })
+                finish_metadata(
+                    "failed_definitive",
+                    finish_reason="INVALID_SSE_EVENT",
+                    timed_out=False,
+                )
+                raise RuntimeError(
+                    f"Gemini returned an invalid streaming event: {exc}"
+                ) from exc
+            else:
+                self.last_usage_metadata = streamed["usage_metadata"]
+                finish = str(streamed.get("finish_reason") or "")
+                first_token = streamed.get("first_token_monotonic")
+                last_token = streamed.get("last_token_monotonic")
+                time_to_first = (
+                    round(float(first_token) - attempt_started, 4)
+                    if isinstance(first_token, (int, float)) else None
+                )
+                total_time_to_first = (
+                    round(float(first_token) - logical_started, 4)
+                    if isinstance(first_token, (int, float)) else None
+                )
+                generation_duration = (
+                    round(float(last_token) - float(first_token), 4)
+                    if isinstance(first_token, (int, float))
+                    and isinstance(last_token, (int, float)) else None
+                )
+                attempt_metrics.append({
+                    "attempt": attempts,
+                    "submitted_at": attempt_sent_at,
+                    "response_headers_at": response_headers_at,
+                    "first_token_at": streamed.get("first_token_at", ""),
+                    "last_token_at": streamed.get("last_token_at", ""),
+                    "completed_at": utc_timestamp(),
+                    "elapsed_seconds": round(time.monotonic() - attempt_started, 4),
+                    "status": "completed",
+                    "time_to_first_token": time_to_first,
+                    "generation_duration": generation_duration,
+                })
+                if finish not in {"STOP", ""}:
+                    finish_metadata(
+                        "failed_definitive",
+                        finish_reason=finish,
+                        response_bytes=int(streamed.get("response_bytes") or 0),
+                        timed_out=False,
+                        time_to_first_token=time_to_first,
+                        generation_duration=generation_duration,
+                        queue_duration=None,
+                    )
+                    raise RuntimeError(
+                        f"Gemini stopped before a complete result: {finish}"
+                    )
+                try:
+                    result = json.loads(str(streamed.get("text") or ""))
+                    if not isinstance(result, dict):
+                        raise TypeError("Gemini result is not an object")
+                except (TypeError, json.JSONDecodeError) as exc:
+                    finish_metadata(
+                        "failed_definitive",
+                        finish_reason=finish or "INVALID_STRUCTURED_OUTPUT",
+                        response_bytes=int(streamed.get("response_bytes") or 0),
+                        timed_out=False,
+                        time_to_first_token=time_to_first,
+                        generation_duration=generation_duration,
+                        queue_duration=None,
+                    )
+                    raise RuntimeError(
+                        f"Gemini returned invalid structured output: {exc}"
+                    ) from exc
+                finish_metadata(
+                    "completed",
+                    successful_attempt_sent_at=attempt_sent_at,
+                    response_headers_at=response_headers_at,
+                    first_token_at=streamed.get("first_token_at", ""),
+                    last_token_at=streamed.get("last_token_at", ""),
+                    finish_reason=finish or "STOP",
+                    response_bytes=int(streamed.get("response_bytes") or 0),
+                    timed_out=False,
+                    time_to_first_token=time_to_first,
+                    total_time_to_first_token=total_time_to_first,
+                    pre_generation_wait=total_time_to_first,
+                    generation_duration=generation_duration,
+                    queue_duration=None,
+                    queue_duration_available=False,
+                    actual_record_count=self._actual_record_count(result),
+                )
+                return result
             pause = min(30, 2 ** attempt * 2)
             if time.monotonic() + pause >= deadline:
                 break
             time.sleep(pause)
-        self.last_request_metadata = {
-            "attempts": attempts,
-            "request_bytes": len(encoded),
-            "elapsed_seconds": round(
-                time.monotonic() - request_started, 4,
-            ),
-            "model": self.model,
-            "timed_out": True,
-        }
+        finish_metadata(
+            "failed_definitive",
+            finish_reason="RETRY_DEADLINE_EXCEEDED",
+            timed_out=True,
+            time_to_first_token=None,
+            generation_duration=None,
+            queue_duration=None,
+        )
         raise RuntimeError(
             f"Gemini visual ingestion exceeded {self.timeout}s hard deadline"
         )
 
     def extract_document(self, bundle: EvidenceBundle, context: dict[str, Any]) -> dict[str, Any]:
-        return self._request(EXTRACTION_INSTRUCTION, self._parts(bundle, context), EXTRACTION_SCHEMA)
+        self._begin_bundle_request(bundle, context, "gemini_extraction")
+        return self._request(
+            EXTRACTION_INSTRUCTION,
+            self._parts(bundle, context),
+            EXTRACTION_SCHEMA,
+            stage="gemini_extraction",
+        )
 
     def verify_document(self, bundle: EvidenceBundle, extraction: dict[str, Any]) -> dict[str, Any]:
         context = extraction.get("_visual_batch_context", {}) if isinstance(extraction, dict) else {}
-        return self._request(VERIFICATION_INSTRUCTION, self._parts(bundle, context, extraction), VERIFICATION_SCHEMA)
+        self._begin_bundle_request(bundle, context, "gemini_verification")
+        return self._request(
+            VERIFICATION_INSTRUCTION,
+            self._parts(bundle, context, extraction),
+            VERIFICATION_SCHEMA,
+            stage="gemini_verification",
+        )
+
+    def reconstruct_correction(
+        self,
+        bundle: EvidenceBundle,
+        extraction: dict[str, Any],
+        verification: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Request one compact representation-only correction.
+
+        The correction request receives the same page images and source text
+        context as verification, but is forbidden from changing record graph
+        fields.  The caller always runs verification again after applying it.
+        """
+        context = extraction.get("_visual_batch_context", {}) if isinstance(extraction, dict) else {}
+        self._begin_bundle_request(bundle, context, "gemini_reconstruction_correction")
+        payload = {"extraction": extraction, "verification": verification}
+        return self._request(
+            RECONSTRUCTION_CORRECTION_INSTRUCTION,
+            self._parts(bundle, context, payload),
+            RECONSTRUCTION_CORRECTION_SCHEMA,
+            max_output_tokens=8192,
+            stage="gemini_reconstruction_correction",
+        )
 
     def verify_spreadsheet_units(
         self, packet: dict[str, Any], context: dict[str, Any],
     ) -> dict[str, Any]:
+        if self._pending_request_context.get("stage") != (
+            "gemini_spreadsheet_verification"
+        ):
+            groups = packet.get("groups", [])
+            count = len(groups) if isinstance(groups, list) else 0
+            self._trace_path = None
+            self._pending_request_context = {
+                "stage": "gemini_spreadsheet_verification",
+                "page_numbers": [], "image_count": 0,
+                "image_resolution": [], "evidence_unit_count": count,
+                "evidence_unit_type": "spreadsheet_row_group",
+                "expected_record_count": count,
+                "expected_record_count_source": (
+                    "deterministic_spreadsheet_groups"
+                ),
+                "request_created_at": utc_timestamp(),
+                "logical_request_started_monotonic": time.monotonic(),
+                "upload_mode": "none", "upload_duration": 0.0,
+            }
         parts = [{"text": json.dumps({
             "known_context_hints": context,
             "spreadsheet_evidence_packet": packet,
@@ -1663,15 +2638,31 @@ class VisualGeminiClient:
             parts,
             SPREADSHEET_VERIFICATION_SCHEMA,
             max_output_tokens=4096,
+            stage="gemini_spreadsheet_verification",
         )
 
     def pre_scan_sources(self, files: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
+        self._trace_path = None
+        self._pending_request_context = {
+            "stage": "gemini_prescan",
+            "page_numbers": [], "image_count": 0,
+            "image_resolution": [], "evidence_unit_count": len(files),
+            "evidence_unit_type": "source_file",
+            "expected_record_count": len(files),
+            "expected_record_count_source": "prescan_file_count",
+            "request_created_at": utc_timestamp(),
+            "logical_request_started_monotonic": time.monotonic(),
+            "upload_mode": "none", "upload_duration": 0.0,
+        }
         parts = [{"text": json.dumps({
             "known_context_hints": context,
             "files": files,
             "instruction": "Classify each file as full_read, context_only, or skip.",
         }, ensure_ascii=False)}]
-        return self._request(PRESCAN_INSTRUCTION, parts, PRESCAN_SCHEMA)
+        return self._request(
+            PRESCAN_INSTRUCTION, parts, PRESCAN_SCHEMA,
+            stage="gemini_prescan",
+        )
 
 
 def match_verified_extraction(
@@ -1682,9 +2673,25 @@ def match_verified_extraction(
     Existing v2 artifacts with ``records`` remain readable. New v3 artifacts
     keep comments and responses independent until this explicit stage.
     """
+    verification = normalize_verification_contract(verification)
     if isinstance(extraction.get("records"), list):
-        return extraction, verification
-    comments = [row for row in extraction.get("comments", []) if isinstance(row, dict)]
+        repaired_extraction = copy.deepcopy(extraction)
+        repaired_extraction["records"] = [
+            split_embedded_response_lines(row)
+            if isinstance(row, dict) else row
+            for row in repaired_extraction.get("records", [])
+        ]
+        repaired_extraction["embedded_response_count"] = sum(
+            bool(row.get("embedded_response_repair", {}).get("applied"))
+            for row in repaired_extraction["records"]
+            if isinstance(row, dict)
+        )
+        return repaired_extraction, verification
+    comments = [
+        split_embedded_response_lines(row)
+        for row in extraction.get("comments", [])
+        if isinstance(row, dict)
+    ]
     responses = [row for row in extraction.get("responses", []) if isinstance(row, dict)]
     response_by_number: dict[str, list[dict[str, Any]]] = {}
     for response in responses:
@@ -1699,6 +2706,55 @@ def match_verified_extraction(
         str(row.get("record_key", "")): row
         for row in verification.get("responses", []) if isinstance(row, dict)
     }
+
+    def explicit_adjacent_response(
+        comment_index: int, comment: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Recognize an unnumbered ``comment`` then labelled ``Response:`` pair.
+
+        This is deliberately narrower than proximity matching: both arrays must
+        have the same length, every printed identifier must be blank, the
+        response must be explicitly labelled, and its box must fall after this
+        comment but before the next comment on the same page.  It supports
+        simple DOC/DOCX correspondence without semantically guessing links.
+        """
+        if len(comments) != len(responses) or comment_index >= len(responses):
+            return None
+        if any(str(row.get("comment_number", "")).strip() for row in comments):
+            return None
+        if any(str(row.get("response_number", "")).strip() for row in responses):
+            return None
+        response = responses[comment_index]
+        if not re.match(
+            r"^\s*(?:applicant\s+|company\s+)?response\s*:",
+            str(response.get("exact_response_text", "")), re.IGNORECASE,
+        ):
+            return None
+        comment_page = int(comment.get("page_start") or 0)
+        response_page = int(response.get("page_start") or 0)
+        if not comment_page or response_page != comment_page:
+            return None
+
+        def top(row: dict[str, Any]) -> float | None:
+            boxes = row.get("bounding_boxes", [])
+            values = [
+                float(box.get("y_min")) for box in boxes
+                if isinstance(box, dict) and box.get("y_min") is not None
+            ]
+            return min(values) if values else None
+
+        comment_top = top(comment)
+        response_top = top(response)
+        if comment_top is None or response_top is None or response_top <= comment_top:
+            return None
+        if comment_index + 1 < len(comments):
+            next_comment = comments[comment_index + 1]
+            if int(next_comment.get("page_start") or 0) == comment_page:
+                next_top = top(next_comment)
+                if next_top is not None and response_top >= next_top:
+                    return None
+        return response
+
     records: list[dict[str, Any]] = []
     checks: list[dict[str, Any]] = []
     matched_response_keys: set[str] = set()
@@ -1707,6 +2763,39 @@ def match_verified_extraction(
         number = str(comment.get("comment_number", "")).strip()
         candidates = response_by_number.get(normalized_whitespace(number).casefold(), []) if number else []
         response = candidates[0] if len(candidates) == 1 else None
+        adjacent_pair = False
+        embedded_response = bool(
+            str(comment.get("response_type", "")).strip()
+            and str(comment.get("exact_response_text", "")).strip()
+            and comment.get("embedded_response_repair", {}).get("applied") is True
+        )
+        if response is None and embedded_response:
+            response = {
+                "record_key": f"{key}:embedded-response",
+                "response_number": number,
+                "exact_response_text": str(comment.get("exact_response_text", "")),
+                "response_date_raw": str(comment.get("response_date_raw", "")),
+                "response_date_iso": str(comment.get("response_date_iso", "")),
+                "response_type": str(comment.get("response_type", "")),
+                "page_start": int(
+                    comment.get("page")
+                    or comment.get("page_start")
+                    or (location_pages(comment.get("comment_location")) or [0])[0]
+                ),
+                "page_end": int(
+                    comment.get("page_end")
+                    or comment.get("page")
+                    or (location_pages(comment.get("comment_location")) or [0])[-1]
+                ),
+                "bounding_boxes": comment.get("response_location", {}).get("bounding_boxes", []),
+                "confidence": float(comment.get("confidence") or 0.0),
+                "uncertain": comment.get("uncertain") is True,
+                "uncertainty_reason": str(comment.get("uncertainty_reason", "")),
+            }
+            adjacent_pair = True
+        if response is None and not number:
+            response = explicit_adjacent_response(index - 1, comment)
+            adjacent_pair = response is not None
         response_key = str(response.get("record_key", "")) if response else ""
         if response_key:
             matched_response_keys.add(response_key)
@@ -1724,23 +2813,41 @@ def match_verified_extraction(
             "response_captured", "text_complete_and_verbatim",
             "locations_and_boxes_correct", "verified",
         ))
+        if embedded_response:
+            # The second Gemini pass verified the containing visible item. The
+            # embedded line did not exist as a separate array element in older
+            # artifacts, so its response checks inherit the parent location
+            # and text verification rather than being marked missing.
+            response_ok = comment_ok
         shared_id = bool(response and number and normalized_whitespace(
             str(response.get("response_number", "")),
         ).casefold() == normalized_whitespace(number).casefold())
-        uncertainty = " ".join(filter(None, [
+        uncertainty_parts = [
             str(comment.get("uncertainty_reason", "")).strip(),
             str(response.get("uncertainty_reason", "")).strip() if response else "",
             str(comment_check.get("uncertainty_reason", "")).strip(),
             str(response_check.get("uncertainty_reason", "")).strip() if response else "",
             "Multiple responses share this printed number." if len(candidates) > 1 else "",
-        ]))
+        ]
+        uncertainty = " ".join(dict.fromkeys(value for value in uncertainty_parts if value))
         records.append({
             "record_key": key, "comment_id": number, "comment_number": number,
             "page": comment_start, "exact_comment_text": str(comment.get("exact_comment_text", "")),
+            "text_reconstructed": str(comment.get("text_reconstructed", "")),
+            "display_structure": copy.deepcopy(comment.get("display_structure", [])) if isinstance(comment.get("display_structure", []), list) else [],
+            "source_unit_ids": [str(item) for item in comment.get("source_unit_ids", [])] if isinstance(comment.get("source_unit_ids", []), list) else [],
             "normalized_comment_text": str(comment.get("normalized_comment_text", "")),
             "department": str(comment.get("department", "")),
             "reviewer": str(comment.get("reviewer", "")),
             "exact_response_text": str(response.get("exact_response_text", "")) if response else "",
+            "response_date_raw": str(response.get("response_date_raw", "")) if response else "",
+            "response_date_iso": str(response.get("response_date_iso", "")) if response else "",
+            "response_type": str(response.get("response_type", "")) if response else "",
+            "response_text_reconstructed": str(response.get("text_reconstructed", "")) if response else "",
+            "response_display_structure": copy.deepcopy(response.get("display_structure", [])) if response and isinstance(response.get("display_structure", []), list) else [],
+            "response_source_unit_ids": [str(item) for item in response.get("source_unit_ids", [])] if response and isinstance(response.get("source_unit_ids", []), list) else [],
+            "raw_extracted_comment_text": str(comment.get("raw_extracted_comment_text", "")),
+            "embedded_response_repair": copy.deepcopy(comment.get("embedded_response_repair", {})),
             "comment_location": {
                 "pages": list(range(comment_start, comment_end + 1)) if comment_start else [],
                 "description": "complete government comment",
@@ -1752,9 +2859,13 @@ def match_verified_extraction(
                 "bounding_boxes": response.get("bounding_boxes", []) if response else [],
             },
             "same_visible_row": False, "explicit_shared_comment_id": shared_id,
+            "explicit_structural_pair": adjacent_pair,
             "pairing_evidence": (
                 f"Post-verification exact printed identifier match {number!r}"
-                if shared_id else "No response was matched during verified matching"
+                if shared_id else
+                "Explicit adjacent paragraph labelled Response:"
+                if adjacent_pair else
+                "No response was matched during verified matching"
             ),
             "confidence": min(
                 float(comment.get("confidence") or 0.0),
@@ -1771,13 +2882,21 @@ def match_verified_extraction(
             "record_key": key, "comment_captured": comment_ok,
             "response_captured": response_ok,
             "text_complete_and_verbatim": comment_ok and response_ok,
-            "pairing_correct": (not response) or shared_id,
+            "pairing_correct": (not response) or shared_id or adjacent_pair,
             "locations_and_boxes_correct": (
                 comment_check.get("locations_and_boxes_correct") is True
-                and (not response or response_check.get("locations_and_boxes_correct") is True)
+                and (
+                    embedded_response
+                    or not response
+                    or response_check.get("locations_and_boxes_correct") is True
+                )
             ),
-            "same_visible_row_or_shared_id": (not response) or shared_id,
-            "verified": comment_ok and response_ok and ((not response) or shared_id),
+            "same_visible_row_or_shared_id": (
+                (not response) or shared_id or adjacent_pair
+            ),
+            "verified": comment_ok and response_ok and (
+                (not response) or shared_id or adjacent_pair
+            ),
             "uncertainty_reason": uncertainty,
         })
     document_checks = all(verification.get(name) is True for name in (
@@ -1788,6 +2907,13 @@ def match_verified_extraction(
         "property": str(extraction.get("property", "")),
         "city": str(extraction.get("city", "")),
         "review_round": str(extraction.get("review_round", "")),
+        "document_date": copy.deepcopy(extraction.get("document_date") or {}),
+        "document_date_iso": str(extraction.get("document_date_iso", "")),
+        "document_date_raw": str(extraction.get("document_date_raw", "")),
+        "document_date_source": str(extraction.get("document_date_source", "")),
+        "document_date_page": int(extraction.get("document_date_page") or 0),
+        "document_date_confidence": float(extraction.get("document_date_confidence") or 0.0),
+        "source_document_date": str(extraction.get("source_document_date", "")),
         "document_type": str(extraction.get("document_class", "uncertain")),
         "document_uncertain": (
             extraction.get("comment_section_complete") is not True
@@ -1804,17 +2930,26 @@ def match_verified_extraction(
         "records": records,
         "additional_markups_referenced": extraction.get("additional_markups_referenced") is True,
         "structured_comment_count": len(comments),
-        "structured_response_count": len(responses),
+        "structured_response_count": len(responses) + sum(
+            bool(row.get("embedded_response_repair", {}).get("applied"))
+            for row in records
+        ),
         "unmatched_response_keys": sorted(
             str(row.get("record_key", "")) for row in responses
             if str(row.get("record_key", "")) not in matched_response_keys
         ),
     }
     legacy_verification = {
+        "verification_contract_version": verification.get(
+            "verification_contract_version", VERIFICATION_CONTRACT_VERSION,
+        ),
         "document_verified": verification.get("document_verified") is True and document_checks,
+        "document_structure_verified": document_checks,
         "every_comment_captured": verification.get("every_comment_captured") is True,
         "every_response_captured": verification.get("every_response_captured") is True,
         "verification_summary": str(verification.get("verification_summary", "")),
+        "pair_verification": copy.deepcopy(verification.get("pair_verification", {})),
+        "coverage_verification": copy.deepcopy(verification.get("coverage_verification", {})),
         "records": checks,
     }
     return legacy_extraction, legacy_verification
@@ -1826,10 +2961,63 @@ def verification_map(verification: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def normalize_verification_contract(verification: dict[str, Any]) -> dict[str, Any]:
+    """Normalize old artifacts into the explicit pair/coverage contract.
+
+    Existing cached artifacts predate the two-gate contract.  They remain
+    readable, but their old document-level flags are recorded as a legacy
+    compatibility result instead of silently bypassing the new gate.  New
+    Gemini responses must provide both objects explicitly.
+    """
+    if not isinstance(verification, dict):
+        return {
+            "verification_contract_version": "missing",
+            "pair_verification": {"passed": False, "checked_record_count": 0,
+                                   "failed_record_ids": [], "reason": "Missing verification object"},
+            "coverage_verification": {"passed": False, "visible_comment_count": 0,
+                                       "visible_response_count": 0, "missing_record_ids": [],
+                                       "reason": "Missing verification object"},
+        }
+    value = verification
+    legacy = "pair_verification" not in value or "coverage_verification" not in value
+    has_errors = any(value.get(field) for field in (
+        "rejected_record_ids", "missing_visible_comments", "missing_visible_responses",
+        "incorrect_links", "incorrect_page_locations", "duplicate_fragments",
+        "continuation_errors",
+    ))
+    if legacy:
+        passed = (
+            value.get("document_verified") is True
+            and value.get("every_comment_captured") is True
+            and value.get("every_response_captured") is True
+            and not has_errors
+        )
+        value.setdefault("pair_verification", {
+            "passed": passed,
+            "checked_record_count": len(value.get("records", [])) if isinstance(value.get("records"), list) else 0,
+            "failed_record_ids": [],
+            "reason": "Legacy verification flags used; re-run to obtain explicit pair verification",
+        })
+        value.setdefault("coverage_verification", {
+            "passed": passed,
+            "visible_comment_count": len(value.get("comments", [])) if isinstance(value.get("comments"), list) else 0,
+            "visible_response_count": len(value.get("responses", [])) if isinstance(value.get("responses"), list) else 0,
+            "missing_record_ids": [],
+            "reason": "Legacy verification flags used; re-run to obtain explicit coverage verification",
+        })
+        value.setdefault("verification_contract_version", "legacy-compatibility")
+    return value
+
+
 def document_verified(verification: dict[str, Any]) -> bool:
+    verification = normalize_verification_contract(verification)
     required_flags = all(verification.get(field) is True for field in (
         "document_verified", "every_comment_captured", "every_response_captured",
     ))
+    pair = verification.get("pair_verification")
+    coverage = verification.get("coverage_verification")
+    pair_passed = isinstance(pair, dict) and pair.get("passed") is True
+    coverage_passed = isinstance(coverage, dict) and coverage.get("passed") is True
     reported_errors = any(
         verification.get(field)
         for field in (
@@ -1839,24 +3027,124 @@ def document_verified(verification: dict[str, Any]) -> bool:
             "continuation_errors",
         )
     )
-    return required_flags and not reported_errors
+    return required_flags and pair_passed and coverage_passed and not reported_errors
+
+
+def reconstruction_correction_required(verification: dict[str, Any]) -> bool:
+    """Return whether verification found a *representation* defect.
+
+    Missing records, wrong pairings, and wrong locators are not repairable by
+    this bounded text pass and therefore do not trigger a request that could
+    accidentally invent data.  Only explicit reconstruction/layout signals
+    are eligible for one correction cycle.
+    """
+    if not isinstance(verification, dict):
+        return False
+    if verification.get("correction_required") is True:
+        return True
+    codes = verification.get("correction_codes")
+    if isinstance(codes, list) and any(str(code).strip() for code in codes):
+        return True
+    if any(verification.get(field) for field in (
+        "duplicate_fragments", "continuation_errors",
+    )):
+        return True
+    return any(
+        verification.get(field) is False
+        for field in (
+            "continuations_joined_correctly", "headers_excluded",
+            "neighboring_items_separate", "no_response_leakage",
+        )
+    )
+
+
+def apply_reconstruction_correction(
+    extraction: dict[str, Any], correction: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Apply only lexical-safe representation corrections to existing rows.
+
+    This function intentionally never changes exact text, IDs, roles, dates,
+    rounds, locations, or array membership.  Invalid model output is retained
+    in the correction artifact by the caller but is not applied.
+    """
+    result = copy.deepcopy(extraction)
+    report: dict[str, Any] = {
+        "accepted": [], "rejected": [], "correction_required": bool(
+            isinstance(correction, dict) and correction.get("correction_required") is True
+        ),
+    }
+    if not isinstance(correction, dict):
+        return result, report
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for role, key in (("comment", "comments"), ("response", "responses"), ("record", "records")):
+        values = result.get(key, [])
+        if not isinstance(values, list):
+            continue
+        for row in values:
+            if isinstance(row, dict):
+                rows[(role, str(row.get("record_key", "")))] = row
+    for item in correction.get("corrections", []) if isinstance(correction.get("corrections"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).casefold()
+        key = str(item.get("record_key", ""))
+        target = rows.get((role, key)) or rows.get(("record", key))
+        if target is None:
+            report["rejected"].append({"record_key": key, "role": role, "reason": "unknown_record_key"})
+            continue
+        exact = str(target.get("exact_response_text", "") if role == "response" else target.get("exact_comment_text", ""))
+        candidate = str(item.get("corrected_text_reconstructed", ""))
+        if not exact or not candidate or not is_lexically_safe_reconstruction(exact, candidate):
+            report["rejected"].append({"record_key": key, "role": role, "reason": "lexical_safety_failed"})
+            continue
+        target["text_reconstructed"] = candidate
+        display = item.get("display_structure")
+        if isinstance(display, list):
+            target["display_structure"] = copy.deepcopy(display)
+        target["reconstruction_correction"] = {
+            "version": RECONSTRUCTION_CORRECTION_PROMPT_VERSION,
+            "reason_code": str(item.get("reason_code", "")),
+            "accepted": True,
+        }
+        report["accepted"].append({"record_key": key, "role": role, "reason": str(item.get("reason_code", ""))})
+    return result, report
 
 
 def result_is_verified(result: dict[str, Any], verification: dict[str, Any]) -> tuple[bool, str]:
+    verification = normalize_verification_contract(verification)
     check = verification_map(verification).get(str(result.get("record_key", "")), {})
+    embedded_response = bool(
+        str(result.get("response_type", "")).strip()
+        and result.get("embedded_response_repair", {}).get("applied") is True
+    )
     checks = all(check.get(field) is True for field in (
         "comment_captured", "response_captured", "text_complete_and_verbatim", "pairing_correct",
         "locations_and_boxes_correct", "verified",
     ))
+    if embedded_response:
+        # Legacy verification checked the containing comment, not a separate
+        # response array item.  The split is safe only when that parent item
+        # itself passed the independent visual checks.
+        checks = all(check.get(field) is True for field in (
+            "comment_captured", "text_complete_and_verbatim",
+            "locations_and_boxes_correct", "verified",
+        ))
     confidence = float(result.get("confidence") or 0.0)
     response_present = bool(str(result.get("exact_response_text", "")).strip())
     pairing_supported = not response_present or (
-        result.get("same_visible_row") is True or result.get("explicit_shared_comment_id") is True
+        result.get("same_visible_row") is True
+        or result.get("explicit_shared_comment_id") is True
+        or result.get("explicit_structural_pair") is True
     )
-    if response_present:
+    if response_present and not embedded_response:
         checks = checks and check.get("same_visible_row_or_shared_id") is True
+    document_scope_verified = document_verified(verification) or (
+        verification.get("every_comment_captured") is True
+        and verification.get("every_response_captured") is True
+        and verification.get("document_structure_verified") is True
+    )
     verified = (
-        document_verified(verification) and checks and result.get("uncertain") is False
+        document_scope_verified and checks and result.get("uncertain") is False
         and confidence >= MIN_VERIFIED_CONFIDENCE and pairing_supported
     )
     reasons = [str(result.get("uncertainty_reason", "")).strip(), str(check.get("uncertainty_reason", "")).strip()]
@@ -1864,13 +3152,78 @@ def result_is_verified(result: dict[str, Any], verification: dict[str, Any]) -> 
         reasons.append(f"Extraction confidence {confidence:.3f} is below {MIN_VERIFIED_CONFIDENCE:.2f}")
     if not pairing_supported:
         reasons.append("No same-visible-row or explicit shared-comment-ID evidence")
-    if not document_verified(verification):
+    if not document_scope_verified:
         reasons.append(str(verification.get("verification_summary", "Document-level verification failed")))
     return verified, " ".join(value for value in reasons if value)
 
 
 def normalized_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def compact_pdf_native_text_for_model(
+    text: str, page_metadata: dict[str, Any], limit: int = 7_000,
+) -> tuple[str, str]:
+    """Keep exact reviewer evidence without resending dense plan-sheet text.
+
+    The complete Ghostscript extraction remains immutable in ``raw_text.json``.
+    For a very dense selected page, Gemini receives every PDF annotation plus
+    bounded native-text windows around explicit PC/reviewer markers.  The full
+    rendered page remains part of the multimodal request.
+    """
+    if len(text) <= limit:
+        return text, "complete_native_page_text"
+    annotation_lines: list[str] = []
+    for index, row in enumerate(
+        page_metadata.get("annotation_evidence", []) or [], 1,
+    ):
+        if not isinstance(row, dict):
+            continue
+        content = str(row.get("content", ""))
+        title = str(row.get("title", ""))
+        subject = str(row.get("subject", ""))
+        if not (content.strip() or title.strip() or subject.strip()):
+            continue
+        annotation_lines.append(
+            f"[PDF annotation {index} | type={row.get('type', '')} | "
+            f"title={title} | subject={subject}]\n{content}"
+        )
+    marker = re.compile(
+        r"\b(?:PC\s*\d+|V\d+\s*-\s*C\d+|reviewer\s+response|"
+        r"applicant\s+response|review\s+comments|corrections\s+required|"
+        r"bldg\s+review)\b",
+        re.IGNORECASE,
+    )
+    spans: list[tuple[int, int]] = []
+    for match in marker.finditer(text):
+        spans.append((max(0, match.start() - 500), min(len(text), match.start() + 6500)))
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    annotation_packet = "\n\n".join(annotation_lines).strip()
+    native_windows = "\n---\n".join(text[start:end] for start, end in merged)
+    # Exact annotation content is never truncated. Native extraction is a
+    # secondary aid because the complete rendered page is sent in the same
+    # request and raw_text.json retains the immutable full extraction.
+    remaining = max(0, limit - len(annotation_packet) - 40)
+    native_packet = native_windows[:remaining]
+    packet = "\n\n".join([
+        value for value in (
+            annotation_packet,
+            (
+                "[High-signal native-text windows]\n" + native_packet
+                if native_packet else ""
+            ),
+        ) if value
+    ]).strip()
+    if not packet:
+        # No exact annotation/marker evidence exists. Retain a bounded header
+        # for routing; the complete image remains authoritative.
+        packet = text[:limit]
+    return packet, "annotation_and_high_signal_native_text"
 
 
 def regression_against_oracle(extraction: dict[str, Any], dataset: dict[str, Any], filename: str) -> dict[str, Any]:
@@ -1972,10 +3325,174 @@ def location_text(value: Any, fallback: str) -> str:
     return f"{page_label} · {description}" if description else page_label
 
 
+# Incomplete-letter exports frequently put the applicant's disposition on a
+# separate coloured line immediately after the black government requirement,
+# for example ``3/16/2026: complete.``.  Older Gemini artifacts occasionally
+# included that line in ``exact_comment_text``.  Keep this repair deliberately
+# narrow: only a line anchored at the start of a physical text line and only a
+# small, status-like vocabulary are eligible.  A date in the middle of a
+# sentence is never split.
+DATED_STATUS_LINE_RE = re.compile(
+    r"(?mi)^[ \t]*(?P<date>"
+    r"(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.](?:20)?\d{2})"
+    r")[ \t]*:[ \t]*(?P<status>"
+    r"(?:complete(?:d)?|not[ \t_-]+done|incomplete|pending|addressed|"
+    r"resolved|unresolved|revised|open|closed|approved|denied|"
+    r"not[ \t_-]+addressed|no[ \t_-]+change))"
+    r"(?:[.!?])?[ \t]*$"
+)
+LABELLED_RESPONSE_LINE_RE = re.compile(
+    r"(?mi)^[ \t]*(?P<label>"
+    r"(?:re|response|applicant[ \t]+response|company[ \t]+response|sc)"
+    r")[ \t]*:[ \t]*(?P<body>\S.*?)[ \t]*$"
+)
+
+
+def _status_response_location(comment_location: Any, response_lines: int = 1) -> dict[str, Any]:
+    """Derive a conservative lower-band locator for an embedded status line.
+
+    The original Gemini box remains in the audit artifact.  This derived box
+    is intentionally only a visual hint; the viewer can still use exact-text
+    search when a PDF text layer is available.
+    """
+    location = copy.deepcopy(comment_location) if isinstance(comment_location, dict) else {}
+    boxes = [box for box in location.get("bounding_boxes", []) if isinstance(box, dict)]
+    if not boxes:
+        location["description"] = "embedded dated response/status line; exact-text fallback"
+        return location
+    last_page = max(int(box.get("page") or 0) for box in boxes)
+    response_boxes: list[dict[str, Any]] = []
+    for box in boxes:
+        try:
+            page = int(box["page"])
+            x_min, y_min = float(box["x_min"]), float(box["y_min"])
+            x_max, y_max = float(box["x_max"]), float(box["y_max"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if page != last_page:
+            continue
+        height = max(1.0, y_max - y_min)
+        # Status lines are normally one or two short rows at the bottom of
+        # the comment box.  Keep enough vertical area for wrapped status text.
+        fraction = min(0.42, max(0.16, 0.14 + 0.10 * max(0, response_lines - 1)))
+        split = max(y_min + 1.0, y_max - height * fraction)
+        response_boxes.append({
+            "page": page, "x_min": x_min, "y_min": split,
+            "x_max": x_max, "y_max": y_max,
+        })
+    location["pages"] = sorted({int(box.get("page") or 0) for box in response_boxes})
+    location["bounding_boxes"] = response_boxes
+    location["description"] = "embedded dated response/status line; exact-text fallback"
+    return location
+
+
+def split_embedded_response_lines(record: dict[str, Any]) -> dict[str, Any]:
+    """Separate a response/status line accidentally appended to a comment.
+
+    This is an auditable deterministic repair for legacy Gemini results.  It
+    never overwrites the raw extraction: ``raw_extracted_comment_text`` records
+    the original value, while the returned record contains the display/search
+    comment and a separately locatable response.
+    """
+    if not isinstance(record, dict) or str(record.get("exact_response_text", "")).strip():
+        return record
+    original = str(record.get("exact_comment_text", ""))
+    if not original.strip():
+        return record
+    matches = list(DATED_STATUS_LINE_RE.finditer(original))
+    response_type = "applicant_status"
+    if not matches:
+        matches = list(LABELLED_RESPONSE_LINE_RE.finditer(original))
+        response_type = "labelled_response"
+    if not matches:
+        return record
+    first = matches[0]
+    trailing = original[first.start():]
+    # A labelled/dated response must consume the remainder of the extracted
+    # item.  This avoids splitting a date or ``RE:`` mentioned in prose.
+    if response_type == "applicant_status":
+        if any(line.strip() and not DATED_STATUS_LINE_RE.fullmatch(line) for line in trailing.splitlines()):
+            return record
+        response_text = trailing.strip()
+        date_raw = str(first.groupdict().get("date") or "").strip()
+        date_iso = _parse_document_date(date_raw)
+    else:
+        if any(line.strip() and not LABELLED_RESPONSE_LINE_RE.fullmatch(line) for line in trailing.splitlines()):
+            return record
+        response_text = trailing.strip()
+        date_raw = ""
+        date_iso = ""
+    comment_text = original[:first.start()].rstrip()
+    if not comment_text or not response_text:
+        return record
+    repaired = dict(record)
+    repaired["raw_extracted_comment_text"] = original
+    repaired["exact_comment_text"] = comment_text
+    repaired["normalized_comment_text"] = normalized_whitespace(comment_text)
+    repaired["exact_response_text"] = response_text
+    repaired["response_type"] = response_type
+    repaired["response_date_raw"] = date_raw
+    repaired["response_date_iso"] = date_iso
+    comment_location = record.get("comment_location")
+    if not isinstance(comment_location, dict):
+        start = int(record.get("page_start") or record.get("page") or 0)
+        end = int(record.get("page_end") or start)
+        comment_location = {
+            "pages": list(range(start, end + 1)) if start else [],
+            "description": "complete government comment",
+            "bounding_boxes": record.get("bounding_boxes", []),
+        }
+    repaired["response_location"] = _status_response_location(
+        comment_location, len(matches),
+    )
+    # Keep the government locator from covering the status line as well.  For
+    # array-style extraction records also mirror the cleaned boxes back to the
+    # schema's top-level ``bounding_boxes`` field.
+    cleaned_location = copy.deepcopy(comment_location)
+    response_boxes_by_page = {
+        int(box.get("page") or 0): box
+        for box in repaired["response_location"].get("bounding_boxes", [])
+        if isinstance(box, dict)
+    }
+    cleaned_boxes: list[dict[str, Any]] = []
+    for box in cleaned_location.get("bounding_boxes", []):
+        if not isinstance(box, dict):
+            continue
+        updated = dict(box)
+        response_box = response_boxes_by_page.get(int(box.get("page") or 0))
+        if response_box is not None:
+            updated["y_max"] = response_box["y_min"]
+        cleaned_boxes.append(updated)
+    cleaned_location["bounding_boxes"] = cleaned_boxes
+    cleaned_location["description"] = "government comment before embedded response/status line"
+    repaired["comment_location"] = cleaned_location
+    if "bounding_boxes" in repaired:
+        repaired["bounding_boxes"] = cleaned_boxes
+    repaired["same_visible_row"] = True
+    repaired["explicit_structural_pair"] = True
+    repaired["pairing_evidence"] = (
+        "Deterministic embedded response/status line split from the same source item"
+    )
+    repaired["uncertainty_reason"] = " ".join(filter(None, [
+        str(record.get("uncertainty_reason", "")).strip(),
+        "Embedded response/status line was separated from the legacy comment extraction.",
+    ]))
+    repaired["embedded_response_repair"] = {
+        "applied": True,
+        "response_type": response_type,
+        "response_date_raw": date_raw,
+        "response_date_iso": date_iso,
+        "raw_extracted_comment_text": original,
+    }
+    return repaired
+
+
 def results_to_dataset_rows(
     bundle: EvidenceBundle, extraction: dict[str, Any], verification: dict[str, Any],
     source_relative: str, regression: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    document_date = normalize_document_date_metadata(extraction, bundle)
+    document_date_iso = str(document_date.get("iso", ""))
     comments: list[dict[str, Any]] = []
     responses: list[dict[str, Any]] = []
     links: list[dict[str, Any]] = []
@@ -1995,12 +3512,16 @@ def results_to_dataset_rows(
     key_counts: dict[str, int] = {}
     for row in extraction.get("records", []):
         number = str(row.get("comment_id") or row.get("comment_number", "")).strip()
-        number_counts[number] = number_counts.get(number, 0) + 1
+        if number:
+            number_counts[number] = number_counts.get(number, 0) + 1
         key = str(row.get("record_key", "")).strip()
         key_counts[key] = key_counts.get(key, 0) + 1
     for index, result in enumerate(extraction.get("records", []), 1):
         record_key = str(result.get("record_key", "")).strip() or f"record-{index}"
-        number = str(result.get("comment_id") or result.get("comment_number", "")).strip()
+        printed_number = str(
+            result.get("comment_id") or result.get("comment_number", "")
+        ).strip()
+        number = printed_number or f"item-{index}"
         verified, uncertainty = result_is_verified(result, verification)
         comment_pages = location_pages(result.get("comment_location"))
         response_pages = location_pages(result.get("response_location"))
@@ -2030,10 +3551,11 @@ def results_to_dataset_rows(
                 locations_valid = locations_valid and valid_pdf_location(result.get("response_location"), document_page_count)
         row_regression_failed = number in regression_failures
         duplicate_number_is_error = (
-            number_counts[number] > 1
+            bool(printed_number)
+            and number_counts[printed_number] > 1
             and extraction.get("comment_number_scope") != "sheet_row"
         )
-        if force_review or row_regression_failed or duplicate_number_is_error or key_counts[record_key] > 1 or not number or not str(result.get("exact_comment_text", "")) or not locations_valid:
+        if force_review or row_regression_failed or duplicate_number_is_error or key_counts[record_key] > 1 or not str(result.get("exact_comment_text", "")) or not locations_valid:
             verified = False
         if force_review or row_regression_failed:
             prefix = str(extraction.get("document_uncertainty_reason", "")).strip()
@@ -2051,24 +3573,70 @@ def results_to_dataset_rows(
         comment_id = base.stable_id("C", bundle.source_sha256, record_identity, "visual")
         response_text = str(result.get("exact_response_text", ""))
         response_id = base.stable_id("R", bundle.source_sha256, record_identity, "visual") if response_text else ""
-        row_round = str(
-            result.get("review_round")
-            or extraction.get("review_round", "")
-        )
         reviewed_plan_round = str(
             result.get("reviewed_plan_round")
-            or extraction.get("reviewed_plan_round", row_round)
+            or extraction.get("reviewed_plan_round", "")
+        )
+        # A response letter can be one round newer than the plan set it is
+        # answering (for example, a PC5 response to PC4 comments).  Keep the
+        # reviewed-plan round on the event; retain the response-letter round
+        # separately instead of allowing the letter's round to relabel the
+        # government comment.
+        row_round = str(
+            reviewed_plan_round
+            or result.get("review_round")
+            or extraction.get("review_round", "")
         )
         response_letter_round = str(
             result.get("response_letter_round")
             or extraction.get("response_letter_round", "")
         )
+        round_metadata = normalize_round_metadata(extraction, result)
+        # Date/round provenance is retained even when the source does not
+        # state either value.  Unknown provenance is a metadata limitation,
+        # not by itself an extraction or pairing failure; the two explicit
+        # verification gates below remain the authority for confirmation.
         comment_sheet, comment_cell, comment_row = spreadsheet_location(
             result.get("comment_location")
         )
         response_sheet, response_cell, response_row = spreadsheet_location(
             result.get("response_location")
         )
+        # ProjectDox narrative PDFs store the authoritative reviewer timestamp
+        # in a narrow cell adjacent to the comment/response cell. Recover that
+        # same-row context locally from PDF geometry. This adds provenance only;
+        # it never rewrites verbatim text, source locators, IDs, or pairing.
+        pdf_row_context: dict[str, Any] = {}
+        if bundle.original_type == "pdf" and (comment_pages or response_pages):
+            try:
+                pdf_row_context = pdf_same_row_context(
+                    bundle.source_path,
+                    int((comment_pages or response_pages)[0]),
+                    str(result.get("exact_comment_text") or response_text),
+                    printed_comment_id=printed_number,
+                )
+            except Exception:
+                pdf_row_context = {}
+        event_date_iso = str(result.get("event_date_iso", "")).strip()
+        event_date_raw = str(result.get("event_date_raw", "")).strip()
+        event_date_source = str(result.get("event_date_source", "")).strip()
+        event_date_location = copy.deepcopy(
+            result.get("event_date_location", {})
+        )
+        if not event_date_iso and pdf_row_context.get("event_date"):
+            event_date_iso = str(pdf_row_context.get("event_date") or "")
+            event_date_raw = str(pdf_row_context.get("event_date_raw") or "")
+            event_date_source = str(
+                pdf_row_context.get("event_date_source") or ""
+            )
+            event_date_location = {
+                "viewer_type": "pdf",
+                "page": int(pdf_row_context.get("page") or comment_pages[0]),
+                "pdf_bounding_boxes": copy.deepcopy(
+                    pdf_row_context.get("date_pdf_bounding_boxes", [])
+                ),
+                "source": "adjacent_reviewer_cell",
+            }
         extraction_method = str(
             result.get("extraction_method")
             or extraction.get("extraction_method")
@@ -2087,10 +3655,11 @@ def results_to_dataset_rows(
             "artifact_id": bundle.artifact_id, "extraction_prompt_version": EXTRACTION_PROMPT_VERSION,
             "verification_prompt_version": VERIFICATION_PROMPT_VERSION,
             "ingestion_pipeline_version": PIPELINE_VERSION,
-            "gemini_record_key": record_key, "printed_comment_id": str(result.get("comment_id", "")),
+            "gemini_record_key": record_key, "printed_comment_id": printed_number,
             "pairing_evidence": str(result.get("pairing_evidence", "")),
             "same_visible_row": result.get("same_visible_row") is True,
             "explicit_shared_comment_id": result.get("explicit_shared_comment_id") is True,
+            "explicit_structural_pair": result.get("explicit_structural_pair") is True,
             "gemini_confidence": float(result.get("confidence") or 0.0),
             "comment_unit_ids": list(result.get("comment_unit_ids", []) or []),
             "response_unit_ids": list(result.get("response_unit_ids", []) or []),
@@ -2099,6 +3668,23 @@ def results_to_dataset_rows(
                 if structured_method else ""
             ),
             "uncertainty_reason": uncertainty,
+            "raw_extracted_comment_text": str(result.get("raw_extracted_comment_text", "")),
+            "pdf_same_row_context": copy.deepcopy(pdf_row_context),
+            "embedded_response_repair": copy.deepcopy(result.get("embedded_response_repair", {})),
+            "response_date_raw": str(result.get("response_date_raw", "")),
+            "response_date_iso": str(result.get("response_date_iso", "")),
+            "response_type": str(result.get("response_type", "")),
+            "document_date": copy.deepcopy(document_date),
+            "review_round": round_metadata,
+            "verification_contract_version": str(
+                verification.get("verification_contract_version", "")
+            ),
+            "pair_verification": copy.deepcopy(
+                verification.get("pair_verification", {})
+            ),
+            "coverage_verification": copy.deepcopy(
+                verification.get("coverage_verification", {})
+            ),
         }
         issue_anchor = normalized_whitespace(str(
             result.get("normalized_comment_text")
@@ -2130,16 +3716,61 @@ def results_to_dataset_rows(
                 "issue_thread_id": issue_thread_id,
                 "source_document": source_relative,
                 "source_locator_json": event_location,
+                "source_document_date": document_date_iso,
+                "document_date": copy.deepcopy(document_date),
             })
+            discussion_events[-1] = attach_reconstruction(
+                discussion_events[-1],
+                role="discussion",
+                verified=verified,
+                method="gemini_visual" if not structured_method else "local_structured",
+            )
         comment = {
             "comment_id": comment_id, "city": str(extraction.get("city", "")),
             "property_project": str(extraction.get("property", "")), "review_round": row_round,
             "reviewed_plan_round": reviewed_plan_round,
             "response_letter_round": response_letter_round,
             "discipline": str(result.get("department", "")) or "unknown",
-            "reviewer": str(result.get("reviewer", "")), "reviewer_context": "",
+            "reviewer": str(
+                result.get("reviewer") or pdf_row_context.get("reviewer") or ""
+            ), "reviewer_context": "",
+            # A deterministic spreadsheet row can carry its government-event
+            # timestamp in the adjacent reviewer/department cell.  Preserve
+            # it independently from the physical source document date.
+            "event_date": event_date_iso,
+            "event_date_iso": event_date_iso,
+            "event_date_raw": event_date_raw,
+            "event_date_source": event_date_source,
+            "event_date_location": event_date_location,
+            "date_confidence": float(
+                result.get("date_confidence")
+                or pdf_row_context.get("confidence")
+                or 0.0
+            ),
             "comment_number": number,
-            "original_text": str(result.get("exact_comment_text", "")), "source_document": source_relative,
+            "document_round": row_round,
+            "source_object_reference": str(
+                (result.get("source_metadata") or {}).get("view_value", "")
+                if isinstance(result.get("source_metadata"), dict) else ""
+            ),
+            "source_metadata": {
+                **(
+                    result.get("source_metadata", {})
+                    if isinstance(result.get("source_metadata"), dict) else {}
+                ),
+                "pdf_same_row_context": copy.deepcopy(pdf_row_context),
+            },
+            "original_text": str(result.get("exact_comment_text", "")),
+            "raw_extracted_text": str(result.get("raw_extracted_comment_text", "")),
+            "source_document": source_relative,
+            "source_document_date": document_date_iso,
+            "document_date": copy.deepcopy(document_date),
+            "document_date_raw": str(document_date.get("raw", "")),
+            "document_date_iso": document_date_iso,
+            "document_date_source": str(document_date.get("source", "unknown")),
+            "document_date_page": int(document_date.get("page") or 0),
+            "document_date_confidence": float(document_date.get("confidence") or 0.0),
+            "review_round_metadata": copy.deepcopy(round_metadata),
             "normalized_comment_text": str(result.get("normalized_comment_text", "")),
             "verified_text": str(result.get("exact_comment_text", "")) if verified else "",
             "source_sha256": bundle.source_sha256, "source_sheet": comment_sheet,
@@ -2150,6 +3781,9 @@ def results_to_dataset_rows(
             "source_locator_json": result.get("comment_location", {}), "extraction_method": extraction_method,
             "extraction_confidence": 1.0 if verified else 0.0, "source_cycle": row_round,
             "source_status": status, "response_id": response_id,
+            "response_date_raw": str(result.get("response_date_raw", "")),
+            "response_date_iso": str(result.get("response_date_iso", "")),
+            "response_type": str(result.get("response_type", "")),
             "match_status": "matched" if response_id else "unmatched", "human_review_status": status,
             "verification_status": status,
             "text_trust_status": "verified" if verified else "quarantined",
@@ -2176,12 +3810,42 @@ def results_to_dataset_rows(
             ),
             "issue_thread_events": discussion_events,
         }
+        comment = attach_reconstruction(
+            comment,
+            role="comment",
+            source_unit_ids=(result.get("comment_unit_ids") or result.get("source_unit_ids") or []),
+            verified=verified,
+            method="gemini_visual" if not structured_method else "local_structured",
+            reconstructed_text=str(result.get("text_reconstructed", "")),
+        )
+        comment["reconstruction"]["verification_version"] = VERIFICATION_PROMPT_VERSION
         comments.append(comment)
         if response_id:
-            responses.append({
+            response_record = {
                 "response_id": response_id, "comment_id": comment_id, "original_text": response_text,
+                "response_type": str(result.get("response_type", "")),
+                "response_date_raw": str(result.get("response_date_raw", "")),
+                "response_date_iso": str(result.get("response_date_iso", "")),
+                # The adjacent reviewer timestamp dates the government event.
+                # Preserve that association without fabricating a response date.
+                "associated_comment_event_date": event_date_iso,
+                "associated_comment_event_date_raw": event_date_raw,
+                "associated_comment_event_date_source": event_date_source,
+                "associated_comment_event_date_location": copy.deepcopy(
+                    event_date_location
+                ),
+                "source_row_context": copy.deepcopy(pdf_row_context),
+                "raw_extracted_text": response_text,
                 "verified_text": response_text if verified else "",
                 "source_document": source_relative, "source_sha256": bundle.source_sha256,
+                "source_document_date": document_date_iso,
+                "document_date": copy.deepcopy(document_date),
+                "document_date_raw": str(document_date.get("raw", "")),
+                "document_date_iso": document_date_iso,
+                "document_date_source": str(document_date.get("source", "unknown")),
+                "document_date_page": int(document_date.get("page") or 0),
+                "document_date_confidence": float(document_date.get("confidence") or 0.0),
+                "review_round_metadata": copy.deepcopy(round_metadata),
                 "source_sheet": response_sheet, "source_row": response_row or "",
                 "source_cell_range": response_cell,
                 "source_page": response_pages[0] if response_pages else "",
@@ -2196,7 +3860,17 @@ def results_to_dataset_rows(
                 "text_trust_status": "verified" if verified else "quarantined",
                 "search_eligible": verified,
                 "ingestion_pipeline_version": PIPELINE_VERSION,
-            })
+            }
+            response_record = attach_reconstruction(
+                response_record,
+                role="response",
+                source_unit_ids=(result.get("response_unit_ids") or result.get("response_source_unit_ids") or []),
+                verified=verified,
+                method="gemini_visual" if not structured_method else "local_structured",
+                reconstructed_text=str(result.get("response_text_reconstructed", "")),
+            )
+            response_record["reconstruction"]["verification_version"] = VERIFICATION_PROMPT_VERSION
+            responses.append(response_record)
         link_id = base.stable_id("L", comment_id, response_id or "NONE", provenance)
         link_status = status if response_id else ("not_required" if verified else "needs_review")
         links.append({
@@ -2205,9 +3879,15 @@ def results_to_dataset_rows(
             "match_confidence": 1.0 if verified and response_id else 0.0, "review_status": link_status,
             "verification_status": status, "pairing_evidence": str(result.get("pairing_evidence", "")),
             "provenance": provenance, "source_document": source_relative,
+            "source_document_date": document_date_iso,
+            "document_date": copy.deepcopy(document_date),
             "source_location": location_text(result.get("comment_location"), "unknown"),
             "comment_locator_json": result.get("comment_location", {}),
             "response_locator_json": result.get("response_location", {}), "ingestion_audit": audit_payload,
+            "response_date_raw": str(result.get("response_date_raw", "")),
+            "response_date_iso": str(result.get("response_date_iso", "")),
+            "response_type": str(result.get("response_type", "")),
+            "review_round_metadata": copy.deepcopy(round_metadata),
         })
         if not verified:
             review.append({
@@ -2248,6 +3928,8 @@ def results_to_dataset_rows(
     summary = {
         "city": str(extraction.get("city", "")), "property_project": str(extraction.get("property", "")),
         "review_round": str(extraction.get("review_round", "")), "source_document": source_relative,
+        "source_document_date": document_date_iso,
+        "document_date": copy.deepcopy(document_date),
         "reviewed_plan_round": str(extraction.get("reviewed_plan_round", extraction.get("review_round", ""))),
         "response_letter_round": str(extraction.get("response_letter_round", "")),
         "source_type": str(extraction.get("document_type", "")) or "gemini_visual_document",
@@ -2272,6 +3954,22 @@ def results_to_dataset_rows(
             or extraction.get("additional_markups_referenced")
         ),
         "verification_result": "verified" if document_verified(verification) else "needs_review",
+        "verification_contract_version": str(
+            verification.get("verification_contract_version", "")
+        ),
+        "pair_verification": copy.deepcopy(
+            verification.get("pair_verification", {})
+        ),
+        "coverage_verification": copy.deepcopy(
+            verification.get("coverage_verification", {})
+        ),
+        "parser_version": TEXT_EXTRACTION_VERSION,
+        "page_screening_version": PAGE_SCREENING_VERSION,
+        "prescan_prompt_version": PRESCAN_PROMPT_VERSION,
+        "extraction_prompt_version": EXTRACTION_PROMPT_VERSION,
+        "verification_prompt_version": VERIFICATION_PROMPT_VERSION,
+        "reconstruction_correction_prompt_version": RECONSTRUCTION_CORRECTION_PROMPT_VERSION,
+        "dedup_version": CHECKPOINT_SCHEMA_VERSION,
         "ingestion_pipeline_version": PIPELINE_VERSION,
         "source_sha256": bundle.source_sha256,
     }
@@ -2405,11 +4103,35 @@ def merge_visual_batches(
         extraction.get("document_uncertain") is True and not document_verified(verification)
         for extraction, verification in zip(extractions, verifications)
     )
+    date_candidates = [
+        value.get("document_date") for value in extractions
+        if isinstance(value.get("document_date"), dict)
+    ]
+    date_candidates = [value for value in date_candidates if str(value.get("iso", "")).strip()]
+    document_date = max(
+        date_candidates,
+        key=lambda value: float(value.get("confidence") or 0.0),
+        default={
+            "raw": "", "iso": "", "source": "unknown", "page": 0,
+            "evidence": "", "confidence": 0.0,
+        },
+    )
+    date_values = {str(value.get("iso", "")).strip() for value in date_candidates}
+    if len(date_values) > 1:
+        metadata_conflicts.append("visual batches disagree on document_date")
     combined_extraction = {
         "property": str(first.get("property", "")),
         "city": str(first.get("city", "")),
         "review_round": str(first.get("review_round", "")),
+        "document_date": copy.deepcopy(document_date),
+        "document_date_iso": str(document_date.get("iso", "")),
+        "document_date_raw": str(document_date.get("raw", "")),
+        "document_date_source": str(document_date.get("source", "unknown")),
+        "document_date_page": int(document_date.get("page") or 0),
+        "document_date_confidence": float(document_date.get("confidence") or 0.0),
+        "source_document_date": str(document_date.get("iso", "")),
         "document_type": str(first.get("document_type", "")),
+        "document_class": str(first.get("document_class") or first.get("document_type", "")),
         "document_uncertain": bool(metadata_conflicts) or unresolved_batch_uncertainty,
         "document_uncertainty_reason": " ".join(uncertainty_reasons),
         "records": combined_records,
@@ -2538,7 +4260,7 @@ class VisualIngestionPipeline:
     def __init__(
         self, client: VisualClient, artifact_root: Path, oracle_dataset: Path | None = None,
         dpi: int = 220, batch_pages: int = 0, batch_overlap: int = 1,
-        prescan_client: VisualClient | None = None,
+        prescan_client: VisualClient | None = None, batch_workers: int = 2,
     ):
         self.client = client
         self.prescan_client = prescan_client or client
@@ -2546,10 +4268,80 @@ class VisualIngestionPipeline:
         self.oracle_dataset = oracle_dataset
         self.batch_pages = max(0, int(batch_pages))
         self.batch_overlap = max(0, int(batch_overlap))
+        self.batch_workers = max(1, int(batch_workers))
         self.batch_text_character_limit = max(
             0, int(os.environ.get("VISUAL_BATCH_TEXT_CHARACTER_LIMIT", "21500")),
         )
         self._metrics: dict[str, Any] = {}
+        self._metrics_lock = threading.RLock()
+        self._confidence_lock = threading.RLock()
+        self._page_checkpoint_lock = threading.RLock()
+        self.circuit_breaker = getattr(
+            client, "circuit_breaker", GeminiCircuitBreaker(),
+        )
+        # Prescan and full extraction share one run-level breaker.  A credit
+        # failure in either queue pauses all Gemini work consistently.
+        for candidate in (self.client, self.prescan_client):
+            if hasattr(candidate, "circuit_breaker"):
+                candidate.circuit_breaker = self.circuit_breaker
+
+    def fork(self) -> "VisualIngestionPipeline":
+        """Create isolated per-file state while sharing only immutable config."""
+        fork_client = getattr(self.client, "fork", None)
+        if not callable(fork_client):
+            raise RuntimeError("Visual client does not support isolated file workers")
+        client = fork_client()
+        if self.prescan_client is self.client:
+            prescan_client = client
+        else:
+            fork_prescan = getattr(self.prescan_client, "fork", None)
+            if not callable(fork_prescan):
+                raise RuntimeError(
+                    "Prescan client does not support isolated file workers"
+                )
+            prescan_client = fork_prescan()
+        pipeline = VisualIngestionPipeline(
+            client,
+            self.builder.artifact_root,
+            self.oracle_dataset,
+            dpi=self.builder.dpi,
+            batch_pages=self.batch_pages,
+            batch_overlap=self.batch_overlap,
+            prescan_client=prescan_client,
+            batch_workers=self.batch_workers,
+        )
+        pipeline.batch_text_character_limit = self.batch_text_character_limit
+        return pipeline
+
+    def _empty_metrics(self) -> dict[str, Any]:
+        return {
+            "gemini_extraction_calls": 0,
+            "gemini_verification_calls": 0,
+            "gemini_reconstruction_correction_calls": 0,
+            "gemini_spreadsheet_verification_calls": 0,
+            "gemini_extraction_seconds": 0.0,
+            "gemini_verification_seconds": 0.0,
+            "gemini_reconstruction_correction_seconds": 0.0,
+            "gemini_spreadsheet_verification_seconds": 0.0,
+            "extraction_cache_hits": 0,
+            "verification_cache_hits": 0,
+            "reconstruction_correction_cache_hits": 0,
+            "spreadsheet_verification_cache_hits": 0,
+            "gemini_extraction_input_tokens": 0,
+            "gemini_extraction_output_tokens": 0,
+            "gemini_verification_input_tokens": 0,
+            "gemini_verification_output_tokens": 0,
+            "gemini_reconstruction_correction_input_tokens": 0,
+            "gemini_reconstruction_correction_output_tokens": 0,
+            "gemini_spreadsheet_verification_input_tokens": 0,
+            "gemini_spreadsheet_verification_output_tokens": 0,
+            "gemini_cached_input_tokens": 0,
+            "gemini_thought_tokens": 0,
+            "visual_batch_workers_configured": self.batch_workers,
+            "visual_batch_parallelized": False,
+            "visual_batch_parallel_groups": 0,
+            "request_metrics": [],
+        }
 
     @staticmethod
     def _json_digest(value: Any) -> str:
@@ -2611,7 +4403,14 @@ class VisualIngestionPipeline:
         metadata_path: Path | None = None,
     ) -> bool:
         path = metadata_path or bundle.artifact_dir / "gemini_cache_metadata.json"
-        return self._read_cache_metadata(path).get(stage) == expected
+        metadata = self._read_cache_metadata(path)
+        if metadata.get(stage) == expected:
+            return True
+        # Historical identities are retained for audit and safe rollback, but
+        # an old identity is not considered compatible with the current output
+        # file.  This prevents a changed packet format from reusing the wrong
+        # JSON while still preserving the old cache metadata.
+        return False
 
     def _write_stage_cache_identity(
         self,
@@ -2622,76 +4421,201 @@ class VisualIngestionPipeline:
     ) -> None:
         path = metadata_path or bundle.artifact_dir / "gemini_cache_metadata.json"
         metadata = self._read_cache_metadata(path)
+        previous = metadata.get(stage)
+        if isinstance(previous, dict) and previous != identity:
+            history = metadata.setdefault("history", {}).setdefault(stage, [])
+            if previous not in history:
+                history.append(previous)
+        metadata["cache_schema_version"] = "stage-history-v1"
         metadata[stage] = identity
         atomic_json(path, metadata)
+
+    def _archive_stage_output_if_identity_changes(
+        self,
+        bundle: EvidenceBundle,
+        stage: str,
+        identity: dict[str, Any],
+        metadata_path: Path | None = None,
+    ) -> None:
+        """Archive the previous result before a changed stage is overwritten."""
+        path = metadata_path or bundle.artifact_dir / "gemini_cache_metadata.json"
+        metadata = self._read_cache_metadata(path)
+        previous = metadata.get(stage)
+        if not isinstance(previous, dict) or previous == identity:
+            return
+        suffix = path.name.replace("gemini_cache_metadata", "", 1)
+        if "spreadsheet_cache_metadata" in path.name:
+            old_name = "spreadsheet_verification" + suffix.replace(
+                "spreadsheet_cache_metadata", "", 1
+            )
+        else:
+            old_name = "gemini_" + stage + suffix
+        old_output = path.parent / old_name
+        if not old_output.is_file():
+            return
+        digest = self._json_digest(previous)[:16]
+        archive_dir = path.parent / "cache_history"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = archive_dir / f"{old_output.stem}-{digest}{old_output.suffix}"
+        if not archive_path.exists():
+            shutil.copy2(old_output, archive_path)
 
     def _record_gemini_metrics(
         self,
         stage: str,
         elapsed: float,
         packet_id: str = "",
+        client: VisualClient | None = None,
     ) -> None:
-        usage = getattr(self.client, "last_usage_metadata", {})
-        request = getattr(self.client, "last_request_metadata", {})
+        request_client = client or self.client
+        usage = getattr(request_client, "last_usage_metadata", {})
+        request = getattr(request_client, "last_request_metadata", {})
         usage = usage if isinstance(usage, dict) else {}
         request = request if isinstance(request, dict) else {}
         input_tokens = int(usage.get("promptTokenCount") or 0)
         output_tokens = int(usage.get("candidatesTokenCount") or 0)
         cached_tokens = int(usage.get("cachedContentTokenCount") or 0)
         thought_tokens = int(usage.get("thoughtsTokenCount") or 0)
-        self._metrics[f"{stage}_input_tokens"] += input_tokens
-        self._metrics[f"{stage}_output_tokens"] += output_tokens
-        self._metrics["gemini_cached_input_tokens"] += cached_tokens
-        self._metrics["gemini_thought_tokens"] += thought_tokens
-        self._metrics["request_metrics"].append({
+        row = {
             "stage": stage,
             "packet_id": packet_id,
+            "request_id": str(request.get("request_id") or ""),
+            "idempotency_key": str(request.get("idempotency_key") or ""),
+            "request_created_at": str(request.get("request_created_at") or ""),
+            "request_sent_at": str(request.get("request_sent_at") or ""),
+            "first_token_at": str(request.get("first_token_at") or ""),
+            "completed_at": str(request.get("completed_at") or ""),
             "elapsed_seconds": round(elapsed, 4),
+            "upload_duration": request.get("upload_duration"),
+            "upload_mode": str(request.get("upload_mode") or ""),
+            "time_to_first_token": request.get("time_to_first_token"),
+            "total_time_to_first_token": request.get(
+                "total_time_to_first_token"
+            ),
+            "pre_generation_wait": request.get("pre_generation_wait"),
+            "generation_duration": request.get("generation_duration"),
+            "queue_duration": request.get("queue_duration"),
+            "queue_duration_available": bool(
+                request.get("queue_duration_available")
+            ),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cached_input_tokens": cached_tokens,
             "thought_tokens": thought_tokens,
             "request_bytes": int(request.get("request_bytes") or 0),
+            "response_bytes": int(request.get("response_bytes") or 0),
             "attempts": int(request.get("attempts") or 1),
+            "retry_count": int(request.get("retry_count") or 0),
+            "attempt_metrics": request.get("attempt_metrics", []),
+            "finish_reason": str(request.get("finish_reason") or ""),
+            "status": str(request.get("status") or "unknown"),
+            "page_numbers": request.get("page_numbers", []),
+            "image_count": int(request.get("image_count") or 0),
+            "image_resolution": request.get("image_resolution", []),
+            "evidence_unit_count": int(
+                request.get("evidence_unit_count") or 0
+            ),
+            "evidence_unit_type": str(
+                request.get("evidence_unit_type") or ""
+            ),
+            "expected_record_count": int(
+                request.get("expected_record_count") or 0
+            ),
+            "expected_record_count_source": str(
+                request.get("expected_record_count_source") or ""
+            ),
+            "actual_record_count": int(
+                request.get("actual_record_count") or 0
+            ),
             "model": str(
                 request.get("model")
-                or getattr(self.client, "model", "test-client")
+                or getattr(request_client, "model", "test-client")
             ),
             "timed_out": bool(request.get("timed_out")),
-        })
+        }
+        with self._metrics_lock:
+            self._metrics[f"{stage}_input_tokens"] += input_tokens
+            self._metrics[f"{stage}_output_tokens"] += output_tokens
+            self._metrics["gemini_cached_input_tokens"] += cached_tokens
+            self._metrics["gemini_thought_tokens"] += thought_tokens
+            self._metrics["request_metrics"].append(row)
 
-    def _extract(self, bundle: EvidenceBundle, context: dict[str, Any]) -> dict[str, Any]:
+    def _extract(
+        self,
+        bundle: EvidenceBundle,
+        context: dict[str, Any],
+        client: VisualClient | None = None,
+    ) -> dict[str, Any]:
+        request_client = client or self.client
         started = time.perf_counter()
-        self._metrics["gemini_extraction_calls"] += 1
-        if hasattr(self.client, "last_usage_metadata"):
-            self.client.last_usage_metadata = {}
-        if hasattr(self.client, "last_request_metadata"):
-            self.client.last_request_metadata = {}
+        with self._metrics_lock:
+            self._metrics["gemini_extraction_calls"] += 1
+        if hasattr(request_client, "last_usage_metadata"):
+            request_client.last_usage_metadata = {}
+        if hasattr(request_client, "last_request_metadata"):
+            request_client.last_request_metadata = {}
         try:
-            return self.client.extract_document(bundle, context)
+            return request_client.extract_document(bundle, context)
         finally:
             elapsed = time.perf_counter() - started
-            self._metrics["gemini_extraction_seconds"] += elapsed
+            with self._metrics_lock:
+                self._metrics["gemini_extraction_seconds"] += elapsed
             self._record_gemini_metrics(
                 "gemini_extraction", elapsed, bundle.artifact_id,
+                request_client,
             )
 
     def _verify(
         self, bundle: EvidenceBundle, extraction: dict[str, Any],
+        client: VisualClient | None = None,
     ) -> dict[str, Any]:
+        request_client = client or self.client
         started = time.perf_counter()
-        self._metrics["gemini_verification_calls"] += 1
-        if hasattr(self.client, "last_usage_metadata"):
-            self.client.last_usage_metadata = {}
-        if hasattr(self.client, "last_request_metadata"):
-            self.client.last_request_metadata = {}
+        with self._metrics_lock:
+            self._metrics["gemini_verification_calls"] += 1
+        if hasattr(request_client, "last_usage_metadata"):
+            request_client.last_usage_metadata = {}
+        if hasattr(request_client, "last_request_metadata"):
+            request_client.last_request_metadata = {}
         try:
-            return self.client.verify_document(bundle, extraction)
+            return request_client.verify_document(bundle, extraction)
         finally:
             elapsed = time.perf_counter() - started
-            self._metrics["gemini_verification_seconds"] += elapsed
+            with self._metrics_lock:
+                self._metrics["gemini_verification_seconds"] += elapsed
             self._record_gemini_metrics(
                 "gemini_verification", elapsed, bundle.artifact_id,
+                request_client,
+            )
+
+    def _reconstruct_correction(
+        self,
+        bundle: EvidenceBundle,
+        extraction: dict[str, Any],
+        verification: dict[str, Any],
+        client: VisualClient | None = None,
+    ) -> dict[str, Any] | None:
+        """Run the one optional representation-only correction request."""
+        request_client = client or self.client
+        method = getattr(request_client, "reconstruct_correction", None)
+        if not callable(method):
+            return None
+        started = time.perf_counter()
+        with self._metrics_lock:
+            self._metrics["gemini_reconstruction_correction_calls"] += 1
+        if hasattr(request_client, "last_usage_metadata"):
+            request_client.last_usage_metadata = {}
+        if hasattr(request_client, "last_request_metadata"):
+            request_client.last_request_metadata = {}
+        try:
+            return method(bundle, extraction, verification)
+        finally:
+            elapsed = time.perf_counter() - started
+            with self._metrics_lock:
+                self._metrics["gemini_reconstruction_correction_seconds"] += elapsed
+            self._record_gemini_metrics(
+                "gemini_reconstruction_correction", elapsed,
+                bundle.artifact_id, request_client,
             )
 
     def _verify_spreadsheet_units(
@@ -2706,6 +4630,15 @@ class VisualIngestionPipeline:
             self.client.last_usage_metadata = {}
         if hasattr(self.client, "last_request_metadata"):
             self.client.last_request_metadata = {}
+        prepare_trace = getattr(
+            self.client, "prepare_spreadsheet_trace", None
+        )
+        if callable(prepare_trace):
+            prepare_trace(
+                self.builder.artifact_root / artifact_id,
+                artifact_id,
+                packet,
+            )
         try:
             return self.client.verify_spreadsheet_units(packet, context)
         finally:
@@ -2787,13 +4720,71 @@ class VisualIngestionPipeline:
         progress.setdefault("artifact_id", bundle.artifact_id)
         progress.setdefault("source_sha256", bundle.source_sha256)
         stages = progress.setdefault("stages", {})
+        stage_aliases = {
+            "fingerprint_file": "uploaded",
+            "classify_canonical_document": "parsed",
+            "prescan": "prescanned",
+            "extract_records": "extracted",
+            "verify_records": "verified",
+            "deduplicate_events": "deduplicated",
+            "link_issue_timelines": "timeline_linked",
+            "index_verified_search": "indexed",
+        }
         stages[stage] = {
             "status": status,
             "updated_at_epoch": round(time.time(), 3),
+            "canonical_stage": stage_aliases.get(stage, stage),
+            "pipeline_version": PIPELINE_VERSION,
+            "parser_version": TEXT_EXTRACTION_VERSION,
+            "prescan_version": PRESCAN_PROMPT_VERSION,
+            "extraction_prompt_version": EXTRACTION_PROMPT_VERSION,
+            "verification_prompt_version": VERIFICATION_PROMPT_VERSION,
+            "reconstruction_correction_prompt_version": RECONSTRUCTION_CORRECTION_PROMPT_VERSION,
+            "dedup_version": CHECKPOINT_SCHEMA_VERSION,
             **details,
+        }
+        progress["checkpoint_version"] = CHECKPOINT_SCHEMA_VERSION
+        progress["versions"] = {
+            "pipeline": PIPELINE_VERSION,
+            "parser": TEXT_EXTRACTION_VERSION,
+            "prescan": PRESCAN_PROMPT_VERSION,
+            "extraction_prompt": EXTRACTION_PROMPT_VERSION,
+            "verification_prompt": VERIFICATION_PROMPT_VERSION,
+            "reconstruction_correction_prompt": RECONSTRUCTION_CORRECTION_PROMPT_VERSION,
+            "dedup": CHECKPOINT_SCHEMA_VERSION,
         }
         progress["last_completed_stage"] = stage if status == "complete" else ""
         atomic_json(path, progress)
+
+    def _write_page_checkpoint(
+        self,
+        bundle: EvidenceBundle,
+        pages: list[PageImage],
+        stage: str,
+        status: str = "complete",
+        **details: Any,
+    ) -> None:
+        """Persist extraction/verification state for this exact page group.
+
+        The checkpoint is intentionally separate from the final dataset.  A
+        restart can therefore reuse completed page groups even when the
+        materialization step had not yet run.
+        """
+        path = bundle.artifact_dir / "page_checkpoints.json"
+        key = ",".join(str(page.page_number) for page in pages)
+        with self._page_checkpoint_lock:
+            value = self._read_cache_metadata(path)
+            groups = value.setdefault("groups", {})
+            group = groups.setdefault(key, {"pages": [page.page_number for page in pages]})
+            group[stage] = {
+                "status": status,
+                "updated_at_epoch": round(time.time(), 3),
+                **details,
+            }
+            value["artifact_id"] = bundle.artifact_id
+            value["source_sha256"] = bundle.source_sha256
+            value["checkpoint_version"] = "page-group-v1"
+            atomic_json(path, value)
 
     @staticmethod
     def _batch_text_characters(
@@ -2823,6 +4814,8 @@ class VisualIngestionPipeline:
 
     @staticmethod
     def _retryable_batch_failure(exc: BaseException) -> bool:
+        if isinstance(exc, RequestStatusUnknownError):
+            return False
         message = str(exc).casefold()
         return any(signal in message for signal in (
             "timed out",
@@ -2831,6 +4824,21 @@ class VisualIngestionPipeline:
             "request entity too large",
             "payload too large",
         ))
+
+    def _write_straggler_summary(
+        self,
+        bundle: EvidenceBundle,
+        performance: dict[str, Any],
+    ) -> None:
+        performance["circuit_breaker"] = self.circuit_breaker.snapshot()
+        trace_rows = finished_request_events(
+            bundle.artifact_dir / "straggler_trace.jsonl"
+        )
+        summary = summarize_request_metrics(
+            trace_rows or self._metrics.get("request_metrics", [])
+        )
+        performance["straggler_summary"] = summary
+        atomic_json(bundle.artifact_dir / "straggler_summary.json", summary)
 
     def _extract_and_verify_page_group(
         self,
@@ -2842,7 +4850,17 @@ class VisualIngestionPipeline:
         force: bool,
         label: str,
         split_depth: int = 0,
+        completed_groups: dict[
+            tuple[int, ...],
+            list[tuple[dict[str, Any], dict[str, Any]]],
+        ] | None = None,
+        client: VisualClient | None = None,
     ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        if completed_groups is None:
+            completed_groups = {}
+        group_key = tuple(page.page_number for page in pages)
+        if group_key in completed_groups:
+            return completed_groups[group_key]
         extraction_path = (
             bundle.artifact_dir / f"gemini_extraction.{label}.json"
         )
@@ -2879,6 +4897,10 @@ class VisualIngestionPipeline:
             bundle.artifact_dir,
             document_page_count=bundle.document_page_count,
             screening=bundle.screening,
+        )
+        self._write_page_checkpoint(
+            bundle, pages, "group", "pending", label=label,
+            split_depth=split_depth,
         )
         extraction_identity = self._extraction_cache_identity(batch_bundle)
         split_marker = self._read_cache_metadata(split_marker_path)
@@ -2932,6 +4954,8 @@ class VisualIngestionPipeline:
                     force,
                     child_label,
                     split_depth + 1,
+                    completed_groups,
+                    client,
                 ))
             return results
 
@@ -2956,10 +4980,16 @@ class VisualIngestionPipeline:
                 extraction = json.loads(
                     extraction_path.read_text(encoding="utf-8"),
                 )
-                self._metrics["extraction_cache_hits"] += 1
+                with self._metrics_lock:
+                    self._metrics["extraction_cache_hits"] += 1
             else:
-                extraction = self._extract(batch_bundle, batch_context)
+                extraction = self._extract(
+                    batch_bundle, batch_context, client,
+                )
                 extraction["_visual_batch_context"] = batch_context
+                self._archive_stage_output_if_identity_changes(
+                    batch_bundle, "extraction", extraction_identity, metadata_path,
+                )
                 atomic_json(extraction_path, extraction)
                 self._write_stage_cache_identity(
                     batch_bundle,
@@ -2967,10 +4997,20 @@ class VisualIngestionPipeline:
                     extraction_identity,
                     metadata_path,
                 )
-            verification_bundle = self._verification_bundle_for_confidence(
-                batch_bundle,
-                extraction,
+            self._write_page_checkpoint(
+                bundle, pages, "extraction", "complete",
+                cache_hit=extraction_cached,
+                extraction_artifact=extraction_path.name,
+                request_id=str(
+                    getattr(client or self.client, "last_request_metadata", {})
+                    .get("request_id") or ""
+                ),
             )
+            with self._confidence_lock:
+                verification_bundle = self._verification_bundle_for_confidence(
+                    batch_bundle,
+                    extraction,
+                )
             verification_identity = self._verification_cache_identity(
                 verification_bundle,
                 extraction,
@@ -2989,11 +5029,16 @@ class VisualIngestionPipeline:
                 verification = json.loads(
                     verification_path.read_text(encoding="utf-8"),
                 )
-                self._metrics["verification_cache_hits"] += 1
+                with self._metrics_lock:
+                    self._metrics["verification_cache_hits"] += 1
             else:
                 verification = self._verify(
                     verification_bundle,
                     extraction,
+                    client,
+                )
+                self._archive_stage_output_if_identity_changes(
+                    batch_bundle, "verification", verification_identity, metadata_path,
                 )
                 atomic_json(verification_path, verification)
                 self._write_stage_cache_identity(
@@ -3002,7 +5047,20 @@ class VisualIngestionPipeline:
                     verification_identity,
                     metadata_path,
                 )
+            self._write_page_checkpoint(
+                bundle, pages, "verification", "complete",
+                cache_hit=verification_cached,
+                verification_artifact=verification_path.name,
+                request_id=str(
+                    getattr(client or self.client, "last_request_metadata", {})
+                    .get("request_id") or ""
+                ),
+            )
         except (OSError, RuntimeError, TimeoutError) as exc:
+            self._write_page_checkpoint(
+                bundle, pages, "group", "failed", label=label,
+                error=str(exc)[:1200], split_depth=split_depth,
+            )
             child_batches = self._split_batch_pages(pages)
             if not child_batches or not self._retryable_batch_failure(exc):
                 raise
@@ -3035,13 +5093,21 @@ class VisualIngestionPipeline:
                     force,
                     child_label,
                     split_depth + 1,
+                    completed_groups,
+                    client,
                 ))
             return results
         extraction, verification = match_verified_extraction(
             extraction,
             verification,
         )
-        return [(extraction, verification)]
+        self._write_page_checkpoint(
+            bundle, pages, "group", "complete", label=label,
+            extraction_artifact=extraction_path.name,
+            verification_artifact=verification_path.name,
+        )
+        completed_groups[group_key] = [(extraction, verification)]
+        return completed_groups[group_key]
 
     def _extract_and_verify_batches(
         self, bundle: EvidenceBundle, context: dict[str, Any], force: bool,
@@ -3049,28 +5115,104 @@ class VisualIngestionPipeline:
         batches = page_batches(bundle.pages, self.batch_pages, self.batch_overlap)
         extractions: list[dict[str, Any]] = []
         verifications: list[dict[str, Any]] = []
-        for index, pages in enumerate(batches, 1):
-            pairs = self._extract_and_verify_page_group(
-                bundle,
-                context,
-                pages,
-                index,
-                len(batches),
-                force,
-                f"batch-{index:03d}",
+        completed_groups: dict[
+            tuple[int, ...],
+            list[tuple[dict[str, Any], dict[str, Any]]],
+        ] = {}
+        fork_client = getattr(self.client, "fork", None)
+        inline_limit = int(
+            getattr(self.client, "inline_limit_bytes", 0) or 0
+        )
+        estimated_batches = [
+            sum(((page.path.stat().st_size + 2) // 3) * 4 for page in pages)
+            + self._batch_text_characters(bundle, pages) * 4
+            for pages in batches
+        ]
+        parallel = (
+            self.batch_workers > 1
+            and len(batches) > 1
+            and self.batch_overlap <= 1
+            and callable(fork_client)
+            and (
+                not inline_limit
+                or all(size <= inline_limit for size in estimated_batches)
             )
-            for extraction, verification in pairs:
+        )
+        indexed_results: dict[
+            int, list[tuple[dict[str, Any], dict[str, Any]]]
+        ] = {}
+        if parallel:
+            with self._metrics_lock:
+                self._metrics["visual_batch_parallelized"] = True
+                self._metrics["visual_batch_parallel_groups"] = len(batches)
+            indexed = list(enumerate(batches, 1))
+            # Adjacent overlapping roots are placed in different waves. This
+            # keeps cross-page context while allowing non-overlapping requests
+            # to progress independently with at most two workers.
+            waves = (
+                [indexed]
+                if self.batch_overlap == 0
+                else [indexed[::2], indexed[1::2]]
+            )
+            for wave in waves:
+                if not wave:
+                    continue
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(self.batch_workers, len(wave)),
+                    thread_name_prefix="gemini-page-batch",
+                ) as executor:
+                    futures = {
+                        executor.submit(
+                            self._extract_and_verify_page_group,
+                            bundle,
+                            context,
+                            pages,
+                            index,
+                            len(batches),
+                            force,
+                            f"batch-{index:03d}",
+                            0,
+                            completed_groups,
+                            fork_client(),
+                        ): index
+                        for index, pages in wave
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        indexed_results[futures[future]] = future.result()
+        else:
+            for index, pages in enumerate(batches, 1):
+                indexed_results[index] = self._extract_and_verify_page_group(
+                    bundle,
+                    context,
+                    pages,
+                    index,
+                    len(batches),
+                    force,
+                    f"batch-{index:03d}",
+                    completed_groups=completed_groups,
+                )
+        for index in sorted(indexed_results):
+            for extraction, verification in indexed_results[index]:
                 extractions.append(extraction)
                 verifications.append(verification)
         extraction, verification = merge_visual_batches(extractions, verifications)
+        final_extraction_identity = self._extraction_cache_identity(bundle)
+        final_verification_identity = self._verification_cache_identity(
+            bundle, extraction,
+        )
+        self._archive_stage_output_if_identity_changes(
+            bundle, "extraction", final_extraction_identity,
+        )
+        self._archive_stage_output_if_identity_changes(
+            bundle, "verification", final_verification_identity,
+        )
         atomic_json(bundle.artifact_dir / "gemini_extraction.json", extraction)
         atomic_json(bundle.artifact_dir / "gemini_verification.json", verification)
         self._write_stage_cache_identity(
-            bundle, "extraction", self._extraction_cache_identity(bundle),
+            bundle, "extraction", final_extraction_identity,
         )
         self._write_stage_cache_identity(
-            bundle, "verification",
-            self._verification_cache_identity(bundle, extraction),
+            bundle, "verification", final_verification_identity,
         )
         return extraction, verification
 
@@ -3126,6 +5268,17 @@ class VisualIngestionPipeline:
         )
         atomic_json(directory / "spreadsheet_schema.json", schemas)
         atomic_json(directory / "spreadsheet_evidence_packet.json", packet)
+        atomic_json(directory / "evidence_packet.json", {
+            "evidence_packet_version": "evidence-packet-v1",
+            "artifact_id": artifact_id,
+            "source_sha256": digest,
+            "source_filename": resolved.name,
+            "original_type": original_type,
+            "raw_text_artifact": "raw_text.json",
+            "structured_packet_artifact": "spreadsheet_evidence_packet.json",
+            "packet_group_count": len(packet.get("groups", [])),
+            "pipeline_version": SPREADSHEET_PIPELINE_VERSION,
+        })
         atomic_json(directory / "completeness_manifest.json", completeness)
         atomic_json(directory / "gemini_extraction.json", extraction)
         atomic_json(directory / "manifest.json", {
@@ -3175,6 +5328,16 @@ class VisualIngestionPipeline:
                 "template_verified": True,
                 "every_candidate_assigned": True,
                 "same_row_links_correct": True,
+                "verification_contract_version": "pair-coverage-v1",
+                "pair_verification": {
+                    "passed": True, "checked_record_count": 0,
+                    "failed_record_ids": [], "reason": "No spreadsheet units were present",
+                },
+                "coverage_verification": {
+                    "passed": True, "visible_comment_count": 0,
+                    "visible_response_count": 0, "missing_record_ids": [],
+                    "reason": "No candidate spreadsheet rows were present",
+                },
                 "verified_group_ids": [],
                 "rejected_group_ids": [],
                 "missing_unit_ids": [],
@@ -3210,6 +5373,16 @@ class VisualIngestionPipeline:
                     "template_verified": False,
                     "every_candidate_assigned": False,
                     "same_row_links_correct": False,
+                    "verification_contract_version": "pair-coverage-v1",
+                    "pair_verification": {
+                        "passed": False, "checked_record_count": 0,
+                        "failed_record_ids": [], "reason": "Spreadsheet verification failed",
+                    },
+                    "coverage_verification": {
+                        "passed": False, "visible_comment_count": 0,
+                        "visible_response_count": 0, "missing_record_ids": [],
+                        "reason": "Spreadsheet verification failed",
+                    },
                     "verified_group_ids": [],
                     "rejected_group_ids": [],
                     "missing_unit_ids": [],
@@ -3220,6 +5393,9 @@ class VisualIngestionPipeline:
                         f"{verification_error}"
                     ),
                 }
+            self._archive_stage_output_if_identity_changes(
+                bundle, "verification", verification_identity, metadata_path,
+            )
             atomic_json(verification_path, compact_verification)
             if not verification_error:
                 self._write_stage_cache_identity(
@@ -3308,6 +5484,7 @@ class VisualIngestionPipeline:
                 "gemini_spreadsheet_verification_output_tokens"
             ],
         }
+        self._write_straggler_summary(bundle, performance)
         summary.update(reconciliation)
         summary["performance"] = performance
         if verification_error:
@@ -3352,26 +5529,7 @@ class VisualIngestionPipeline:
 
     def process(self, source: Path, source_relative: str, context: dict[str, Any], force: bool = False):
         process_started = time.perf_counter()
-        self._metrics = {
-            "gemini_extraction_calls": 0,
-            "gemini_verification_calls": 0,
-            "gemini_spreadsheet_verification_calls": 0,
-            "gemini_extraction_seconds": 0.0,
-            "gemini_verification_seconds": 0.0,
-            "gemini_spreadsheet_verification_seconds": 0.0,
-            "extraction_cache_hits": 0,
-            "verification_cache_hits": 0,
-            "spreadsheet_verification_cache_hits": 0,
-            "gemini_extraction_input_tokens": 0,
-            "gemini_extraction_output_tokens": 0,
-            "gemini_verification_input_tokens": 0,
-            "gemini_verification_output_tokens": 0,
-            "gemini_spreadsheet_verification_input_tokens": 0,
-            "gemini_spreadsheet_verification_output_tokens": 0,
-            "gemini_cached_input_tokens": 0,
-            "gemini_thought_tokens": 0,
-            "request_metrics": [],
-        }
+        self._metrics = self._empty_metrics()
         structured_result = self._process_structured_spreadsheet(
             source,
             source_relative,
@@ -3382,7 +5540,14 @@ class VisualIngestionPipeline:
         if structured_result is not None:
             return structured_result
         build_started = time.perf_counter()
-        bundle = self.builder.build(source)
+        prescan_value = context.get("prescan_decision", "")
+        if isinstance(prescan_value, dict):
+            prescan_value = prescan_value.get("decision", "")
+        force_full_read = str(prescan_value) == "full_read"
+        bundle = (
+            self.builder.build(source, force_full_read=True)
+            if force_full_read else self.builder.build(source)
+        )
         build_seconds = time.perf_counter() - build_started
         self._write_job_progress(
             bundle, "fingerprint_file",
@@ -3397,6 +5562,27 @@ class VisualIngestionPipeline:
         )
         self._write_job_progress(
             bundle, "classify_canonical_document",
+            pages_screened=len(bundle.screening.get("pages_screened", [])),
+            pages_selected=len(bundle.pages),
+        )
+        atomic_json(bundle.artifact_dir / "evidence_packet.json", {
+            "evidence_packet_version": "evidence-packet-v1",
+            "artifact_id": bundle.artifact_id,
+            "source_sha256": bundle.source_sha256,
+            "source_filename": source.name,
+            "original_type": bundle.original_type,
+            "document_page_count": bundle.document_page_count,
+            "raw_text_artifact": "raw_text.json",
+            "page_manifest_artifact": "page_manifest.json",
+            "rendered_pages": [
+                {"page": page.page_number, "path": str(page.path.name)}
+                for page in bundle.pages
+            ],
+            "screening": bundle.screening,
+            "pipeline_version": PIPELINE_VERSION,
+        })
+        self._write_job_progress(
+            bundle, "prescan",
             pages_screened=len(bundle.screening.get("pages_screened", [])),
             pages_selected=len(bundle.pages),
         )
@@ -3416,6 +5602,7 @@ class VisualIngestionPipeline:
                 "gemini_input_tokens": 0,
                 "gemini_output_tokens": 0,
             }
+            self._write_straggler_summary(bundle, performance)
             summary = {
                 "city": str(context.get("city_hint", "")),
                 "property_project": str(context.get("property_hint", "")),
@@ -3480,6 +5667,11 @@ class VisualIngestionPipeline:
             return [], [], [], summary, review
         extraction_path = bundle.artifact_dir / "gemini_extraction.json"
         verification_path = bundle.artifact_dir / "gemini_verification.json"
+        correction_path = bundle.artifact_dir / "gemini_reconstruction_correction.json"
+        # Batch verification already checked each batch; a correction request
+        # still uses the complete bundle so the follow-up audit sees the same
+        # source context and never changes source locations.
+        verification_bundle = bundle
         use_batches = self.batch_pages > 0 and len(bundle.pages) > self.batch_pages
         if use_batches:
             extraction, verification = self._extract_and_verify_batches(bundle, context, force)
@@ -3497,6 +5689,9 @@ class VisualIngestionPipeline:
                 self._metrics["extraction_cache_hits"] += 1
             else:
                 extraction = self._extract(bundle, context)
+                self._archive_stage_output_if_identity_changes(
+                    bundle, "extraction", extraction_identity,
+                )
                 atomic_json(extraction_path, extraction)
                 self._write_stage_cache_identity(
                     bundle, "extraction", extraction_identity,
@@ -3519,10 +5714,69 @@ class VisualIngestionPipeline:
                 self._metrics["verification_cache_hits"] += 1
             else:
                 verification = self._verify(verification_bundle, extraction)
+                self._archive_stage_output_if_identity_changes(
+                    bundle, "verification", verification_identity,
+                )
                 atomic_json(verification_path, verification)
                 self._write_stage_cache_identity(
                     bundle, "verification", verification_identity,
                 )
+
+        # Verification may report a layout-only reconstruction defect.  Give
+        # Gemini one bounded correction opportunity, then independently verify
+        # the corrected representation.  Missing records, pair failures and
+        # locator failures do not enter this path (they remain needs_review).
+        correction_report: dict[str, Any] = {
+            "attempted": False, "accepted": [], "rejected": [],
+        }
+        if reconstruction_correction_required(verification):
+            correction_identity = {
+                "stage": "reconstruction_correction",
+                "source_sha256": bundle.source_sha256,
+                "model": str(getattr(self.client, "model", "test-client")),
+                "prompt_version": RECONSTRUCTION_CORRECTION_PROMPT_VERSION,
+                "extraction_fingerprint": self._json_digest(extraction),
+                "verification_fingerprint": self._json_digest(verification),
+            }
+            correction: dict[str, Any] | None = None
+            correction_cached = (
+                not force
+                and correction_path.is_file()
+                and self._stage_cache_is_compatible(
+                    bundle, "reconstruction_correction", correction_identity,
+                )
+            )
+            if correction_cached:
+                correction = self._read_cache_metadata(correction_path)
+                self._metrics["reconstruction_correction_cache_hits"] += 1
+            else:
+                correction = self._reconstruct_correction(
+                    verification_bundle, extraction, verification,
+                )
+                if correction is not None:
+                    self._archive_stage_output_if_identity_changes(
+                        bundle, "reconstruction_correction", correction_identity,
+                    )
+                    atomic_json(correction_path, correction)
+                    self._write_stage_cache_identity(
+                        bundle, "reconstruction_correction", correction_identity,
+                    )
+            if correction is not None:
+                corrected, correction_report = apply_reconstruction_correction(
+                    extraction, correction,
+                )
+                correction_report["attempted"] = True
+                correction_report["cached"] = correction_cached
+                correction_report["model_output"] = copy.deepcopy(correction)
+                if correction_report.get("accepted"):
+                    extraction = corrected
+                    # The second pass is mandatory after any accepted change.
+                    verification = self._verify(verification_bundle, extraction)
+                    atomic_json(
+                        bundle.artifact_dir / "gemini_verification_after_reconstruction_correction.json",
+                        verification,
+                    )
+        atomic_json(bundle.artifact_dir / "reconstruction_correction_report.json", correction_report)
         self._write_job_progress(
             bundle, "extract_records",
             extracted_records=len(extraction.get("records", [])),
@@ -3551,12 +5805,26 @@ class VisualIngestionPipeline:
         if response_document and round_hint and extracted_round and extracted_round.isdigit() and round_hint.isdigit():
             round_offset_is_expected = int(extracted_round) == int(round_hint) + 1
         if round_hint and normalized_whitespace(extracted_round).casefold() != normalized_whitespace(round_hint).casefold():
-            if round_offset_is_expected:
+            # The audited/file-name round is context only.  An explicit round
+            # read from the document must remain authoritative; retain the
+            # mismatch as provenance instead of silently rewriting the event.
+            if extracted_round and round_offset_is_expected:
                 extraction["response_letter_round"] = extracted_round
-                extraction["reviewed_plan_round"] = round_hint
-                extraction["review_round"] = round_hint
+                extraction.setdefault("reviewed_plan_round", round_hint)
+                extraction.setdefault("review_round_metadata", {
+                    "value": extracted_round, "raw": extracted_round,
+                    "source": "document_content", "confidence": 0.9,
+                })
+            elif extracted_round:
+                context_conflicts.append(
+                    f"Filename/audit round {round_hint!r} differs from document round {extracted_round!r}; document value retained"
+                )
             else:
-                context_conflicts.append(f"Gemini review round {extraction.get('review_round')!r} conflicts with audited round {round_hint!r}")
+                extraction["review_round"] = round_hint
+                extraction["review_round_metadata"] = {
+                    "value": round_hint, "raw": round_hint,
+                    "source": "filename", "confidence": 0.45,
+                }
         if context_conflicts:
             extraction["document_uncertain"] = True
             existing_reason = str(extraction.get("document_uncertainty_reason", "")).strip()
@@ -3581,8 +5849,10 @@ class VisualIngestionPipeline:
         total_cache_checks = (
             self._metrics["gemini_extraction_calls"]
             + self._metrics["gemini_verification_calls"]
+            + self._metrics["gemini_reconstruction_correction_calls"]
             + self._metrics["extraction_cache_hits"]
             + self._metrics["verification_cache_hits"]
+            + self._metrics["reconstruction_correction_cache_hits"]
         )
         performance = {
             **self._metrics,
@@ -3595,28 +5865,35 @@ class VisualIngestionPipeline:
                 100.0 * (
                     self._metrics["extraction_cache_hits"]
                     + self._metrics["verification_cache_hits"]
+                    + self._metrics["reconstruction_correction_cache_hits"]
                 ) / total_cache_checks,
                 2,
             ) if total_cache_checks else 0.0,
             "gemini_input_tokens": (
                 self._metrics["gemini_extraction_input_tokens"]
                 + self._metrics["gemini_verification_input_tokens"]
+                + self._metrics["gemini_reconstruction_correction_input_tokens"]
             ),
             "gemini_output_tokens": (
                 self._metrics["gemini_extraction_output_tokens"]
                 + self._metrics["gemini_verification_output_tokens"]
+                + self._metrics["gemini_reconstruction_correction_output_tokens"]
             ),
         }
+        self._write_straggler_summary(bundle, performance)
         audit = {
             "artifact_id": bundle.artifact_id, "source_filename": source.name,
             "source_sha256": bundle.source_sha256, "raw_text_artifact": "raw_text.json",
             "extraction_artifact": "gemini_extraction.json", "verification_artifact": "gemini_verification.json",
+            "reconstruction_correction_artifact": "gemini_reconstruction_correction.json",
             "page_count": bundle.document_page_count or len(bundle.pages),
             "pages_screened": bundle.screening.get("pages_screened", []),
             "pages_fully_analyzed": [page.page_number for page in bundle.pages],
             "additional_markup_detected": bool(bundle.screening.get("additional_markup_detected")),
             "page_screening": bundle.screening,
             "pipeline_version": PIPELINE_VERSION,
+            "reconstruction_correction_prompt_version": RECONSTRUCTION_CORRECTION_PROMPT_VERSION,
+            "reconstruction_correction": correction_report,
             "regression": regression,
             "completeness_reconciliation": reconciliation,
             "performance": performance,
@@ -3628,6 +5905,7 @@ class VisualIngestionPipeline:
         comments, responses, links, summary, review = result
         summary.update(reconciliation)
         summary["performance"] = performance
+        summary["reconstruction_correction"] = copy.deepcopy(correction_report)
         if reconciliation["completion_status"] != "complete":
             summary["processing_error"] = "Completeness reconciliation requires review"
             review.append({

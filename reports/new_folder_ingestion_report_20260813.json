@@ -1,0 +1,127 @@
+{
+  "report_date": "2026-08-13",
+  "scope": {
+    "folder": "new",
+    "included_project_folders": [
+      "25-023",
+      "25-024",
+      "25-025",
+      "25-026",
+      "25-027",
+      "25-028",
+      "25-029",
+      "25-030",
+      "25-031"
+    ],
+    "excluded_as_already_ingested": "25-001 through 25-021",
+    "projects_identified": 9
+  },
+  "inventory": {
+    "supported_files_accounted_for": 805,
+    "pdf_files": 766,
+    "xlsx_files": 31,
+    "docx_files": 8,
+    "files_opened_for_content_ingestion": 73,
+    "files_classified_locally_without_full_content_ingestion": 732,
+    "files_producing_comments_or_responses": 66,
+    "files_opened_with_no_relevant_content": 6,
+    "failed_files": 1,
+    "initial_existing_hash_hits": 9,
+    "completed_files_reused_by_checkpoint_retry": 797
+  },
+  "records": {
+    "new_comments": 586,
+    "new_responses": 128,
+    "canonical_reviewer_followups": 30,
+    "confirmed_comment_response_links": 114,
+    "needs_review_comment_response_links": 14,
+    "source_occurrences_added": 714,
+    "canonical_events": 564,
+    "search_eligible_canonical_events": 420,
+    "needs_review_canonical_events": 144,
+    "issue_timelines_touched": 507,
+    "canonical_events_with_multiple_new_source_occurrences": 143,
+    "automatic_duplicate_event_occurrences_collapsed": 126,
+    "duplicate_groups_requiring_manual_review": 0,
+    "needs_review_comments": 150,
+    "needs_review_responses": 14,
+    "needs_review_record_total": 164,
+    "qa_review_items": 194
+  },
+  "post_ingestion_manual_review_2026_08_14": {
+    "persisted_workbook_decisions_all_app": 19,
+    "persisted_workbook_decisions_in_batch": 10,
+    "batch_comment_rows_with_human_workbook_verification": 214,
+    "batch_response_rows_with_human_workbook_verification": 56,
+    "current_batch_confirmed_comments": 586,
+    "current_batch_needs_review_comments": 0,
+    "current_batch_confirmed_responses": 128,
+    "current_batch_needs_review_responses": 0,
+    "current_batch_verified_links": 586,
+    "current_batch_confirmed_matched_links": 128,
+    "current_batch_confirmed_unmatched_links": 458,
+    "current_batch_search_eligible_comments": 492,
+    "current_batch_search_excluded_comments": 94,
+    "current_batch_duplicate_rows_kept_out_of_search": 81,
+    "record_confirmation_decision_id": "HR-20260814-new-25-023-031",
+    "search_index_refresh_embedding_calls": 0,
+    "note": "The user explicitly confirmed the remaining record/link-level needs-review rows. Duplicate source copies remain excluded from search, and relationship/date/round/source-locator/timeline semantics were unchanged."
+  },
+  "source_registry": {
+    "new_record_owners_registered": 714,
+    "new_source_citations": 1641,
+    "unique_documents_referenced": 138,
+    "pdf_documents": 114,
+    "spreadsheet_documents": 22,
+    "word_preview_documents": 2,
+    "spreadsheet_citations_with_sheet_and_cell_range": 512,
+    "pdf_or_preview_citations_with_page_number": 708,
+    "pdf_citations_with_stored_coordinate_boxes": 0,
+    "pdf_navigation_fallback": "page plus exact-text search"
+  },
+  "gemini_telemetry": {
+    "requests": 138,
+    "completed_requests": 137,
+    "definitive_failed_requests": 1,
+    "input_tokens": 1373779,
+    "cached_input_tokens": 6787,
+    "output_tokens": 175390,
+    "thought_tokens": 337384,
+    "images_sent": 276,
+    "pages_screened": 256,
+    "pages_fully_analyzed": 137,
+    "retries": 21,
+    "median_time_to_first_token_seconds": 12.5395,
+    "maximum_time_to_first_token_seconds": 55.2183,
+    "median_generation_duration_seconds": 2.4159,
+    "maximum_generation_duration_seconds": 35.4022,
+    "request_elapsed_seconds_total": 3000.4836
+  },
+  "timing": {
+    "primary_ingestion_seconds": 3262.56,
+    "checkpoint_retry_seconds": 511.53,
+    "final_single_file_retry_seconds": 116.58,
+    "active_pipeline_seconds_total": 3890.67,
+    "active_pipeline_duration": "1h 04m 51s",
+    "first_touch_to_dataset_ready_seconds": 10151,
+    "first_touch_to_dataset_ready_duration": "2h 49m 11s"
+  },
+  "failed_sources": [
+    {
+      "project": "25-024 — 117 Scharff Avenue, San Jose",
+      "source": "new/25-024-117 Scharff Avenue, San Jose, CA/07 Deliverables and Submitals/Building/4th Submission/3rd Comments/Planning Review 4.9.2026.pdf",
+      "pages": 38,
+      "reason": "Gemini HTTP 503 high demand after targeted retry",
+      "status": "needs_review"
+    }
+  ],
+  "tests": {
+    "targeted_ingestion_and_data_model_tests_run": 67,
+    "targeted_ingestion_and_data_model_tests_passed": 67,
+    "broader_tests_run": 153,
+    "broader_tests_passed": 152,
+    "broader_test_failures": [
+      "Stale frontend assertion expects SourcesTrigger after the Library-style evidence-panel redesign"
+    ]
+  }
+}

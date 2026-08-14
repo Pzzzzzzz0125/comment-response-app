@@ -124,6 +124,14 @@ class SpreadsheetIngestionTests(unittest.TestCase):
             records[0]["response_location"]["cell_range"], "E2",
         )
         self.assertEqual(records[0]["review_round"], "2")
+        self.assertEqual(records[0]["event_date_iso"], "2026-01-02")
+        self.assertEqual(records[0]["event_date_raw"], "1/2/2026")
+        self.assertEqual(
+            records[0]["event_date_location"]["cell_range"], "B2",
+        )
+        self.assertEqual(
+            records[0]["source_metadata"]["reviewer_cell"], "B2",
+        )
         self.assertEqual(
             evidence["completeness"]["candidate_comment_count"], 2,
         )
@@ -160,6 +168,24 @@ class SpreadsheetIngestionTests(unittest.TestCase):
         self.assertEqual(
             events[1]["source_location"]["cell_range"], "F4",
         )
+
+    def test_flattened_discussion_is_split_into_compact_role_entries(self):
+        text = (
+            "Reviewer Response: Gregg Schwartz - 9/23/25 3:29 PM "
+            "This comment to remain open until all other comments are resolved. "
+            "---------------------------------------------------------- "
+            "Responded by: Mau Pham - 9/11/25 5:54 PM noted "
+            "---------------------------------------------------------- "
+            "Reviewer Response: Gregg Schwartz - 8/6/25 9:18 AM "
+            "Please see the original comment and respond clearly."
+        )
+        events = parse_discussion_events(text, {"cell_range": "F39"})
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0]["display_label"], "Reviewer follow-up")
+        self.assertIn("remain open", events[0]["exact_text"])
+        self.assertEqual(events[1]["display_label"], "Applicant response")
+        self.assertEqual(events[1]["actor"], "Mau Pham")
+        self.assertIn("Please see the original comment", events[2]["exact_text"])
 
     def test_compact_verification_translates_to_confirmed_dataset_rows(self):
         raw = projectdox_raw()
@@ -204,6 +230,8 @@ class SpreadsheetIngestionTests(unittest.TestCase):
             comments[0]["issue_grouping_method"],
             "same_spreadsheet_row_with_history",
         )
+        self.assertEqual(comments[0]["event_date"], "2026-01-02")
+        self.assertEqual(comments[0]["event_date_source"], "reviewer_column")
         self.assertEqual(
             comments[0]["issue_thread_events"][0]["event_type"],
             "discussion_note",

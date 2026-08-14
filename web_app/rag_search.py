@@ -127,7 +127,18 @@ def truncation_reason(text: str) -> str:
 
 def searchable_text(comment: dict[str, Any], display_text: str = "") -> str:
     """Stable text embedded per comment; deliberately excludes the long response."""
-    text = display_text or str(comment.get("original_text", ""))
+    # Reconstructed text is a representation-layer improvement.  It is safe
+    # for search/embedding only when the record is trusted; otherwise retain
+    # the legacy text path and let the normal trust gate decide eligibility.
+    reconstruction = comment.get("reconstruction")
+    reconstructed = str(comment.get("text_reconstructed") or "")
+    reconstructed_trusted = (
+        comment.get("text_trust_status") == "verified"
+        or (isinstance(reconstruction, dict) and reconstruction.get("verified") is True)
+    )
+    text = display_text or (reconstructed if reconstructed and reconstructed_trusted else "") or str(
+        comment.get("verified_text") or comment.get("original_text", "")
+    )
     fields = [
         f"City: {comment.get('city', '')}",
         f"Discipline: {comment.get('discipline', '')}",

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 try:
@@ -71,6 +73,18 @@ def main() -> int:
         "canonical_document_count": identity["canonical_document_count"],
         "source_file_aliases": len(identity["source_file_aliases"]),
     })
+    report["date_aware_event_identity"] = True
+    report["duplicate_city_counts"] = dict(Counter(
+        str(next(
+            (
+                row.get("city", "")
+                for row in dataset.get("comments", [])
+                if str(row.get("comment_id", "")) == duplicate_id
+            ),
+            "",
+        ))
+        for duplicate_id in report.get("duplicate_of", {})
+    ))
     report["applied"] = args.apply
     if args.apply:
         hierarchy_backup = args.dataset.with_suffix(".pre_comment_hierarchy.json")
@@ -82,6 +96,15 @@ def main() -> int:
         backup = args.dataset.with_suffix(".pre_comment_dedup.json")
         if not backup.exists():
             atomic_json(backup, json.loads(args.dataset.read_text(encoding="utf-8")))
+        dataset.setdefault("metadata", {})["global_duplicate_audit"] = {
+            "applied_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "method": "same_site_same_review_round_same_date_same_normalized_text",
+            "duplicate_rows_suppressed": report.get("duplicate_rows_suppressed", 0),
+            "duplicate_groups": report.get("duplicate_groups", 0),
+            "source_occurrences_attached": report.get("source_occurrences_attached", 0),
+            "response_occurrences_attached": report.get("response_occurrences_attached", 0),
+            "duplicate_city_counts": report.get("duplicate_city_counts", {}),
+        }
         atomic_json(args.dataset, dataset)
         if args.source_registry.is_file():
             registry = json.loads(args.source_registry.read_text(encoding="utf-8"))

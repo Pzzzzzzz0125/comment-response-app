@@ -51,6 +51,20 @@ SPREADSHEET_VERIFICATION_SCHEMA = {
         "template_verified": {"type": "BOOLEAN"},
         "every_candidate_assigned": {"type": "BOOLEAN"},
         "same_row_links_correct": {"type": "BOOLEAN"},
+        "verification_contract_version": {"type": "STRING"},
+        "pair_verification": {"type": "OBJECT", "properties": {
+            "passed": {"type": "BOOLEAN"},
+            "checked_record_count": {"type": "INTEGER"},
+            "failed_record_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "reason": {"type": "STRING"},
+        }},
+        "coverage_verification": {"type": "OBJECT", "properties": {
+            "passed": {"type": "BOOLEAN"},
+            "visible_comment_count": {"type": "INTEGER"},
+            "visible_response_count": {"type": "INTEGER"},
+            "missing_record_ids": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "reason": {"type": "STRING"},
+        }},
         "verified_group_ids": {
             "type": "ARRAY", "items": {"type": "STRING"},
         },
@@ -71,6 +85,7 @@ SPREADSHEET_VERIFICATION_SCHEMA = {
     "required": [
         "document_verified", "template_verified",
         "every_candidate_assigned", "same_row_links_correct",
+        "verification_contract_version", "pair_verification", "coverage_verification",
         "verified_group_ids", "rejected_group_ids", "missing_unit_ids",
         "incorrect_groupings", "incorrect_links", "verification_summary",
     ],
@@ -94,9 +109,36 @@ DISCUSSION_EVENT_HEADER = re.compile(
     r"(?im)^[ \t]*(Reviewer Response|Responded by)[ \t]*:"
     r"[ \t]*(.*?)[ \t]*-[ \t]*"
     r"(\d{1,2}/\d{1,2}/\d{2,4}"
-    r"(?:[ \t]+\d{1,2}:\d{2}(?:[ \t]*[AP]M)?)?)[ \t]*$"
+    r"(?:[ \t]+\d{1,2}:\d{2}(?:[ \t]*[AP]M)?)?)"
 )
 DISCUSSION_SEPARATOR = re.compile(r"(?m)^[ \t]*-{8,}[ \t]*$")
+
+
+def _discussion_layout_text(exact_text: str) -> str:
+    """Make compacted spreadsheet history parseable without changing source text.
+
+    Some exports flatten line breaks and the dashed separator into one cell
+    string.  We keep ``exact_discussion_text`` untouched for audit, but parse a
+    layout-only copy where each explicit header starts on its own line.
+    """
+    value = str(exact_text or "")
+    value = html.unescape(value)
+    value = re.sub(r"(?:_x000[dD]_|\*x000[dD]\*)", "\n", value)
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"-{8,}", "\n--------------------\n", value)
+    value = re.sub(
+        r"(?<!\n)[ \t]+(?=(?:Reviewer Response|Responded by)[ \t]*:)",
+        "\n",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"(?<!\n)(?=(?:Reviewer Response|Responded by)[ \t]*:)",
+        "\n",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return value
 
 
 def _discussion_timestamp(value: str) -> str:
@@ -130,9 +172,10 @@ def parse_discussion_events(
     """
     if not exact_text.strip():
         return []
-    matches = list(DISCUSSION_EVENT_HEADER.finditer(exact_text))
+    layout_text = _discussion_layout_text(exact_text)
+    matches = list(DISCUSSION_EVENT_HEADER.finditer(layout_text))
     if not matches:
-        body = DISCUSSION_SEPARATOR.sub("", exact_text).strip()
+        body = DISCUSSION_SEPARATOR.sub("", layout_text).strip()
         return [{
             "event_type": "discussion_note",
             "actor_role": "unknown",
@@ -144,14 +187,15 @@ def parse_discussion_events(
             "source_order": 1,
             "source_location": copy.deepcopy(location),
             "parse_status": "unstructured",
+            "display_label": "Discussion note",
         }] if body else []
     events: list[dict[str, Any]] = []
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(
-            exact_text
+            layout_text
         )
-        raw_segment = exact_text[match.start():end]
-        body = exact_text[match.end():end]
+        raw_segment = layout_text[match.start():end]
+        body = layout_text[match.end():end]
         body = DISCUSSION_SEPARATOR.sub("", body).strip()
         label = match.group(1).casefold()
         events.append({
@@ -170,6 +214,11 @@ def parse_discussion_events(
             "occurred_at_label": normalized_visible_text(match.group(3)),
             "exact_text": body,
             "raw_segment": raw_segment.strip(),
+            "display_label": (
+                "Reviewer follow-up"
+                if label == "reviewer response"
+                else "Applicant response"
+            ),
             "source_order": index + 1,
             "source_location": copy.deepcopy(location),
             "parse_status": "explicit_header",
@@ -377,6 +426,34 @@ def _department(reviewer_context: str) -> str:
     )
 
 
+def reviewer_header_event_date(value: Any) -> dict[str, str]:
+    """Extract an explicitly printed reviewer-column timestamp.
+
+    In ProjectDox workbooks the reviewer/department cell is part of the same
+    visible row as the comment.  A value such as ``Building Plan Review Kia
+    Goudarzi 7/11/25 3:50 PM`` therefore dates the government-comment event;
+    it is not a file/export date.  Keep the raw value and the exact matched
+    date for audit rather than deriving it later from a filename.
+    """
+    raw = normalized_visible_text(value)
+    match = re.search(
+        r"\b(\d{1,2}/\d{1,2}/\d{2,4}"
+        r"(?:\s+\d{1,2}:\d{2}(?:\s*[AP]M)?)?)\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if not match:
+        return {"iso": "", "raw": "", "source": "unknown"}
+    occurred_at = _discussion_timestamp(match.group(1))
+    if not occurred_at:
+        return {"iso": "", "raw": "", "source": "unknown"}
+    return {
+        "iso": occurred_at[:10],
+        "raw": match.group(1),
+        "source": "reviewer_column",
+    }
+
+
 def build_spreadsheet_evidence(
     raw_text: dict[str, Any],
     schemas: list[dict[str, Any]],
@@ -483,6 +560,14 @@ def build_spreadsheet_evidence(
             reviewer = _cell_value(
                 cells, str(schema.get("reviewer_column", "")).upper(),
             )
+            reviewer_column = str(schema.get("reviewer_column", "")).upper()
+            reviewer_cell = cells.get(reviewer_column, {})
+            reviewer_address = str(
+                reviewer_cell.get("address") or (
+                    f"{reviewer_column}{row_number}" if reviewer_column else ""
+                )
+            )
+            reviewer_date = reviewer_header_event_date(reviewer)
             cycle = _cell_value(
                 cells, str(schema.get("cycle_column", "")).upper(),
             )
@@ -550,6 +635,17 @@ def build_spreadsheet_evidence(
                 ),
                 "department": _department(reviewer),
                 "reviewer": reviewer,
+                "event_date_iso": reviewer_date["iso"],
+                "event_date_raw": reviewer_date["raw"],
+                "event_date_source": reviewer_date["source"],
+                "event_date_location": ({
+                    "viewer_type": "spreadsheet",
+                    "sheet_name": sheet_name,
+                    "cell_range": reviewer_address,
+                    "row_number": row_number,
+                    "unit_ids": [_unit_id(sheet_name, reviewer_address)],
+                    "description": "reviewer/department cell with event date",
+                } if reviewer_address and reviewer_date["iso"] else {}),
                 "exact_response_text": response_text,
                 "comment_location": comment_location,
                 "response_location": response_location,
@@ -581,6 +677,20 @@ def build_spreadsheet_evidence(
                         discussion_cell.get("address", "")
                     ),
                     "discussion_event_count": len(discussion_events),
+                    # Persist the visible non-comment cells with their
+                    # addresses.  This is row-level evidence used for later
+                    # date/round/reviewer repairs; it is not inferred text.
+                    "row_context_cells": [
+                        {
+                            "column": unit["column"],
+                            "cell": unit["cell"],
+                            "value": unit["text"],
+                        }
+                        for unit in row_units
+                        if unit["role"] == "context"
+                    ],
+                    "reviewer_cell": reviewer_address,
+                    "reviewer_date_raw": reviewer_date["raw"],
                 },
                 "extraction_method": "local_structured_spreadsheet",
             })
@@ -696,6 +806,9 @@ def local_verification_result(
         and verified_ids == expected_ids
         and evidence["completeness"]["completion_status"] == "complete"
     )
+    failed_ids = sorted(rejected_ids | set(str(value) for value in result.get("missing_unit_ids", []) if str(value)))
+    pair_passed = bool(complete and not result.get("incorrect_links") and not result.get("incorrect_groupings"))
+    coverage_passed = bool(complete and not failed_ids)
     checks = []
     for group in groups:
         group_id = str(group.get("group_id", ""))
@@ -717,6 +830,7 @@ def local_verification_result(
             ),
         })
     return {
+        "verification_contract_version": "pair-coverage-v1",
         "document_verified": complete,
         "every_comment_captured": complete,
         "every_response_captured": complete,
@@ -735,4 +849,17 @@ def local_verification_result(
         ),
         "duplicate_fragments": [],
         "continuation_errors": [],
+        "pair_verification": {
+            "passed": pair_passed,
+            "checked_record_count": len(expected_ids),
+            "failed_record_ids": sorted(set(failed_ids) | set(str(value) for value in result.get("incorrect_links", []) if str(value))),
+            "reason": "Every spreadsheet comment/response link was checked against its visible row" if pair_passed else "Spreadsheet row pairing requires review",
+        },
+        "coverage_verification": {
+            "passed": coverage_passed,
+            "visible_comment_count": len(expected_ids),
+            "visible_response_count": int(evidence["completeness"].get("candidate_response_count", 0) or 0),
+            "missing_record_ids": failed_ids,
+            "reason": "All candidate spreadsheet rows were assigned" if coverage_passed else "One or more spreadsheet rows were omitted or rejected",
+        },
     }
