@@ -118,7 +118,7 @@ export function App() {
     </main>
     <Suspense fallback={null}>
       {sourceOpen && <SourceViewer sourceId={sourceId} open={sourceOpen} onOpenChange={setSourceOpen} />}
-      {importOpen && <ImportDialog open={importOpen} onOpenChange={setImportOpen} />}
+      {importOpen && <ImportDialog open={importOpen} onOpenChange={setImportOpen} onCompleted={() => { loadCity(city); loadWorkbookReviewCount(); loadReviewCount() }} />}
       {reviewOpen && <ReviewLinksDialog open={reviewOpen} onOpenChange={setReviewOpen} cities={data?.cities.map((item) => item.name) || []} onOpenSource={openSource} onChanged={() => { loadReviewCount(); loadCity(city) }} />}
       {workbookReviewOpen && <WorkbookReviewDialog open={workbookReviewOpen} onOpenChange={setWorkbookReviewOpen} cities={data?.cities.map((item) => item.name) || []} onOpenSource={openSource} onChanged={() => { loadWorkbookReviewCount(); loadReviewCount(); loadCity(city) }} />}
     </Suspense>

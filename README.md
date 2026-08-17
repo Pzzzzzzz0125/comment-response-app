@@ -994,6 +994,46 @@ npm run build
 
 ### Incremental ingestion
 
+#### Maintainer ingestion entrance
+
+See [`INGESTION_NOTE.md`](INGESTION_NOTE.md) for the maintainer runbook,
+storage map, post-ingestion verification checklist, and recovery guidance.
+
+The top-navigation **Import data** action is a guarded maintainer entrance over
+the existing incremental pipeline. A maintainer chooses one complete project
+folder in the browser and clicks **Upload and ingest** once. Original filenames
+and nested folders are preserved; supported PDF, Word, Excel, and CSV files are
+streamed individually so a large folder is not buffered as one request.
+
+That single action automatically performs the internal phases in order:
+
+1. commit the complete upload under the workspace `new/` staging area;
+2. reconcile file hashes, checkpoints, and already processed material;
+3. run high-recall prescan for relevant files, pages, sheets, and regions;
+4. run verified extraction, pairing and coverage checks;
+5. deduplicate canonical events and rebuild issue timelines; and
+6. refresh the source registry and search metadata.
+
+The dialog reports upload progress, current pipeline stage, recent log lines,
+and completion. Gemini processing may take several minutes and incur API cost,
+but unchanged hashes and completed stage checkpoints are reused.
+
+The entrance allows only one background task at a time. Its durable job state is
+stored in `phase2_dataset/ingestion_admin_jobs.json`; bounded task logs are stored
+under `phase2_dataset/ingestion_jobs/`. These runtime files are private dataset
+artifacts and are excluded from Git with the rest of `phase2_dataset/`.
+
+For safety, browser-triggered ingestion is enabled automatically only when the
+server binds to a loopback host (`127.0.0.1`, `localhost`, or `::1`). A remote
+binding requires `--enable-ingestion-admin`; use that flag only behind an
+authenticated, trusted maintenance network. The browser never submits arbitrary
+host filesystem paths. Upload manifests use validated relative paths, per-file
+and total-size limits, and a private temporary session; files are moved into
+project staging only after the complete manifest arrives. A configured Gemini
+key is required for the one-click workflow.
+
+The CLI remains available for automation and recovery:
+
 Inventory only, without Gemini:
 
 ```sh
