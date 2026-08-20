@@ -14,13 +14,13 @@ try:
     from .rag_search import SearchIndex
     from .server import readable_text
     from .data_trust import searchable_comment, verified_text
-    from .local_secrets import gemini_api_key
+    from .local_secrets import gemini_api_key, runtime_setting
 except ImportError:
     from gemini_enrich import GeminiClient, record_digest
     from rag_search import SearchIndex
     from server import readable_text
     from data_trust import searchable_comment, verified_text
-    from local_secrets import gemini_api_key
+    from local_secrets import gemini_api_key, runtime_setting
 
 
 def main() -> int:
@@ -30,7 +30,7 @@ def main() -> int:
     parser.add_argument("--categories", type=Path, default=workspace / "web_app" / "data" / "category_assignments.json")
     parser.add_argument("--enrichment", type=Path, default=workspace / "web_app" / "data" / "gemini_enrichment.json")
     parser.add_argument("--index", type=Path, default=workspace / "web_app" / "data" / "search_index.json")
-    parser.add_argument("--gemini-model", default=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"))
+    parser.add_argument("--gemini-model", default=runtime_setting("GEMINI_MODEL", "gemini-3.5-flash"))
     parser.add_argument("--metadata-only", action="store_true", help="Refresh records without calling the embedding API")
     args = parser.parse_args()
 

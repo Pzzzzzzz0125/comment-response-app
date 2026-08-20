@@ -30,6 +30,7 @@ if str(WORKSPACE_IMPORT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_IMPORT))
 
 from corpus_audit import audit_corpus as audit
+from web_app.platform_support import ghostscript_executable, tesseract_executable
 
 
 COMMENT_FIELDS = [
@@ -312,12 +313,12 @@ def extract_spreadsheet(
 
 
 def ocr_pdf_pages(path: Path, dpi: int = 220) -> list[str]:
-    ghostscript = shutil.which("gs")
-    tesseract = shutil.which("tesseract")
+    ghostscript = ghostscript_executable()
+    tesseract = tesseract_executable()
     if not ghostscript or not tesseract:
         missing = [name for name, command in (("gs", ghostscript), ("tesseract", tesseract)) if not command]
         raise RuntimeError("Targeted PDF OCR requires local command(s): " + ", ".join(missing))
-    with tempfile.TemporaryDirectory(prefix="permit-phase2-", dir="/private/tmp") as temporary:
+    with tempfile.TemporaryDirectory(prefix="permit-phase2-") as temporary:
         temp_dir = Path(temporary).resolve()
         output_pattern = temp_dir / "page-%04d.png"
         render = subprocess.run(

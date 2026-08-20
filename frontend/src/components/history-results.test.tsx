@@ -9,6 +9,18 @@ const filters: Filters = { property_project: "", discipline: "", review_round: "
 afterEach(cleanup)
 
 describe("HistoricalResults", () => {
+  it("matches meaningful terms in a natural-language keyword query", () => {
+    const treeComment = { ...commentFixture, comment_id: "tree-comment" }
+    const doorComment = { ...commentFixture, comment_id: "door-comment", display_text: "Revise the garage door opening.", original_text: "Revise the garage door opening.", category: "Door openings" }
+    render(<HistoricalResults city="San Jose" comments={[treeComment, doorComment]} loading={false} activeId={null} onActive={vi.fn()} filters={filters} onFilters={vi.fn()} relevance={new Map()} explanations={new Map()} onClearResultSet={vi.fn()} onOpenSource={vi.fn()} onCategoriesChanged={vi.fn()} />)
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search historical comments" }), { target: { value: "tree related" } })
+
+    expect(screen.getByText("Protect the existing street tree during construction.")).toBeInTheDocument()
+    expect(screen.queryByText("Revise the garage door opening.")).not.toBeInTheDocument()
+    expect(screen.queryByText("No keyword match")).not.toBeInTheDocument()
+  })
+
   it("merges identical same-date events and preserves every source link", () => {
     const first = { event_id: "event-1-file-a", event_type: "government_comment" as const, actor_role: "government" as const, actor: "Reviewer", occurred_at: "", occurred_at_label: "6/17/25 2:41 PM", time_label: "6/17/25", label: "Government comment", text: "Show the structural calculation.", review_round: "1", source: { source_id: "source-a", relation: "Primary source", filename: "file-a.xlsx" } }
     const second = { ...first, event_id: "event-1-file-b", source: { source_id: "source-b", relation: "Primary source", filename: "file-b.xlsx" } }

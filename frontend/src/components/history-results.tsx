@@ -21,6 +21,38 @@ const valueOrAll = (value: string) => value || "__all__"
 const fromSelect = (value: string) => value === "__all__" ? "" : value
 const threadKey = (comment: CommentRecord) => comment.issue_thread?.thread_id || comment.comment_id
 
+// The first search layer is deliberately lexical, but users often enter a
+// short natural-language phrase rather than one exact substring. Ignore only
+// generic query scaffolding and match every remaining term as a whole token.
+// Smart Search remains the fallback when the meaningful terms are absent.
+const SEARCH_SCAFFOLD = new Set([
+  "a", "about", "an", "and", "are", "as", "at", "be", "by", "comment", "comments",
+  "for", "from", "handled", "handling", "have", "historical", "history", "how", "in",
+  "is", "issue", "issues", "of", "on", "or", "permit", "permits", "record", "records",
+  "regarding", "related", "review", "reviews", "that", "the", "this", "to", "was", "we",
+  "were", "what", "which", "with",
+])
+
+function searchTokens(value: string) {
+  return (value.normalize("NFKD").toLocaleLowerCase().match(/[a-z0-9]+/g) || []).map((token) => {
+    if (token.length > 4 && token.endsWith("ies")) return `${token.slice(0, -3)}y`
+    if (token.length > 3 && token.endsWith("s") && !token.endsWith("ss")) return token.slice(0, -1)
+    return token
+  })
+}
+
+export function matchesHistoricalQuery(query: string, fields: Array<string | null | undefined>) {
+  const normalizedQuery = query.normalize("NFKD").toLocaleLowerCase().trim().replace(/\s+/g, " ")
+  if (!normalizedQuery) return true
+  const normalizedHaystack = fields.filter(Boolean).join(" ").normalize("NFKD").toLocaleLowerCase().replace(/\s+/g, " ")
+  if (normalizedHaystack.includes(normalizedQuery)) return true
+
+  const meaningfulTerms = searchTokens(query).filter((token) => !SEARCH_SCAFFOLD.has(token))
+  if (!meaningfulTerms.length) return false
+  const haystackTerms = new Set(searchTokens(normalizedHaystack))
+  return meaningfulTerms.every((term) => haystackTerms.has(term))
+}
+
 function representativeForThread(rows: CommentRecord[]) {
   return [...rows].sort((left, right) => {
     const responseDifference = Number(Boolean(right.response)) - Number(Boolean(left.response))
@@ -89,8 +121,7 @@ export function HistoricalResults({ city, comments, loading, activeId, onActive,
   const visible = useMemo(() => comments.filter((comment) => {
     if (smartIds && !smartIds.has(comment.comment_id)) return false
     if (query && !smartIds) {
-      const haystack = [comment.display_text, comment.property_project, comment.discipline, comment.source_filename, comment.category].join(" ").toLocaleLowerCase()
-      if (!haystack.includes(query.toLocaleLowerCase())) return false
+      if (!matchesHistoricalQuery(query, [comment.display_text, comment.original_text, comment.property_project, comment.discipline, comment.source_filename, comment.category])) return false
     }
     return Object.entries(filters).every(([key, value]) => key === "timeline" || !value || String(comment[key as keyof CommentRecord]) === value)
   }).sort((a, b) => {

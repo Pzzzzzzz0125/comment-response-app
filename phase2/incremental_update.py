@@ -49,7 +49,8 @@ from web_app.comment_hierarchy import (
 )
 from web_app.source_lineage import document_date as derive_document_date, mark_copied_source_documents
 from web_app.document_identity import canonicalize_documents, source_file_id
-from web_app.local_secrets import gemini_api_key
+from web_app.local_secrets import gemini_api_key, runtime_setting
+from web_app.platform_support import ghostscript_executable
 
 
 def rebuild_issue_event_index(comments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -774,10 +775,10 @@ def write_ingestion_report(
 
 
 def gs_text_pages(path: Path) -> list[str]:
-    ghostscript = __import__("shutil").which("gs")
+    ghostscript = ghostscript_executable()
     if not ghostscript:
-        raise RuntimeError("Incremental PDF extraction requires local Ghostscript (gs)")
-    with tempfile.TemporaryDirectory(prefix="permit-text-", dir="/private/tmp") as temporary:
+        raise RuntimeError("Incremental PDF extraction requires local Ghostscript")
+    with tempfile.TemporaryDirectory(prefix="permit-text-") as temporary:
         directory = Path(temporary).resolve()
         pattern = directory / "page-%04d.txt"
         result = subprocess.run(
@@ -4085,17 +4086,15 @@ def main() -> int:
     parser.add_argument("--oracle-dataset", type=Path, default=Path("phase2_dataset/dataset.json"))
     parser.add_argument(
         "--gemini-model",
-        default=os.environ.get(
+        default=runtime_setting(
             "INGESTION_GEMINI_MODEL",
-            os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"),
+            runtime_setting("GEMINI_MODEL", "gemini-3.6-flash"),
         ),
         help="Strong Gemini model used for document extraction and verification",
     )
     parser.add_argument(
         "--prescan-gemini-model",
-        default=os.environ.get(
-            "PRESCAN_GEMINI_MODEL", "gemini-3.1-flash-lite",
-        ),
+        default=runtime_setting("PRESCAN_GEMINI_MODEL", "gemini-3.1-flash-lite"),
         help="Lower-cost Gemini model used only for prescan and simple file classification",
     )
     parser.add_argument("--gemini-api-key-stdin", action="store_true", help="Read Gemini key from a hidden prompt")
@@ -4133,13 +4132,13 @@ def main() -> int:
     parser.add_argument(
         "--visual-batch-workers",
         type=int,
-        default=int(os.environ.get("VISUAL_BATCH_WORKERS", "2")),
+        default=int(runtime_setting("VISUAL_BATCH_WORKERS", "2")),
         help="Maximum independent Gemini page batches in flight (default: 2)",
     )
     parser.add_argument(
         "--folder-workers",
         type=int,
-        default=int(os.environ.get("FOLDER_INGESTION_WORKERS", "2")),
+        default=int(runtime_setting("FOLDER_INGESTION_WORKERS", "2")),
         help=(
             "Maximum source files processed concurrently inside one folder "
             "group (default: 2)"

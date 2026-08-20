@@ -22,12 +22,25 @@ LibreOffice is optional for ingestion. It is needed only when a DOC/DOCX PDF
 preview must be generated; native text extraction and evidence storage continue
 without it.
 
+PDF visual ingestion requires Ghostscript, and scanned PDFs require Tesseract
+OCR. On Windows the application recognizes `gswin64c.exe`, `tesseract.exe`,
+and `soffice.exe` in their standard installation folders. For custom install
+locations, copy `.env.example` to `.env.local` and set `GHOSTSCRIPT_PATH`,
+`TESSERACT_PATH`, or `LIBREOFFICE_PATH`. Temporary files use the operating
+system temp directory; `/private/tmp` is no longer assumed.
+
 ## One-click workflow
 
 1. Start the app locally:
 
    ```sh
    python3 web_app/server.py --host 127.0.0.1 --port 8010
+   ```
+
+   Windows PowerShell equivalent:
+
+   ```powershell
+   py -3 web_app/server.py --host 127.0.0.1 --port 8010
    ```
 
 2. Open `http://localhost:8010`.

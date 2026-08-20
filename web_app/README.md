@@ -141,15 +141,19 @@ The current evaluation results are provisional. A larger domain-reviewed gold da
 - `GET /api/conversations/{conversation_id}` returns the server-held conversation state.
 - `GET /api/result-sets/{result_set_id}/comments` hydrates an unexpired result set through the existing comment view model.
 
-Knowledge Chat responses may also include capability-checked `actions`. These
-are not free-form questions invented by the model: each action contains an
-allowlisted `type`, a short label, the current `result_set_id`, and optional
-parameters. The React client renders them as **Explore next** buttons and
-posts the selected action back as `guided_action`, preserving the prior result
-set while the backend performs the narrower lookup, project comparison,
-timeline analysis, response analysis, or unresolved-record filter. Actions are
-generated only when the verified result set contains the data needed to carry
-them out.
+Knowledge Chat first decides whether a message can be answered directly,
+should reuse the current validated evidence, or needs a new search. Obvious
+greetings and general permit concepts take an evidence-free conversational
+path. A dedicated Flash-Lite router handles ambiguous cases without receiving
+source-document text. Historical questions still pass through the existing
+verified retrieval and citation gates.
+
+Knowledge Chat responses may also include capability-checked `actions`. The
+answer model may suggest up to three evidence-specific **Explore next**
+questions. Each suggestion carries an allowlisted action, the current
+`result_set_id`, and an explicit decision to reuse current evidence or run a
+new search. The React client posts the action back as `guided_action`; the
+model never directly executes retrieval.
 
 Counts are calculated from unique parent comment IDs in backend code. Gemini cannot provide executable SQL, counts, record IDs, source IDs, or source locations. Semantic answers use only independently verified Direct and Related records; unverified fallback candidates are excluded. Confirmed-response summaries exclude suggested and otherwise unconfirmed response links.
 
@@ -173,7 +177,13 @@ matching, preserves raw comment text, supports verified grouped responses, and
 stores both XML and visible DOCX paragraph indices. Repeating the import creates
 no additional responses or links.
 
-Knowledge Chat routing and grounded answer summaries use `gemini-3.6-flash` by default through `KNOWLEDGE_GEMINI_MODEL` or `--knowledge-gemini-model`. It shares the server-side API key but uses a separate client from Smart Search, whose model remains controlled by `GEMINI_MODEL` or `--gemini-model`. Semantic retrieval inside a conversation continues to use the existing Smart Search client.
+Knowledge Chat uses `gemini-3.1-flash-lite` by default for the small
+direct/reuse/search routing decision through `KNOWLEDGE_ROUTER_MODEL` or
+`--knowledge-router-model`. Grounded answer synthesis and open-ended general
+answers use `gemini-3.6-flash` by default through `KNOWLEDGE_GEMINI_MODEL` or
+`--knowledge-gemini-model`. These server-side clients share the configured API
+key but remain separate from Smart Search, whose model is controlled by
+`GEMINI_MODEL` or `--gemini-model`.
 
 Source files remain available only through authorized in-app preview and spreadsheet endpoints. The public source model exposes no original-download action, and `/api/documents/{document_id}/original` is disabled.
 

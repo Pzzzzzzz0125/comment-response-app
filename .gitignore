@@ -15,6 +15,7 @@ corpus_audit_output/
 # Local permit-derived datasets and review decisions are not public artifacts.
 phase2_dataset/
 web_app/data/*.json
+web_app/data/retag_runs/
 phase2/review_decisions.csv
 corpus_audit/manual_overrides.csv
 
@@ -30,10 +31,12 @@ demo_data/previews/
 .env
 .env.*
 !.env.example
+PRIVATE_PROJECT_HANDOFF.md
 
 # React frontend dependencies and local build diagnostics.
 frontend/node_modules/
 frontend/coverage/
+frontend/dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts

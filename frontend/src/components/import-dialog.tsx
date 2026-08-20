@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { AlertTriangle, CheckCircle2, DatabaseZap, FolderOpen, Loader2, RefreshCw, UploadCloud } from "lucide-react"
-import { api } from "@/lib/api"
+import { api, apiUrl } from "@/lib/api"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -110,7 +110,7 @@ export function ImportDialog({ open, onOpenChange, onCompleted }: { open: boolea
   }
 
   async function uploadBinary(uploadId: string, fileId: string, file: File) {
-    const response = await fetch(`/api/ingestion/uploads/${uploadId}/files/${fileId}`, {
+    const response = await fetch(apiUrl(`/api/ingestion/uploads/${uploadId}/files/${fileId}`), {
       method: "PUT",
       headers: { "Content-Type": "application/octet-stream" },
       body: file,

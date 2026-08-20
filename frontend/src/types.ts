@@ -261,11 +261,11 @@ export type GuidedAction = {
 
 export type KnowledgeAnswer = {
   answer: string
-  answer_type?: "COUNT" | "FACT_LOOKUP" | "HISTORY_SUMMARY" | "HOW_HANDLED" | "COMPARISON" | "EXAMPLE_SEARCH" | "TIMELINE" | "PRACTICAL_LESSONS" | "FOLLOW_UP"
+  answer_type?: "COUNT" | "FACT_LOOKUP" | "HISTORY_SUMMARY" | "HOW_HANDLED" | "COMPARISON" | "EXAMPLE_SEARCH" | "TIMELINE" | "PRACTICAL_LESSONS" | "FOLLOW_UP" | "GENERAL_CONVERSATION"
   direct_answer?: string[]
   intent?: string
   conversation_id?: string
-  result_set_id?: string
+  result_set_id?: string | null
   answer_sections?: Record<string, string>
   key_patterns?: KnowledgePattern[]
   patterns?: KnowledgePattern[]
@@ -322,6 +322,7 @@ export type KnowledgeAnswer = {
   query_plan?: {
     raw_query?: string
     mode?: string
+    analytical_unit?: "canonical_event" | "issue_timeline" | "project_aggregate" | "city_aggregate" | "current_evidence" | "conversation" | string
     subject?: string
     intent?: string
     operations?: string[]
@@ -349,7 +350,7 @@ export type KnowledgeAnswer = {
     suggested_tags?: { event_id?: string; suggested_tag?: string; status?: string }[]
     fallback_reason?: string
   }
-  validation_status?: "validated" | "not_required" | "unverified" | "insufficient_comparison" | "no_validated_evidence"
+  validation_status?: "validated" | "not_required" | "not_applicable" | "unverified" | "insufficient_comparison" | "no_validated_evidence"
   validation_summary?: { relevant_comments: number; relevant_projects: number; excluded_off_topic: number }
   excluded_records?: { comment_id: string; project?: string; city?: string; record_topic?: string; exclude_reason?: string; supporting_excerpt?: string }[]
 }

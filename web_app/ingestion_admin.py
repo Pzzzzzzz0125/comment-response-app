@@ -20,6 +20,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
+try:
+    from .platform_support import (
+        ghostscript_executable, libreoffice_executable, tesseract_executable,
+    )
+except ImportError:
+    from platform_support import (
+        ghostscript_executable, libreoffice_executable, tesseract_executable,
+    )
+
 
 SUPPORTED_SUFFIXES = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv"}
 JOB_MODES = {"inventory", "prescan", "ingest"}
@@ -126,9 +135,9 @@ class IngestionAdmin:
 
     def _dependencies(self) -> dict[str, bool]:
         return {
-            "ghostscript": bool(shutil.which("gs")),
-            "tesseract": bool(shutil.which("tesseract")),
-            "libreoffice": bool(shutil.which("soffice")),
+            "ghostscript": bool(ghostscript_executable()),
+            "tesseract": bool(tesseract_executable()),
+            "libreoffice": bool(libreoffice_executable()),
             "gemini_key": bool(self.gemini_api_key or os.getenv("GEMINI_API_KEY")),
         }
 

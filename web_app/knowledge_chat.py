@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
+import threading
 import time
 from collections import Counter
+from pathlib import Path
 from typing import Any, Callable
 
 try:
@@ -38,10 +41,57 @@ def _project_label(row: dict[str, Any]) -> str:
     ).strip()
 
 
+def _normalized_project_phrase(value: Any) -> str:
+    """Normalize a user-visible project/address phrase for explicit matching.
+
+    This is deliberately narrower than semantic retrieval.  It is used only
+    to recognize that a follow-up names one of the projects already present
+    in the current validated result set.
+    """
+    text = str(value or "").casefold()
+    replacements = {
+        "avenue": "ave", "street": "st", "road": "rd", "drive": "dr",
+        "court": "ct", "boulevard": "blvd", "lane": "ln", "place": "pl",
+        "terrace": "ter", "highway": "hwy",
+    }
+    tokens = re.findall(r"[a-z0-9]+", text)
+    return " ".join(replacements.get(token, token) for token in tokens)
+
+
+def _project_aliases(row: dict[str, Any]) -> set[str]:
+    """Return conservative aliases for one already-retrieved project."""
+    aliases: set[str] = set()
+    for field in ("project_name", "site_name", "property_project", "project_id", "site_id"):
+        raw = str(row.get(field) or "").strip()
+        if not raw:
+            continue
+        candidates = [raw]
+        # ``property_project`` often appends a permit scope such as
+        # ``— Building``.  The address before that separator is what users
+        # naturally mention in a follow-up.
+        candidates.extend(re.split(r"\s+[—–|]\s+", raw, maxsplit=1)[:1])
+        for candidate in candidates:
+            normalized = _normalized_project_phrase(candidate)
+            if normalized and (any(char.isdigit() for char in normalized) or len(normalized.split()) >= 2):
+                aliases.add(normalized)
+    return aliases
+
+
+def _explicit_project_keys(message: str, rows: list[dict[str, Any]]) -> set[str]:
+    """Find projects explicitly named in a follow-up from the current rows."""
+    normalized_message = f" {_normalized_project_phrase(message)} "
+    matches: set[str] = set()
+    for row in rows:
+        if any(f" {alias} " in normalized_message for alias in _project_aliases(row)):
+            matches.add(_project_key(row))
+    return matches
+
+
 ALLOWED_INTENTS = {
     "precedent_search", "historical_response_summary", "aggregate_count",
-    "topic_summary", "compare_groups", "filter_previous_results",
-    "explain_selected_comment", "database_exploration", "unsupported_or_ambiguous",
+    "topic_summary", "timeline_analysis", "compare_groups", "filter_previous_results",
+    "explain_selected_comment", "database_exploration", "general_conversation",
+    "unsupported_or_ambiguous",
 }
 ALLOWED_OPERATIONS = {
     "smart_search", "keyword_search", "count_parent_comments", "count_searchable_units",
@@ -50,6 +100,11 @@ ALLOWED_OPERATIONS = {
     "load_previous_result_set", "load_filtered_comments", "group_by_project",
     "group_by_review_round", "group_by_response_status", "group_by_reviewer",
     "group_by_code_section", "group_by_comment_type",
+    "load_issue_timelines",
+}
+ALLOWED_ANALYTICAL_UNITS = {
+    "canonical_event", "issue_timeline", "project_aggregate", "city_aggregate",
+    "current_evidence", "conversation",
 }
 ALLOWED_FILTERS = {
     "city", "site_id", "project_id", "discipline", "review_round",
@@ -58,6 +113,7 @@ ALLOWED_FILTERS = {
 GUIDED_ACTION_TYPES = {
     "filter_subtopic", "compare_projects", "timeline_analysis",
     "response_analysis", "unresolved_analysis", "broaden_scope",
+    "model_followup",
 }
 GENERIC_QUERY_WORDS = {
     "a", "about", "all", "and", "are", "comment", "comments", "concern", "concerning",
@@ -175,6 +231,59 @@ class PlanValidationError(ValueError):
 
 def _clean_text(value: Any, limit: int = 500) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def _subject_identity(value: Any) -> str:
+    """Normalize a query subject only for safe result-set reuse checks."""
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+
+def _general_conversation_kind(message: str) -> str:
+    """Classify ordinary conversation that should never trigger retrieval.
+
+    Permit-history questions are deliberately recognized by explicit evidence
+    language (comments, responses, projects, rounds, and similar terms).  A
+    conceptual question such as ``What is a building permit?`` belongs to the
+    ordinary conversation path, while ``What did reviewers say about building
+    permits?`` remains an evidence query.
+    """
+    lower = re.sub(r"\s+", " ", str(message or "").casefold()).strip(" .!?\t\r\n")
+    if not lower:
+        return ""
+    if re.fullmatch(r"(?:hi|hello|hey|hiya|howdy)(?: there)?", lower) or re.match(
+        r"^(?:good morning|good afternoon|good evening)\b", lower
+    ):
+        return "greeting"
+    if re.fullmatch(r"(?:thanks|thank you|thank you very much|thx|got it|okay thanks|ok thanks)", lower):
+        return "courtesy"
+    if re.fullmatch(r"(?:bye|goodbye|see you|talk to you later)", lower):
+        return "farewell"
+    if re.search(
+        r"\b(?:what can you do|how can you help|who are you|what are you|how do i use (?:this|the) (?:app|chat)|help me use (?:this|the) (?:app|chat))\b",
+        lower,
+    ):
+        return "capabilities"
+
+    history_markers = re.search(
+        r"\b(?:comment|comments|response|responses|history|historical|record|records|"
+        r"reviewer|reviewers|applicant|applicants|project|projects|round|rounds|"
+        r"source|sources|citation|citations|precedent|precedents|dataset|database|"
+        r"handled|addressed|responded|confirmed|recurring|timeline|compare|comparison|"
+        r"count|summarize|summary)\b|\bhow many\b|\bhow (?:have|has|did) we\b",
+        lower,
+    )
+    conceptual_question = re.match(
+        r"^(?:what (?:is|are|does)|why (?:is|are|does|do)|how (?:does|do|can|should)|"
+        r"can you (?:explain|tell)|could you (?:explain|tell)|explain\b|tell me\b)",
+        lower,
+    )
+    if conceptual_question and not history_markers:
+        return "general_question"
+    if not history_markers and not _controlled_topic(lower) and (
+        message.strip().endswith("?") or re.match(r"^(?:tell me|write|help|can you|could you)\b", lower)
+    ):
+        return "general_question"
+    return ""
 
 
 def _complete_excerpt(value: Any, limit: int = 500) -> tuple[str, bool]:
@@ -299,6 +408,9 @@ def validate_query_plan(raw: Any) -> dict[str, Any]:
             "timeline_required",
         )
     } if isinstance(response_requirements, dict) else {}
+    analytical_unit = _clean_text(raw.get("analytical_unit"), 80)
+    if analytical_unit and analytical_unit not in ALLOWED_ANALYTICAL_UNITS:
+        raise PlanValidationError("Query plan contains an unsupported analytical unit")
     return {
         "intent": intent,
         "subject": _clean_text(raw.get("subject"), 500),
@@ -311,6 +423,7 @@ def validate_query_plan(raw: Any) -> dict[str, Any]:
         "objects": safe_objects,
         "response_requirements": safe_requirements,
         "scope": _safe_scope(raw.get("scope")),
+        "analytical_unit": analytical_unit,
     }
 
 
@@ -351,6 +464,7 @@ def enrich_query_plan(plan: dict[str, Any], message: str, has_previous: bool = F
         "timeline_required": intent in {"timeline", "timeline_analysis"},
     }
     mode_by_intent = {
+        "general_conversation": "GENERAL",
         "precedent_search": "LOOKUP",
         "aggregate_count": "COUNT",
         "topic_summary": "SUMMARY",
@@ -359,6 +473,48 @@ def enrich_query_plan(plan: dict[str, Any], message: str, has_previous: bool = F
         "timeline_analysis": "TIMELINE",
         "filter_previous_results": "FOLLOW_UP",
     }
+    unit_by_intent = {
+        "general_conversation": "conversation",
+        "precedent_search": "canonical_event",
+        "historical_response_summary": "canonical_event",
+        "topic_summary": "canonical_event",
+        "compare_groups": "project_aggregate",
+        "aggregate_count": "city_aggregate",
+        "timeline_analysis": "issue_timeline",
+        "filter_previous_results": "current_evidence",
+        "explain_selected_comment": "canonical_event",
+    }
+    # The backend intent contract, not a model-suggested unit, owns the data
+    # boundary.  A router may correctly identify a response-summary intent
+    # while loosely calling the subject an ``issue_timeline``; allowing that
+    # field to win would silently switch from canonical comments/responses to
+    # recurring histories.  Unknown intents may retain a valid suggested unit
+    # as a conservative fallback, but every supported intent is deterministic.
+    suggested_unit = str(value.get("analytical_unit") or "canonical_event")
+    analytical_unit = str(unit_by_intent.get(intent, suggested_unit))
+    operations = list(value.get("operations") or [])
+    # Data selection follows the analytical unit rather than the wording of
+    # one question. A standalone timeline question reads canonical issue
+    # histories; a guided follow-up intentionally keeps its current result
+    # set and only analyzes the histories represented there.
+    if analytical_unit == "issue_timeline" and "load_previous_result_set" not in operations:
+        operations = [
+            operation for operation in operations
+            if operation not in {"smart_search", "keyword_search", "load_filtered_comments"}
+        ]
+        operations = list(dict.fromkeys([
+            *operations, "load_issue_timelines", "group_by_review_round",
+        ]))
+    elif analytical_unit != "issue_timeline":
+        # Remove a contradictory model operation before retrieval dispatch.
+        # Historical handling/lookup questions must search canonical events;
+        # only an explicit timeline intent may enter the timeline service.
+        operations = [
+            operation for operation in operations
+            if operation != "load_issue_timelines"
+        ]
+        if intent in {"precedent_search", "historical_response_summary", "compare_groups"}:
+            operations = list(dict.fromkeys(["smart_search", *operations]))
     raw_scope = dict(scope or value.get("scope") or {})
     if "city" in raw_scope and "city_ids" not in raw_scope:
         raw_scope["city_ids"] = [raw_scope.pop("city")]
@@ -378,6 +534,8 @@ def enrich_query_plan(plan: dict[str, Any], message: str, has_previous: bool = F
         "response_requirements": requirements,
         "scope": _safe_scope(raw_scope),
         "mode": mode_by_intent.get(intent, "LOOKUP"),
+        "analytical_unit": analytical_unit,
+        "operations": operations,
         "has_previous_result_set": bool(has_previous),
     })
     return value
@@ -386,6 +544,16 @@ def enrich_query_plan(plan: dict[str, Any], message: str, has_previous: bool = F
 def fallback_query_plan(message: str, has_previous: bool) -> dict[str, Any]:
     """Conservative local router used only when Gemini routing is unavailable."""
     lower = message.casefold()
+    general_kind = _general_conversation_kind(message)
+    if general_kind:
+        return validate_query_plan({
+            "intent": "general_conversation",
+            "subject": general_kind,
+            "operations": [],
+            "filters": {},
+            "needs_clarification": False,
+            "clarification_question": "",
+        })
     # ``only`` inside a standalone question ("only state that they would") is
     # not a conversation reference.  Treat it as a follow-up only when the
     # wording actually points at an earlier result set or when a prior set is
@@ -399,10 +567,19 @@ def fallback_query_plan(message: str, has_previous: bool) -> dict[str, Any]:
     # not treated as a dangling follow-up when no prior result set exists.
     if has_previous and re.search(r"\b(?:those|these|them)\b", lower):
         followup_reference = True
+    round_dimension = bool(re.search(r"\b(?:review\s+)?(?:rounds?|cycles?|submissions?)\b", lower))
+    recurrence_dimension = bool(re.search(
+        r"\b(?:repeat(?:ed|ing)?|recur(?:red|ring)?|reissue(?:d)?|reappear(?:ed)?|"
+        r"continued?|persist(?:ed|ing)?|remain(?:ed|ing)?|unresolved)\b",
+        lower,
+    ))
+    timeline_dimension = bool(re.search(r"\b(?:timeline|progression|chronolog(?:y|ical)|history)\b", lower))
     if re.search(r"\b(?:explain|describe)\b.*\b(?:this|selected)\s+comment\b", lower):
         intent, operations = "explain_selected_comment", []
     elif followup_reference:
         intent, operations = "filter_previous_results", ["load_previous_result_set"]
+    elif timeline_dimension or (round_dimension and recurrence_dimension):
+        intent, operations = "timeline_analysis", ["load_issue_timelines", "group_by_review_round"]
     elif re.search(r"\bhow many\b|\bcount\b|\bnumber of\b", lower):
         intent = "aggregate_count"
         operations = ["keyword_search", "count_parent_comments", "count_projects", "count_review_rounds"]
@@ -459,6 +636,7 @@ def fallback_query_plan(message: str, has_previous: bool) -> dict[str, Any]:
         "subject": " ".join(subject_words) or _clean_text(message),
         "operations": operations,
         "filters": {},
+        "analytical_unit": "issue_timeline" if intent == "timeline_analysis" else "",
         "needs_clarification": bool((followup_reference and not has_previous) or ambiguous_response_question or ambiguous_timeline_question or ambiguous_comparison or ambiguous_topic_question),
         "clarification_question": (
             "I do not have a previous verified result set to filter. What topic should I search first?"
@@ -484,10 +662,15 @@ class KnowledgeChat:
         self.clock = clock
         self.result_sets: dict[str, dict[str, Any]] = {}
         self.conversations: dict[str, dict[str, Any]] = {}
+        data_root = Path(getattr(store, "categories_path", Path.cwd())).parent
+        self.state_path = data_root / "knowledge_chat_sessions.json"
+        self._state_lock = threading.RLock()
         self.remote_circuit_until = 0.0
+        self.router_circuit_until = 0.0
         self._tag_index: ValidatedTagIndex | None = None
         self._tag_index_signature: tuple[int, int] | None = None
         self._last_progressive_result: dict[str, Any] = {}
+        self._load_state()
 
     def _progressive_index(self) -> ValidatedTagIndex:
         """Build the tag projection only when the canonical row set changes."""
@@ -520,6 +703,149 @@ class KnowledgeChat:
         # repeating the same timeout/429.  Retrieval and deterministic answers
         # continue to work while the remote service recovers.
         self.remote_circuit_until = time.monotonic() + 60.0
+
+    def _router_client(self) -> Any | None:
+        """Return only the dedicated low-cost router client."""
+        if time.monotonic() < self.router_circuit_until:
+            return None
+        return getattr(self.store, "knowledge_router_client", None)
+
+    def _mark_router_failure(self) -> None:
+        # Router availability must not disable final synthesis or evidence
+        # validation.  Its circuit is deliberately independent.
+        self.router_circuit_until = time.monotonic() + 60.0
+
+    def _current_evidence_summary(self, previous: dict[str, Any] | None) -> dict[str, Any]:
+        """Describe current chat evidence without sending source text."""
+        if not previous:
+            return {"available": False}
+        comment_ids = [
+            str(item) for item in previous.get("comment_ids", [])
+            if str(item) in getattr(self.store, "_comments_by_id", {})
+        ]
+        rows = [self.store._comments_by_id[item] for item in comment_ids]
+        return {
+            "available": bool(comment_ids),
+            "validation_status": _clean_text(previous.get("validation_status"), 80),
+            "subject": _clean_text(previous.get("validated_subject"), 300),
+            "intent": _clean_text(previous.get("intent"), 80),
+            "comment_count": len(comment_ids),
+            "project_count": len({_project_key(row) for row in rows}),
+            "round_count": len({str(row.get("review_round", "")) for row in rows if row.get("review_round")}),
+        }
+
+    @staticmethod
+    def _requires_history_search(message: str) -> bool:
+        lower = str(message or "").casefold()
+        return bool(re.search(
+            r"\b(?:history|historical|comment|comments|response|responses|reviewer|reviewers|"
+            r"project|projects|round|rounds|source|sources|precedent|precedents|dataset|database|"
+            r"handled|addressed|responded|confirmed|recurring|timeline|compare|comparison|"
+            r"count|summarize|summary)\b|\bhow many\b|\bhow (?:have|has|did) we\b",
+            lower,
+        ))
+
+    @staticmethod
+    def _local_conversation_action(message: str, previous: dict[str, Any] | None) -> str:
+        """Conservative fallback when the Lite router is unavailable."""
+        lower = str(message or "").casefold()
+        asks_for_more = bool(re.search(
+            r"\b(?:other|another|broader|wider|elsewhere|new evidence|more projects?|all projects?)\b",
+            lower,
+        ))
+        contextual = bool(re.search(
+            r"\b(?:that|those|these|them|same|above|previous|earlier)\b|"
+            r"\bwhat (?:repeated|happened next)\b",
+            lower,
+        ))
+        if previous and contextual and not asks_for_more:
+            return "reuse_evidence"
+        if _general_conversation_kind(message):
+            return "direct"
+        return "search"
+
+    def _conversation_action(
+        self,
+        message: str,
+        previous: dict[str, Any] | None,
+        conversation_id: str,
+    ) -> tuple[dict[str, str], list[str]]:
+        """Route without exposing historical document text to the model."""
+        fallback_action = self._local_conversation_action(message, previous)
+        # Deterministic conversational cases are both safer and cheaper than
+        # spending a router request on greetings or obvious general concepts.
+        if fallback_action == "direct":
+            return {"action": "direct", "search_query": ""}, []
+        client = self._router_client()
+        if not client or not hasattr(client, "route_knowledge_message"):
+            return {"action": fallback_action, "search_query": ""}, []
+        conversation = self.conversations.get(conversation_id, {})
+        history = [
+            {
+                "role": str(item.get("role", "")),
+                "content": _clean_text(item.get("content"), 800),
+            }
+            for item in conversation.get("messages", [])[-4:]
+            if isinstance(item, dict) and item.get("role") in {"user", "assistant"}
+        ]
+        try:
+            routed = client.route_knowledge_message(
+                message,
+                history,
+                self._current_evidence_summary(previous),
+            )
+            action = _clean_text(routed.get("action"), 40)
+            if action not in {"direct", "reuse_evidence", "search"}:
+                raise ValueError("Gemini returned an unsupported conversation route")
+            if action == "reuse_evidence" and (
+                not previous
+                or _clean_text(previous.get("validation_status"), 80) not in {"validated", "not_required"}
+            ):
+                action = "search"
+            # A history-dependent question must never bypass the evidence
+            # lane merely because a weak router classified it as conversational.
+            if action == "direct" and self._requires_history_search(message):
+                action = "search"
+            return {
+                "action": action,
+                "search_query": _clean_text(routed.get("search_query"), 500),
+            }, []
+        except (RuntimeError, TypeError, ValueError, AttributeError):
+            self._mark_router_failure()
+            return {"action": fallback_action, "search_query": ""}, []
+
+    @staticmethod
+    def _reuse_plan(message: str, previous: dict[str, Any]) -> dict[str, Any]:
+        """Create an allowlisted plan scoped strictly to validated evidence."""
+        lower = str(message or "").casefold()
+        subject = (
+            _clean_text(previous.get("validated_subject"), 500)
+            or _clean_text(previous.get("query"), 500)
+            or "the current validated evidence"
+        )
+        local = fallback_query_plan(message, True)
+        if local.get("intent") == "filter_previous_results":
+            intent, operations = "filter_previous_results", ["load_previous_result_set"]
+        elif re.search(r"\b(?:compare|difference|differ|versus|vs)\b", lower):
+            intent, operations = "compare_groups", ["load_previous_result_set", "group_by_project"]
+        elif re.search(r"\b(?:timeline|repeated|repeat|review rounds?|what happened next|continued)\b", lower):
+            intent, operations = "timeline_analysis", ["load_previous_result_set", "group_by_review_round"]
+        elif re.search(r"\b(?:response|responded|handled|addressed|applicant|resolution)\b", lower):
+            intent, operations = "historical_response_summary", ["load_previous_result_set", "summarize_confirmed_responses"]
+        elif re.search(r"\b(?:unresolved|missing|without|still open)\b", lower):
+            intent, operations = "topic_summary", ["load_previous_result_set", "group_by_response_status"]
+        else:
+            intent, operations = "filter_previous_results", ["load_previous_result_set"]
+        plan = validate_query_plan({
+            "intent": intent,
+            "subject": subject,
+            "operations": operations,
+            "filters": {},
+            "needs_clarification": False,
+            "clarification_question": "",
+        })
+        plan["_reuse_current_evidence"] = True
+        return plan
 
     @staticmethod
     def _verification_failure_kind(exc: Exception) -> str:
@@ -650,12 +976,86 @@ class KnowledgeChat:
             raise RuntimeError("Gemini structured evidence verification returned incomplete coverage")
         return [valid[str(item.get("candidate_id", ""))] for item in batch]
 
+    def _load_state(self) -> None:
+        """Restore unexpired chat context after a local server restart.
+
+        Result sets contain IDs and filters, not source-document contents.  The
+        authoritative comments are always reloaded from the current dataset.
+        """
+        if not self.state_path.is_file():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return
+        now = self.clock()
+        known_comment_ids = set(getattr(self.store, "_comments_by_id", {}))
+        stored_results = payload.get("result_sets", {}) if isinstance(payload, dict) else {}
+        if isinstance(stored_results, dict):
+            for result_set_id, raw in stored_results.items():
+                if not isinstance(raw, dict) or float(raw.get("expires_at", 0) or 0) <= now:
+                    continue
+                result = dict(raw)
+                for key in ("comment_ids", "direct_comment_ids", "related_comment_ids"):
+                    values = result.get(key, [])
+                    result[key] = [
+                        str(item) for item in values
+                        if str(item) in known_comment_ids
+                    ] if isinstance(values, list) else []
+                classes = result.get("match_classes", {})
+                result["match_classes"] = {
+                    str(key): value for key, value in classes.items()
+                    if str(key) in known_comment_ids
+                } if isinstance(classes, dict) else {}
+                self.result_sets[str(result_set_id)] = result
+        stored_conversations = payload.get("conversations", {}) if isinstance(payload, dict) else {}
+        if isinstance(stored_conversations, dict):
+            self.conversations = {
+                str(key): value for key, value in stored_conversations.items()
+                if isinstance(value, dict)
+                and float(value.get("expires_at", now + self.ttl_seconds) or 0) > now
+            }
+
+    def _save_state(self) -> None:
+        """Atomically persist short-lived chat state without touching evidence."""
+        payload = {
+            "schema_version": 1,
+            "saved_at": self.clock(),
+            "result_sets": self.result_sets,
+            "conversations": self.conversations,
+        }
+        with self._state_lock:
+            try:
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.state_path.with_name(
+                    f".{self.state_path.name}.{secrets.token_hex(4)}.tmp"
+                )
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                temporary.replace(self.state_path)
+            except OSError:
+                # Chat remains usable in memory on read-only deployments.
+                return
+
     def _purge(self) -> None:
         now = self.clock()
+        previous_result_count = len(self.result_sets)
+        previous_conversation_count = len(self.conversations)
         self.result_sets = {
             key: value for key, value in self.result_sets.items()
             if float(value["expires_at"]) > now
         }
+        self.conversations = {
+            key: value for key, value in self.conversations.items()
+            if float(value.get("expires_at", now + self.ttl_seconds) or 0) > now
+        }
+        if (
+            len(self.result_sets) != previous_result_count
+            or len(self.conversations) != previous_conversation_count
+        ):
+            self._save_state()
 
     def _route(self, message: str, has_previous: bool) -> tuple[dict[str, Any], list[str]]:
         # Routing is deterministic for every question the local allowlist can
@@ -689,6 +1089,107 @@ class KnowledgeChat:
         else:
             warnings.append("Gemini query routing is unavailable; a conservative local intent router was used.")
         return enrich_query_plan(local_plan, message, has_previous), warnings
+
+    @staticmethod
+    def _local_general_answer(message: str, kind: str) -> str:
+        """Provide fast, useful conversation even without a remote model."""
+        if kind == "greeting":
+            return (
+                "Hi! I can help you explore permit-history comments, compare projects, "
+                "trace issues across review rounds, or answer general questions. What would you like to know?"
+            )
+        if kind == "courtesy":
+            return "You’re welcome! What would you like to look at next?"
+        if kind == "farewell":
+            return "Goodbye! Come back whenever you want to explore the permit history."
+        if kind == "capabilities":
+            return (
+                "I can search verified permit comments and responses, compare how projects handled an issue, "
+                "count recurring requirements, trace review-round history, and open the supporting source files. "
+                "I can also explain general permit concepts in plain language."
+            )
+        return (
+            "I can help with that, but the general conversation model is temporarily unavailable. "
+            "You can still ask me to search verified permit history, or try the general question again shortly."
+        )
+
+    def _general_conversation_response(
+        self,
+        message: str,
+        conversation_id: str,
+        plan: dict[str, Any],
+        warnings: list[str],
+    ) -> dict[str, Any]:
+        """Answer ordinary conversation without searching or citing the dataset."""
+        now = self.clock()
+        kind = _clean_text(plan.get("subject"), 80) or _general_conversation_kind(message)
+        conversation = self.conversations.setdefault(
+            conversation_id,
+            {"conversation_id": conversation_id, "messages": []},
+        )
+        history = [
+            {
+                "role": str(item.get("role", "")),
+                "content": _clean_text(item.get("content"), 1200),
+            }
+            for item in conversation.get("messages", [])[-6:]
+            if isinstance(item, dict) and item.get("role") in {"user", "assistant"}
+        ]
+        answer = self._local_general_answer(message, kind)
+        suggested_followups: list[str] = []
+        # Greetings, thanks, and capability questions have deterministic local
+        # answers.  This keeps them instant and avoids spending a model request
+        # on boilerplate.  Open-ended questions use Gemini when configured,
+        # but receive no permit records or source contents.
+        if kind == "general_question":
+            client = self._chat_client()
+            if client and hasattr(client, "answer_general_conversation"):
+                try:
+                    generated = client.answer_general_conversation(message, history)
+                    if isinstance(generated, dict):
+                        answer = _clean_text(generated.get("answer"), 4000) or answer
+                        raw_followups = generated.get("suggested_followups", [])
+                        if isinstance(raw_followups, list):
+                            suggested_followups = [
+                                _clean_text(item, 120) for item in raw_followups[:3]
+                                if _clean_text(item, 120)
+                            ]
+                except (RuntimeError, TypeError, ValueError, AttributeError) as exc:
+                    self._mark_remote_failure()
+                    warnings.append(f"General conversation model was unavailable: {exc}")
+
+        response = {
+            "conversation_id": conversation_id,
+            "answer": answer,
+            "answer_type": "GENERAL_CONVERSATION",
+            "direct_answer": [answer],
+            "answer_sections": {},
+            "intent": "general_conversation",
+            "result_set_id": None,
+            "metrics": {},
+            "coverage": {},
+            "citations": [],
+            "evidence": [],
+            "representative_evidence": [],
+            "patterns": [],
+            "differences": [],
+            "takeaway": None,
+            "limitations": [],
+            "retrieval": {"stage": 0, "coverage": {}},
+            "actions": [],
+            "suggested_followups": suggested_followups,
+            "warnings": warnings,
+            "query_plan": plan,
+            "validation_status": "not_applicable",
+            "needs_clarification": False,
+        }
+        conversation["messages"].extend([
+            {"role": "user", "content": message, "created_at": now},
+            {"role": "assistant", "content": answer, "created_at": now},
+        ])
+        conversation["expires_at"] = now + self.ttl_seconds
+        self._save_state()
+        return response
 
     def _record_matches_filters(self, row: dict[str, Any], filters: dict[str, str]) -> bool:
         # Chat is an evidence layer, not a QA view.  Explicitly quarantined,
@@ -785,6 +1286,67 @@ class KnowledgeChat:
             ignored.update(re.findall(r"[a-z0-9]+", city["name"].casefold()))
         subject_tokens = set(re.findall(r"[a-z0-9]+", plan["subject"].casefold()))
         return not (subject_tokens - ignored)
+
+    def _issue_timeline_ids(
+        self,
+        filters: dict[str, str],
+        plan: dict[str, Any],
+    ) -> tuple[list[str], dict[str, str], int]:
+        """Select recurring canonical issue histories inside the active scope.
+
+        The analytical unit controls this lookup.  Unlike a semantic top-N
+        search, it cannot discard one round before recurrence is calculated.
+        """
+        scope_rows = [
+            row for row in self.store._comments
+            if self._record_matches_filters(row, filters)
+        ]
+        try:
+            issues, _stats = self.store._recurring_issues(scope_rows)
+        except (AttributeError, TypeError, ValueError):
+            return [], {}, 0
+        topic = (
+            next(iter(plan.get("primary_topics") or []), "")
+            or topic_from_query(str(plan.get("subject") or ""))
+            or _controlled_topic(str(plan.get("subject") or ""))
+        )
+        rows_by_id = {
+            str(row.get("comment_id") or ""): row
+            for row in scope_rows
+            if row.get("comment_id")
+        }
+        selected: list[dict[str, Any]] = []
+        for issue in issues:
+            if int(issue.get("round_count") or 0) < 2:
+                continue
+            member_rows = [
+                rows_by_id[str(comment_id)]
+                for comment_id in issue.get("comment_ids", []) or []
+                if str(comment_id) in rows_by_id
+            ]
+            if not member_rows:
+                continue
+            if topic and not any(
+                self._candidate_matches_subject(topic, row)
+                for row in member_rows
+            ):
+                continue
+            selected.append(issue)
+        selected.sort(key=lambda issue: (
+            -int(issue.get("round_count") or 0),
+            -int(issue.get("history_event_count") or 0),
+            -int(issue.get("response_event_count") or 0),
+            str(issue.get("title") or "").casefold(),
+        ))
+        comment_ids: list[str] = []
+        for issue in selected:
+            comment_ids.extend(
+                str(comment_id)
+                for comment_id in issue.get("comment_ids", []) or []
+                if str(comment_id) in rows_by_id
+            )
+        unique_ids = list(dict.fromkeys(comment_ids))
+        return unique_ids, {comment_id: "direct" for comment_id in unique_ids}, len(selected)
 
     def _breakdowns(self, rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
         response_status = Counter()
@@ -1798,6 +2360,8 @@ class KnowledgeChat:
         if re.search(r"\b(?:what should (?:we|i) learn|lessons?|before submission|safer approach|what should (?:we|i) check)\b", lower):
             return "PRACTICAL_LESSONS"
         intent = str(plan.get("intent", ""))
+        if intent == "timeline_analysis":
+            return "TIMELINE"
         if intent == "aggregate_count":
             return "COUNT"
         if intent == "historical_response_summary":
@@ -1862,7 +2426,12 @@ class KnowledgeChat:
             "The response is preserved as project-specific evidence rather than treated as a recurring method.",
         )
 
-    def _structured_evidence(self, rows: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
+    def _structured_evidence(
+        self,
+        rows: list[dict[str, Any]],
+        limit: int = 5,
+        per_project_limit: int = 2,
+    ) -> list[dict[str, Any]]:
         """Return compact summaries with exact evidence hidden one click away."""
         evidence: list[dict[str, Any]] = []
         candidates: list[tuple[int, str, dict[str, Any], dict[str, Any] | None]] = []
@@ -1873,7 +2442,7 @@ class KnowledgeChat:
         candidates.sort(key=lambda item: (-item[0], item[1].casefold(), str(item[2].get("comment_id", ""))))
         project_counts: Counter[str] = Counter()
         for level, project, row, response in candidates:
-            if project_counts[project] >= 2:
+            if project_counts[project] >= per_project_limit:
                 continue
             view = self.store._view_comment(row)
             # Preserve the existing evidence boundary: only a confirmed
@@ -1961,6 +2530,7 @@ class KnowledgeChat:
                 "event_id": event_id,
                 "comment_id": str(row.get("comment_id") or ""),
                 "issue_id": str(row.get("canonical_issue_id") or row.get("issue_thread_id") or ""),
+                "issue_thread_id": str(row.get("issue_thread_id") or ""),
                 "project_id": project_id,
                 "claim": (
                     f"{project or row.get('city') or 'This project'} has a confirmed historical response for this issue."
@@ -1997,6 +2567,105 @@ class KnowledgeChat:
             if len(evidence) >= limit:
                 break
         return evidence
+
+    def _timeline_findings(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return only concrete issues that recur across multiple review rounds.
+
+        The recurring-issue index owns event deduplication and source-occurrence
+        merging.  Chat must not infer recurrence from a flat list of comments.
+        """
+        try:
+            issues, _stats = self.store._recurring_issues(rows)
+        except (AttributeError, TypeError, ValueError):
+            return [], []
+        visible = {str(row.get("comment_id") or ""): row for row in rows}
+        finding_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for issue in issues:
+            round_count = int(issue.get("round_count") or 0)
+            if round_count < 2:
+                continue
+            member_rows = [
+                visible[str(comment_id)]
+                for comment_id in issue.get("comment_ids", []) or []
+                if str(comment_id) in visible
+            ]
+            if not member_rows:
+                continue
+            representative = min(
+                member_rows,
+                key=lambda row: (
+                    str(row.get("review_round") or ""),
+                    str(row.get("comment_id") or ""),
+                ),
+            )
+            finding_rows.append(({
+                "issue_thread_id": str(issue.get("issue_thread_id") or ""),
+                "title": _clean_text(issue.get("title"), 220) or "Recurring review issue",
+                "project": _project_label(representative),
+                "first_round": str(issue.get("first_round") or "Unknown"),
+                "latest_round": str(issue.get("latest_round") or "Unknown"),
+                "round_count": round_count,
+                "comment_event_count": int(issue.get("comment_event_count") or 0),
+                "response_event_count": int(issue.get("response_event_count") or 0),
+                "history_event_count": int(issue.get("history_event_count") or 0),
+                "status": str(issue.get("status") or "unknown"),
+                "comment_ids": [str(value) for value in issue.get("comment_ids", []) or []],
+            }, representative))
+        finding_rows.sort(key=lambda pair: (
+            -int(pair[0].get("round_count") or 0),
+            -int(pair[0].get("history_event_count") or 0),
+            -int(pair[0].get("response_event_count") or 0),
+            str(pair[0].get("title") or "").casefold(),
+        ))
+        return (
+            [finding for finding, _row in finding_rows],
+            [row for _finding, row in finding_rows],
+        )
+
+    def _deterministic_timeline_answer(
+        self,
+        findings: list[dict[str, Any]],
+        evidence: list[dict[str, Any]],
+        citation_indexes: dict[str, int],
+    ) -> str:
+        if not findings:
+            return (
+                "I did not find a concrete issue in this result set that reappeared "
+                "across more than one review round. A single reviewer comment or an "
+                "ordinary comment-response pair is not counted as a recurring issue."
+            )
+        evidence_by_issue = {
+            str(item.get("issue_thread_id") or item.get("issue_id") or ""): item
+            for item in evidence
+            if item.get("issue_thread_id") or item.get("issue_id")
+        }
+        project_count = len({str(item.get("project") or "") for item in findings})
+        lead = (
+            f"I found **{len(findings)} concrete recurring "
+            f"{'issue' if len(findings) == 1 else 'issues'}** across "
+            f"**{project_count} {'project' if project_count == 1 else 'projects'}**. "
+            "These are canonical issue histories that reappeared in multiple review rounds, "
+            "not duplicate source-file occurrences."
+        )
+        statements: list[str] = []
+        for finding in findings[:5]:
+            item = evidence_by_issue.get(str(finding.get("issue_thread_id") or ""))
+            event_id = str((item or {}).get("event_id") or "")
+            first_round = str(finding.get("first_round") or "Unknown")
+            latest_round = str(finding.get("latest_round") or "Unknown")
+            text = (
+                f"At **{finding.get('project') or 'this project'}**, **{finding.get('title')}** "
+                f"continued from **{first_round} to {latest_round}** across "
+                f"**{finding.get('round_count')} review rounds**. The stored history contains "
+                f"{finding.get('comment_event_count')} reviewer/comment events and "
+                f"{finding.get('response_event_count')} applicant responses."
+            )
+            rendered = self._with_inline_citations(text, [event_id], citation_indexes)
+            statements.append(rendered or text)
+        return "\n\n".join((lead, *statements))
 
     @staticmethod
     def _with_inline_citations(
@@ -2079,7 +2748,7 @@ class KnowledgeChat:
             event_id for ids in pattern_groups.values() for event_id in ids
         ))
         intro = self._with_inline_citations(
-            f"Across the representative history, {subject} comments were handled through {approach}.",
+            f"In the records provided, the documented responses mainly used {approach}.",
             intro_ids,
             citation_indexes,
         )
@@ -2117,17 +2786,8 @@ class KnowledgeChat:
             if rendered:
                 examples.append(rendered)
         body = "\n\n".join(part for part in (intro, " ".join(examples)) if part)
-        takeaway_ids = [
-            str(item.get("event_id")) for item in with_responses
-            if int(item.get("evidence_level", 0) or 0) >= 3
-        ]
-        takeaway = self._with_inline_citations(
-            "The practical pattern is that responses were easiest to verify when they named the revised sheet, detail, plan, calculation, report, or completed design change rather than only acknowledging the comment.",
-            takeaway_ids,
-            citation_indexes,
-        ) if takeaway_ids and answer_type != "COUNT" else ""
         return "\n\n".join(
-            part for part in ((count_intro if answer_type == "COUNT" else ""), body, takeaway)
+            part for part in ((count_intro if answer_type == "COUNT" else ""), body)
             if part
         )
 
@@ -2182,17 +2842,30 @@ class KnowledgeChat:
         # history questions may also expose patterns, differences, and a
         # historical takeaway.
         analytical = True
-        broad_analysis = answer_type in {"HISTORY_SUMMARY", "HOW_HANDLED", "COMPARISON", "TIMELINE", "PRACTICAL_LESSONS"}
-        all_evidence = self._structured_evidence(rows, limit=12) if plan.get("_validation_status") in {"validated", "not_required"} else []
+        broad_analysis = answer_type in {"HISTORY_SUMMARY", "HOW_HANDLED", "COMPARISON", "PRACTICAL_LESSONS"}
+        timeline_findings: list[dict[str, Any]] = []
+        evidence_rows = rows
+        if answer_type == "TIMELINE":
+            timeline_findings, timeline_rows = self._timeline_findings(rows)
+            evidence_rows = timeline_rows or rows
+        all_evidence = self._structured_evidence(
+            evidence_rows,
+            limit=12,
+            per_project_limit=5 if answer_type == "TIMELINE" else 2,
+        ) if plan.get("_validation_status") in {"validated", "not_required"} else []
         representative_evidence = all_evidence[:5]
         citation_indexes = {
             str(item.get("event_id")): index
             for index, item in enumerate(representative_evidence, start=1)
             if item.get("event_id") and item.get("primary_source_occurrence_id")
         }
+        # A timeline already has its own authoritative analytical objects.
+        # Response-pattern cards describe canonical comments and would answer
+        # a different question, so they must not leak into timeline output.
         patterns = self._deterministic_patterns(rows) if broad_analysis else []
         differences: list[dict[str, Any]] = []
         takeaway: dict[str, str] | None = None
+        explore_more: list[dict[str, Any]] = []
         conversational_answer = str(natural_answer or "").strip()
 
         project_actions: dict[str, set[str]] = {}
@@ -2227,7 +2900,7 @@ class KnowledgeChat:
         # compact type prevents a model from dropping, changing, or repeating
         # the count while the deterministic evidence explanation still gives
         # the user context and cited examples.
-        if analytical and answer_type != "COUNT" and all_evidence and client and hasattr(client, "synthesize_knowledge_answer"):
+        if analytical and answer_type not in {"COUNT", "TIMELINE"} and all_evidence and client and hasattr(client, "synthesize_knowledge_answer"):
             synthesis_packet = [{
                 "citation_index": citation_indexes.get(str(item["event_id"])),
                 "event_id": item["event_id"],
@@ -2317,13 +2990,30 @@ class KnowledgeChat:
                     if not re.match(r"^(?:the history suggests|based on (?:these|the) (?:examples|records)|the records indicate|a safer approach)", generated_takeaway.casefold()):
                         generated_takeaway = f"The history suggests that {generated_takeaway[0].lower()}{generated_takeaway[1:]}"
                     takeaway = {"type": "historical_inference", "text": generated_takeaway}
+                for item in generated.get("explore_more", [])[:3]:
+                    if not isinstance(item, dict):
+                        continue
+                    label = _clean_text(item.get("label"), 120)
+                    query = _clean_text(item.get("query"), 300)
+                    if label and query:
+                        explore_more.append({
+                            "label": label,
+                            "query": query,
+                            "reuse_current_evidence": bool(item.get("reuse_current_evidence")),
+                        })
             except (RuntimeError, TypeError, ValueError, AttributeError):
                 self._mark_remote_failure()
 
         # A useful analytical answer needs a traceable example whenever
         # representative source evidence exists.  This also replaces the old
         # record-by-record fallback when Gemini is unavailable or incomplete.
-        if analytical and representative_evidence and (answer_type == "COUNT" or not re.search(r"\[\d+\]", conversational_answer)):
+        if answer_type == "TIMELINE":
+            conversational_answer = self._deterministic_timeline_answer(
+                timeline_findings,
+                representative_evidence,
+                citation_indexes,
+            )
+        elif analytical and representative_evidence and (answer_type == "COUNT" or not re.search(r"\[\d+\]", conversational_answer)):
             cited_fallback = self._deterministic_cited_answer(
                 answer_type,
                 str(plan.get("subject") or "the requested topic"),
@@ -2360,7 +3050,11 @@ class KnowledgeChat:
             "review_rounds": metrics.get("review_rounds", 0),
             "confirmed_responses": metrics.get("confirmed_responses", 0),
             "comment_count": metrics.get("parent_comments", 0),
-            "issue_count": metrics.get("canonical_issues", 0) or metrics.get("parent_comments", 0),
+            "issue_count": (
+                len(timeline_findings)
+                if answer_type == "TIMELINE"
+                else metrics.get("canonical_issues", 0) or metrics.get("parent_comments", 0)
+            ),
             "project_count": metrics.get("projects", 0),
             "round_count": metrics.get("review_rounds", 0),
             "confirmed_response_count": metrics.get("confirmed_responses", 0),
@@ -2379,7 +3073,9 @@ class KnowledgeChat:
             "coverage": coverage,
             "limitations": limitations,
             "suggested_followups": [],
+            "explore_more": explore_more,
             "uncertainty": limitations[0] if limitations else "",
+            "timeline_findings": timeline_findings,
         }
 
     def _guided_plan(self, action: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
@@ -2394,9 +3090,24 @@ class KnowledgeChat:
             raise PlanValidationError("Unsupported guided exploration action")
         parameters = action.get("parameters") if isinstance(action.get("parameters"), dict) else {}
         topic = _clean_text(parameters.get("topic"), 300)
+        followup_query = _clean_text(parameters.get("query"), 500)
         previous_query = _clean_text((previous or {}).get("query"), 500)
-        subject = topic or previous_query or "the selected result set"
-        if action_type == "filter_subtopic":
+        previous_subject = _clean_text((previous or {}).get("validated_subject"), 500)
+        subject = topic or previous_subject or previous_query or "the selected result set"
+        if action_type == "model_followup":
+            if not previous:
+                intent, operations = "unsupported_or_ambiguous", []
+            elif bool(parameters.get("reuse_current_evidence")):
+                return self._reuse_plan(followup_query or previous_query, previous)
+            else:
+                routed = fallback_query_plan(followup_query or previous_query, False)
+                routed["subject"] = followup_query or routed.get("subject")
+                routed["operations"] = [
+                    operation for operation in routed.get("operations", [])
+                    if operation != "load_previous_result_set"
+                ] or ["smart_search"]
+                return validate_query_plan(routed)
+        elif action_type == "filter_subtopic":
             intent, operations = "filter_previous_results", ["load_previous_result_set"]
         elif action_type == "broaden_scope":
             # The city filter is inherited below from the prior result set.
@@ -2405,7 +3116,7 @@ class KnowledgeChat:
         elif action_type == "compare_projects":
             intent, operations = "compare_groups", ["load_previous_result_set", "group_by_project"]
         elif action_type == "timeline_analysis":
-            intent, operations = "topic_summary", ["load_previous_result_set", "group_by_review_round"]
+            intent, operations = "timeline_analysis", ["load_previous_result_set", "group_by_review_round"]
         elif action_type == "response_analysis":
             intent, operations = "historical_response_summary", ["load_previous_result_set", "summarize_confirmed_responses"]
         elif action_type == "unresolved_analysis":
@@ -2456,7 +3167,7 @@ class KnowledgeChat:
         # out timeline, response, and unresolved analysis.
         if metrics.get("projects", 0) >= 2:
             add("compare_projects", "Compare these issues across projects")
-        if metrics.get("review_rounds", 0) >= 2:
+        if plan.get("intent") != "timeline_analysis" and metrics.get("review_rounds", 0) >= 2:
             add("timeline_analysis", "See what repeated across review rounds")
         if metrics.get("confirmed_responses", 0) > 0:
             add("response_analysis", "Compare how applicants responded")
@@ -2467,12 +3178,16 @@ class KnowledgeChat:
         # common-topic helper already operates on canonical issue occurrences,
         # so these suggestions do not reintroduce physical-file duplicates.
         try:
-            _, topics = self.store._common_topics(rows, limit=3)
+            _, topics = self.store._common_topics_by_aspect(rows, limit=3)
         except (AttributeError, TypeError, ValueError):
             topics = []
         for topic in topics:
             label = _clean_text(topic.get("label"), 120)
-            if len(label) >= 8 and label.casefold() not in {"a", "comment", "comments", "additional design requirements"}:
+            if (
+                3 <= len(label) <= 60
+                and len(label.split()) <= 9
+                and label.casefold() not in {"a", "comment", "comments", "additional design requirements"}
+            ):
                 add("filter_subtopic", f"Explore: {label}", {"topic": label})
         return actions
 
@@ -2491,16 +3206,56 @@ class KnowledgeChat:
             if action_result_id:
                 previous_id = action_result_id
         previous = self.result_sets.get(previous_id) if previous_id else None
-        if previous_id and not previous:
-            raise KeyError("Previous result set was not found or has expired")
+        previous_context_expired = bool(previous_id and not previous)
         if guided_action:
             plan, warnings = self._guided_plan(guided_action, previous), []
         else:
-            plan, warnings = self._route(message, bool(previous))
+            conversation_route, warnings = self._conversation_action(
+                message,
+                previous,
+                conversation_id,
+            )
+            if conversation_route["action"] == "direct":
+                plan = validate_query_plan({
+                    "intent": "general_conversation",
+                    "subject": _general_conversation_kind(message) or "general_question",
+                    "operations": [],
+                    "filters": {},
+                    "needs_clarification": False,
+                    "clarification_question": "",
+                })
+            elif conversation_route["action"] == "reuse_evidence" and previous:
+                plan = self._reuse_plan(message, previous)
+            else:
+                routing_query = conversation_route.get("search_query") or message
+                plan, route_warnings = self._route(routing_query, bool(previous))
+                warnings.extend(route_warnings)
+                if routing_query != message:
+                    plan["_routing_search_query"] = routing_query
+        if previous_context_expired:
+            warnings.insert(
+                0,
+                "The earlier result context expired, so this question was handled without stale context.",
+            )
+        # Ordinary conversation is a separate, evidence-free lane.  Return
+        # before inheriting filters or touching the permit dataset so a
+        # greeting/general question cannot accidentally reuse an earlier
+        # search result or receive a misleading no-evidence answer.
+        if plan.get("intent") == "general_conversation":
+            return self._general_conversation_response(
+                message,
+                conversation_id,
+                plan,
+                warnings,
+            )
         # Keep a model paraphrase only if it remains anchored to the words in
         # the user's question.  This prevents a stale or hallucinated router
         # subject from sending retrieval toward an unrelated discipline.
-        if not guided_action and plan.get("intent") != "explain_selected_comment":
+        if (
+            not guided_action
+            and not plan.get("_reuse_current_evidence")
+            and plan.get("intent") != "explain_selected_comment"
+        ):
             plan["subject"] = self._local_subject(message, plan.get("subject", ""))
         # Questions asking how an issue was handled require comment-response
         # histories, not a corpus-wide topic breakdown.  Keep this intent
@@ -2516,7 +3271,11 @@ class KnowledgeChat:
             r"\b(how (?:have|has|did) we|how was|how were|handled|addressed|responded|confirmed responses?)\b",
             lower_message,
         ))
-        if asks_for_handling and plan["intent"] not in {"explain_selected_comment", "filter_previous_results", "aggregate_count"}:
+        if (
+            asks_for_handling
+            and not plan.get("_reuse_current_evidence")
+            and plan["intent"] not in {"explain_selected_comment", "filter_previous_results", "aggregate_count"}
+        ):
             plan["intent"] = "historical_response_summary"
             plan["operations"] = ["smart_search", "summarize_confirmed_responses"]
         if (
@@ -2549,7 +3308,13 @@ class KnowledgeChat:
             }
             inherited.update(filters)
             filters = inherited
+        reuse_current_evidence = bool(plan.get("_reuse_current_evidence"))
+        routing_search_query = _clean_text(plan.get("_routing_search_query"), 500)
         plan = enrich_query_plan(plan, message, bool(previous), filters)
+        if reuse_current_evidence:
+            plan["_reuse_current_evidence"] = True
+        if routing_search_query:
+            plan["_routing_search_query"] = routing_search_query
         plan["filters"] = filters
 
         missing_selected = plan["intent"] == "explain_selected_comment" and selected_comment_id not in self.store._comments_by_id
@@ -2570,6 +3335,25 @@ class KnowledgeChat:
             comment_ids = list(previous["comment_ids"])
             classes = dict(previous["match_classes"])
             lower = message.casefold()
+            # A contextual follow-up may reuse the validated evidence while
+            # explicitly narrowing it to one project, e.g. "explore more on
+            # the 701 S Clover Ave one".  Reuse is not permission to carry
+            # every project from the earlier answer into the new answer.
+            prior_rows = [
+                self.store._comments_by_id[item]
+                for item in comment_ids
+                if item in self.store._comments_by_id
+            ]
+            focused_project_keys = _explicit_project_keys(message, prior_rows)
+            if focused_project_keys:
+                comment_ids = [
+                    item for item in comment_ids
+                    if item in self.store._comments_by_id
+                    and _project_key(self.store._comments_by_id[item]) in focused_project_keys
+                ]
+                plan["_focused_project_keys"] = sorted(focused_project_keys)
+                if len(focused_project_keys) == 1:
+                    filters["project_id"] = next(iter(focused_project_keys))
             action_type = _clean_text(guided_action.get("type"), 80) if guided_action else ""
             action_parameters = guided_action.get("parameters") if guided_action and isinstance(guided_action.get("parameters"), dict) else {}
             if action_type == "filter_subtopic":
@@ -2584,6 +3368,9 @@ class KnowledgeChat:
             elif "confirmed response" in lower or "how did we respond" in lower:
                 filters["response_status"] = "confirmed"
             comment_ids = [item for item in comment_ids if self._record_matches_filters(self.store._comments_by_id[item], filters)]
+        elif "load_issue_timelines" in plan["operations"]:
+            comment_ids, classes, recurring_issue_count = self._issue_timeline_ids(filters, plan)
+            plan["_recurring_issue_count"] = recurring_issue_count
         elif self._scope_overview(message, plan):
             plan["operations"] = list(dict.fromkeys([
                 operation for operation in plan["operations"] if operation != "smart_search"
@@ -2625,18 +3412,48 @@ class KnowledgeChat:
         excluded_records: list[dict[str, Any]] = []
         validation_warnings: list[str] = []
         validation_status = "not_required"
+        action_type = _clean_text(guided_action.get("type"), 80) if guided_action else ""
+        previous_validation_status = _clean_text((previous or {}).get("validation_status"), 80)
+        previous_validated_subject = _clean_text((previous or {}).get("validated_subject"), 500)
+        current_subject = _clean_text(plan.get("subject") or message, 500)
+        can_inherit_validation = bool(
+            (
+                plan.get("_reuse_current_evidence")
+                or (
+                    guided_action
+                    and action_type in {
+                        "compare_projects", "timeline_analysis", "response_analysis", "unresolved_analysis",
+                    }
+                )
+            )
+            and previous_validation_status in {"validated", "not_required"}
+            and previous_validated_subject
+            and _subject_identity(previous_validated_subject) == _subject_identity(current_subject)
+        )
+        if can_inherit_validation:
+            validation_status = previous_validation_status
         # Topic validation is deliberately applied before metrics, citations,
         # summaries, and result-set creation.  This prevents an off-topic
         # retrieval from becoming authoritative merely because it has a
         # confirmed response.
         topic_validation_required = (
-            plan["intent"] in {"precedent_search", "historical_response_summary", "topic_summary", "compare_groups", "aggregate_count"}
+            (
+                plan["intent"] in {
+                    "precedent_search", "historical_response_summary", "topic_summary",
+                    "timeline_analysis", "compare_groups", "aggregate_count",
+                }
+                or action_type == "filter_subtopic"
+            )
             and (
                 "smart_search" in plan["operations"]
                 or plan["intent"] == "compare_groups"
+                or action_type == "filter_subtopic"
+                or action_type in {
+                    "timeline_analysis", "response_analysis", "unresolved_analysis",
+                }
                 or (plan["intent"] == "aggregate_count" and bool(_controlled_topic(plan["subject"] or message)))
             )
-            and not (guided_action and _clean_text(guided_action.get("type"), 80) != "broaden_scope")
+            and not can_inherit_validation
         )
         rows = raw_rows
         if topic_validation_required and rows:
@@ -2681,11 +3498,16 @@ class KnowledgeChat:
             "comment_ids": comment_ids, "direct_comment_ids": direct_ids,
             "related_comment_ids": related_ids, "match_classes": classes,
             "canonical_issue_ids": sorted({str(row.get("canonical_issue_id")) for row in rows if row.get("canonical_issue_id")}),
+            "validation_status": validation_status,
+            "validated_subject": current_subject,
             "created_at": now, "expires_at": now + self.ttl_seconds,
         }
-        if guided_action:
+        if guided_action or plan.get("_reuse_current_evidence"):
             result_set["parent_result_set_id"] = previous_id or None
-            result_set["guided_action"] = _clean_text(guided_action.get("type"), 80)
+            result_set["guided_action"] = (
+                _clean_text(guided_action.get("type"), 80)
+                if guided_action else "reuse_evidence"
+            )
         self.result_sets[result_set_id] = result_set
         if validation_status in {"insufficient_comparison", "no_validated_evidence"}:
             plan["evidence_scope"] = "validated_insufficient"
@@ -2723,8 +3545,11 @@ class KnowledgeChat:
                 "source_occurrence_ids": list(item.get("source_occurrence_ids") or [primary_source_id]),
                 "label": f"{item.get('project') or item.get('city') or 'Historical evidence'} · {item.get('evidence_badge') or 'Source evidence'}",
             })
+        recurring_issue_count = int((structured.get("coverage") or {}).get("issue_count") or 0)
         action_label = (
-            f"View {metrics['parent_comments']} validated comment{'s' if metrics['parent_comments'] != 1 else ''}"
+            f"View {recurring_issue_count} recurring issue{'s' if recurring_issue_count != 1 else ''}"
+            if structured.get("answer_type") == "TIMELINE" and recurring_issue_count
+            else f"View {metrics['parent_comments']} validated comment{'s' if metrics['parent_comments'] != 1 else ''}"
             if validation_status in {"validated", "not_required"}
             else f"View {candidate_metrics['parent_comments']} screened candidate{'s' if candidate_metrics['parent_comments'] != 1 else ''}"
         )
@@ -2756,7 +3581,27 @@ class KnowledgeChat:
             "warnings": warnings, "query_plan": plan, "needs_clarification": False,
         }
         if validation_status in {"validated", "not_required"}:
-            response["actions"] = response["actions"] + self._guided_actions(result_set_id, plan, metrics, rows, validation_status)
+            generated_actions: list[dict[str, Any]] = []
+            for item in structured.get("explore_more", [])[:3]:
+                label = _clean_text(item.get("label"), 120)
+                query = _clean_text(item.get("query"), 300)
+                if not label or not query:
+                    continue
+                generated_actions.append({
+                    "type": "model_followup",
+                    "label": label,
+                    "result_set_id": result_set_id,
+                    "parameters": {
+                        "result_set_id": result_set_id,
+                        "query": query,
+                        "reuse_current_evidence": bool(item.get("reuse_current_evidence")),
+                    },
+                })
+            response["actions"] = response["actions"] + (
+                generated_actions
+                if generated_actions
+                else self._guided_actions(result_set_id, plan, metrics, rows, validation_status)
+            )
         # An explicit wider search inspects every verified canonical event in
         # this answer's city. It does not expand to other cities.
         if int(response["retrieval"].get("stage") or 0) != 3:
@@ -2779,6 +3624,8 @@ class KnowledgeChat:
         conversation["current_result_set_id"] = result_set_id
         conversation["filters"] = filters
         conversation["selected_comment_id"] = selected_comment_id or None
+        conversation["expires_at"] = now + self.ttl_seconds
+        self._save_state()
         return response
 
     def conversation(self, conversation_id: str) -> dict[str, Any]:

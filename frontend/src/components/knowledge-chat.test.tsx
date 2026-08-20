@@ -52,6 +52,73 @@ function knowledgePayload(overrides: Record<string, unknown> = {}) {
 }
 
 describe("KnowledgeChat", () => {
+  it("renders ordinary conversation without permit-evidence warnings or diagnostics", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      answer: "Hi! I can answer general questions or help you explore verified permit history.",
+      answer_type: "GENERAL_CONVERSATION",
+      intent: "general_conversation",
+      conversation_id: "conversation-general",
+      result_set_id: null,
+      validation_status: "not_applicable",
+      metrics: {}, coverage: {}, citations: [], evidence: [], representative_evidence: [],
+      retrieval: { stage: 0, coverage: {} }, actions: [], suggested_followups: [],
+    }), { status: 200, headers: { "Content-Type": "application/json" } })))
+    render(<KnowledgeChat city="San Jose" filters={{}} onOpenSource={vi.fn()} onOpenResults={vi.fn()} />)
+
+    const textbox = screen.getByRole("textbox", { name: "Ask Permit History" })
+    fireEvent.change(textbox, { target: { value: "Hello" } })
+    fireEvent.submit(textbox.closest("form")!)
+
+    expect(await screen.findByText(/I can answer general questions/)).toBeInTheDocument()
+    expect(screen.queryByText("No validated evidence")).not.toBeInTheDocument()
+    expect(screen.queryByText("Retrieval diagnostics")).not.toBeInTheDocument()
+    expect(screen.queryByText("Supporting sources")).not.toBeInTheDocument()
+  })
+
+  it("starts a fresh city search from a general-conversation suggestion", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(knowledgePayload({
+        answer: "An earlier evidence answer.[1]",
+        conversation_id: "conversation-scope",
+        result_set_id: "results-old",
+      })), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        answer: "Hi! What would you like to explore?",
+        answer_type: "GENERAL_CONVERSATION",
+        intent: "general_conversation",
+        conversation_id: "conversation-scope",
+        result_set_id: null,
+        validation_status: "not_applicable",
+        metrics: {}, coverage: {}, citations: [], evidence: [], representative_evidence: [],
+        retrieval: { stage: 0, coverage: {} }, actions: [],
+        suggested_followups: ["How have we handled tree-related comments?"],
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(knowledgePayload({
+        answer: "Tree comments were handled through plan revisions.[1]",
+        conversation_id: "conversation-scope",
+        result_set_id: "results-tree",
+      })), { status: 200, headers: { "Content-Type": "application/json" } }))
+    vi.stubGlobal("fetch", fetchMock)
+    render(<KnowledgeChat city="San Jose" filters={{}} onOpenSource={vi.fn()} onOpenResults={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "How have we handled tree-protection comments?" }))
+    await screen.findByText(/earlier evidence answer/i)
+
+    const textbox = screen.getByRole("textbox", { name: "Ask Permit History" })
+    fireEvent.change(textbox, { target: { value: "Hi" } })
+    fireEvent.submit(textbox.closest("form")!)
+    await screen.findByText(/What would you like to explore/)
+
+    fireEvent.click(screen.getByRole("button", { name: "How have we handled tree-related comments?" }))
+    await screen.findByText(/Tree comments were handled/)
+
+    const request = fetchMock.mock.calls[2][1] as RequestInit
+    const body = JSON.parse(String(request.body))
+    expect(body.city_id).toBe("San Jose")
+    expect(body).not.toHaveProperty("previous_result_set_id")
+    expect(body.guided_action).toBeUndefined()
+  })
+
   it("leads with a coherent answer and reveals evidence/diagnostics on demand", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
       answer: "Across the validated records, applicants documented tree-protection measures on the plans.[1]",
@@ -147,6 +214,17 @@ describe("KnowledgeChat", () => {
     expect(screen.getByText("Setback dimension correction")).toBeInTheDocument()
   })
 
+  it("treats not-required validation as grounded when backend evidence is authoritative", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(knowledgePayload({
+      validation_status: "not_required",
+    })), { status: 200, headers: { "Content-Type": "application/json" } })))
+    render(<KnowledgeChat city="San Jose" filters={{}} onOpenSource={vi.fn()} onOpenResults={vi.fn()} />)
+    fireEvent.click(screen.getByRole("button", { name: "How have we handled tree-protection comments?" }))
+    expect(await screen.findByText(/applicant documented the requested correction/i)).toBeInTheDocument()
+    expect(screen.queryByText("No validated evidence")).not.toBeInTheDocument()
+    expect(screen.getByText("Supporting sources")).toBeInTheDocument()
+  })
+
   it("turns an evidence-aware explore-next action into a contextual chat turn", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -178,6 +256,50 @@ describe("KnowledgeChat", () => {
     expect(body.guided_action.type).toBe("timeline_analysis")
     expect(body.guided_action.result_set_id).toBe("results-2")
     expect(body.previous_result_set_id).toBe("results-2")
+  })
+
+  it("submits a model follow-up with its evidence-aware query and reuse decision", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        answer: "Tree comments were handled through plan revisions.[1]",
+        intent: "historical_response_summary",
+        conversation_id: "conversation-model-followup",
+        result_set_id: "results-tree",
+        metrics: { parent_comments: 2, projects: 1, review_rounds: 2, confirmed_responses: 2, missing_responses: 0 },
+        actions: [{
+          type: "model_followup",
+          label: "Why did this issue continue?",
+          result_set_id: "results-tree",
+          parameters: {
+            result_set_id: "results-tree",
+            query: "Why did the tree-protection issue continue across rounds?",
+            reuse_current_evidence: true,
+          },
+        }],
+        query_plan: { evidence_scope: "verified" },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        answer: "The reviewer reissued the requirement after the first response.",
+        intent: "timeline_analysis",
+        conversation_id: "conversation-model-followup",
+        result_set_id: "results-tree-followup",
+        metrics: { parent_comments: 2, projects: 1, review_rounds: 2, confirmed_responses: 2, missing_responses: 0 },
+        actions: [],
+        query_plan: { evidence_scope: "verified" },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+    vi.stubGlobal("fetch", fetchMock)
+    render(<KnowledgeChat city="San Jose" filters={{}} onOpenSource={vi.fn()} onOpenResults={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "How have we handled tree-protection comments?" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Why did this issue continue?" }))
+    await screen.findByText("The reviewer reissued the requirement after the first response.")
+
+    const request = fetchMock.mock.calls[1][1] as RequestInit
+    const body = JSON.parse(String(request.body))
+    expect(body.message).toBe("Why did the tree-protection issue continue across rounds?")
+    expect(body.previous_result_set_id).toBe("results-tree")
+    expect(body.guided_action.type).toBe("model_followup")
+    expect(body.guided_action.parameters.reuse_current_evidence).toBe(true)
   })
 
   it("can explicitly broaden only the current city's history and warns that it may take longer", async () => {
@@ -293,5 +415,28 @@ describe("KnowledgeChat", () => {
     expect(openSource).toHaveBeenCalledWith("source-response")
     fireEvent.click(screen.getByRole("button", { name: "Back to answer" }))
     expect(screen.getByText(/applicant documented the requested correction/i)).toBeInTheDocument()
+  })
+
+  it("hands fullscreen focus to the source viewer and restores the same evidence workspace", async () => {
+    setDesktopWorkspace(true)
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(knowledgePayload()), { status: 200, headers: { "Content-Type": "application/json" } })))
+    const openSource = vi.fn()
+    const view = render(<KnowledgeChat city="San Jose" filters={{}} onOpenSource={openSource} onOpenResults={vi.fn()} sourceViewerOpen={false} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "How have we handled tree-protection comments?" }))
+    await screen.findByRole("link", { name: "[1]" })
+    fireEvent.click(screen.getByRole("button", { name: "Expand AI workspace" }))
+    fireEvent.click(screen.getByRole("link", { name: "[1]" }))
+    expect(await screen.findByRole("button", { name: "Open original source" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Open original source" }))
+    expect(openSource).toHaveBeenCalledWith("source-response")
+
+    view.rerender(<KnowledgeChat city="San Jose" filters={{}} onOpenSource={openSource} onOpenResults={vi.fn()} sourceViewerOpen />)
+    expect(screen.queryByRole("dialog", { name: "Permit History AI research workspace" })).not.toBeInTheDocument()
+
+    view.rerender(<KnowledgeChat city="San Jose" filters={{}} onOpenSource={openSource} onOpenResults={vi.fn()} sourceViewerOpen={false} />)
+    expect(screen.getByRole("dialog", { name: "Permit History AI research workspace" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Close evidence panel" })).toBeInTheDocument()
+    expect(screen.getByText("Evidence 1 of 1")).toBeInTheDocument()
   })
 })

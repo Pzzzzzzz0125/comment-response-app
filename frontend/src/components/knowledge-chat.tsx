@@ -159,12 +159,17 @@ function AnswerMessage({ messageId, payload, expanded, selectedEvidenceId, onOpe
 }) {
   const metrics = payload.metrics || {}
   const unverified = payload.query_plan?.evidence_scope === "literal_unverified"
-  const grounded = payload.validation_status === "validated" || (!payload.validation_status && !unverified)
+  const conversational = payload.answer_type === "GENERAL_CONVERSATION" || payload.intent === "general_conversation"
+  const grounded = conversational
+    || payload.validation_status === "validated"
+    || payload.validation_status === "not_required"
+    || (!payload.validation_status && !unverified)
   const answer = payload.answer || payload.direct_answer?.join("\n\n") || "I couldn't find a verified answer in the selected history."
   const evidence = payload.representative_evidence || payload.evidence || []
   const coverage = payload.coverage
   const showEvidence = grounded && evidence.length > 0
   const commentCount = coverage?.comment_count ?? Number(metrics.parent_comments || 0)
+  const issueCount = coverage?.issue_count ?? Number(metrics.canonical_issues || 0)
   const projectCount = coverage?.project_count ?? Number(metrics.projects || 0)
   const roundCount = coverage?.round_count ?? Number(metrics.review_rounds || 0)
   const responseCount = coverage?.confirmed_response_count ?? Number(metrics.confirmed_responses || 0)
@@ -222,11 +227,15 @@ function AnswerMessage({ messageId, payload, expanded, selectedEvidenceId, onOpe
       <section className="answer-primary prose prose-sm max-w-none leading-7 dark:prose-invert [&_a[href^='#citation-']]:rounded [&_a[href^='#citation-']]:border [&_a[href^='#citation-']]:border-primary/25 [&_a[href^='#citation-']]:bg-primary/5 [&_a[href^='#citation-']]:px-1 [&_a[href^='#citation-']]:font-semibold [&_a[href^='#citation-']]:text-primary [&_a[href^='#citation-']]:no-underline hover:[&_a[href^='#citation-']]:bg-primary/10" onClick={handleAnswerClick}>
         <MessageResponse>{citedAnswer}</MessageResponse>
       </section>
-      {commentCount > 0 && <p className="text-xs text-muted-foreground">
-        Based on <strong>{commentCount}</strong> relevant {commentCount === 1 ? "comment" : "comments"} · <strong>{projectCount}</strong> {projectCount === 1 ? "project" : "projects"} · <strong>{roundCount}</strong> review {roundCount === 1 ? "round" : "rounds"}.
-        {responseCount > 0 && <> <strong>{responseCount}</strong> confirmed {responseCount === 1 ? "response" : "responses"} for {responseCount} {responseCount === 1 ? "comment" : "comments"}.</>}
-        {missingCount > 0 && responseCount > 0 && <> {missingCount} without a confirmed response.</>}
-      </p>}
+      {payload.answer_type === "TIMELINE" && issueCount > 0
+        ? <p className="text-xs text-muted-foreground">
+            Based on <strong>{issueCount}</strong> recurring {issueCount === 1 ? "issue" : "issues"} · <strong>{projectCount}</strong> {projectCount === 1 ? "project" : "projects"} · <strong>{roundCount}</strong> review {roundCount === 1 ? "round" : "rounds"}.
+          </p>
+        : commentCount > 0 && <p className="text-xs text-muted-foreground">
+            Based on <strong>{commentCount}</strong> relevant {commentCount === 1 ? "comment" : "comments"} · <strong>{projectCount}</strong> {projectCount === 1 ? "project" : "projects"} · <strong>{roundCount}</strong> review {roundCount === 1 ? "round" : "rounds"}.
+            {responseCount > 0 && <> <strong>{responseCount}</strong> confirmed {responseCount === 1 ? "response" : "responses"} for {responseCount} {responseCount === 1 ? "comment" : "comments"}.</>}
+            {missingCount > 0 && responseCount > 0 && <> {missingCount} without a confirmed response.</>}
+          </p>}
       {showEvidence && <section className="space-y-3 border-t pt-4">
         <div className="flex items-center justify-between gap-3"><h4 className="text-sm font-semibold text-primary">Supporting sources</h4><span className="text-xs text-muted-foreground">{evidence.length} {evidence.length === 1 ? "record" : "records"}</span></div>
         <div className={expanded ? "grid gap-3 xl:grid-cols-2" : "grid gap-3 sm:grid-cols-2"}>
@@ -249,21 +258,28 @@ function AnswerMessage({ messageId, payload, expanded, selectedEvidenceId, onOpe
         </div>
       </section>}
       {!!payload.limitations?.length && <section className="space-y-1 border-t pt-3 text-xs leading-5 text-muted-foreground">{payload.limitations.map((limitation) => <p key={limitation}>{limitation}</p>)}</section>}
-      <details className="rounded-lg border bg-muted/15 px-3 py-2 text-sm">
+      {!conversational && <details className="rounded-lg border bg-muted/15 px-3 py-2 text-sm">
         <summary className="cursor-pointer font-medium text-muted-foreground">Retrieval diagnostics</summary>
         <div className="mt-3 space-y-3 text-xs text-muted-foreground">
           {payload.retrieval?.stage ? <p>Stage {payload.retrieval.stage}{payload.retrieval.coverage?.event_count !== undefined ? ` · ${payload.retrieval.coverage.event_count} validated events` : ""}{payload.retrieval.coverage?.project_count !== undefined ? ` · ${payload.retrieval.coverage.project_count} projects` : ""}</p> : null}
           {payload.retrieval?.fallback_reason && <p>{payload.retrieval.fallback_reason}</p>}
           {(payload.warnings || []).map((warning) => <p key={warning}>{warning}</p>)}
         </div>
-      </details>
+      </details>}
+      {conversational && !!payload.suggested_followups?.length && <section className="space-y-2 border-t pt-3"><h4 className="text-xs font-semibold tracking-wide text-primary uppercase">You could also ask</h4><div className="flex flex-wrap gap-2">{payload.suggested_followups.map((question) => <Button variant="outline" size="sm" onClick={() => onGuidedAction({ type: "general_followup", label: question, result_set_id: "" })} key={question}>{question}<ArrowRight /></Button>)}</div></section>}
       {!!payload.actions?.some((action) => action.type !== "show_results") && <section className="space-y-2 border-t pt-3"><h4 className="text-xs font-semibold tracking-wide text-primary uppercase">Explore next</h4><div className="flex flex-wrap gap-2">{(payload.actions || []).filter((action) => action.type !== "show_results").map((action) => <Button variant="outline" size="sm" onClick={() => onGuidedAction(action)} key={`${action.type}-${action.label}`} aria-label={action.label}>{action.label}<ArrowRight /></Button>)}</div></section>}
       {(payload.actions || []).filter((action) => action.type === "show_results").map((action) => <Button onClick={() => onOpenResults(action.result_set_id)} key={`results-${action.result_set_id}`}>{action.label}<ArrowRight /></Button>)}
     </div>
   </MessageContent>
 }
 
-export function KnowledgeChat({ city, filters, onOpenSource, onOpenResults }: { city: string; filters: Record<string, string>; onOpenSource: (id: string) => void; onOpenResults: (id: string) => void }) {
+export function KnowledgeChat({ city, filters, onOpenSource, onOpenResults, sourceViewerOpen = false }: {
+  city: string
+  filters: Record<string, string>
+  onOpenSource: (id: string) => void
+  onOpenResults: (id: string) => void
+  sourceViewerOpen?: boolean
+}) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [conversationId, setConversationId] = useState<string>()
   const [previousResultSetId, setPreviousResultSetId] = useState<string>()
@@ -291,16 +307,16 @@ export function KnowledgeChat({ city, filters, onOpenSource, onOpenResults }: { 
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key !== "Escape" || !expanded) return
+      if (event.key !== "Escape" || !expanded || sourceViewerOpen) return
       event.preventDefault()
       if (selectedEvidence) setSelectedEvidence(null)
       else setExpanded(false)
     }
     document.addEventListener("keydown", handleKeyDown)
     return () => document.removeEventListener("keydown", handleKeyDown)
-  }, [expanded, selectedEvidence])
+  }, [expanded, selectedEvidence, sourceViewerOpen])
 
-  async function ask(question: string, guidedAction?: GuidedAction) {
+  async function ask(question: string, guidedAction?: GuidedAction, startFresh = false) {
     const text = question.trim()
     if (!text || loading) return
     setDraft("")
@@ -309,7 +325,7 @@ export function KnowledgeChat({ city, filters, onOpenSource, onOpenResults }: { 
     const controller = new AbortController()
     const timeout = window.setTimeout(() => controller.abort(), 120_000)
     try {
-      const payload = await api<KnowledgeAnswer>("/api/knowledge-chat", { method: "POST", signal: controller.signal, body: JSON.stringify({ conversation_id: conversationId, message: text, city_id: city, filters, previous_result_set_id: guidedAction?.result_set_id || previousResultSetId, guided_action: guidedAction || undefined }) })
+      const payload = await api<KnowledgeAnswer>("/api/knowledge-chat", { method: "POST", signal: controller.signal, body: JSON.stringify({ conversation_id: conversationId, message: text, city_id: city, filters, previous_result_set_id: startFresh ? undefined : (guidedAction?.result_set_id || previousResultSetId), guided_action: guidedAction || undefined }) })
       setConversationId(payload.conversation_id)
       if (payload.result_set_id) setPreviousResultSetId(payload.result_set_id)
       setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", payload }])
@@ -334,23 +350,23 @@ export function KnowledgeChat({ city, filters, onOpenSource, onOpenResults }: { 
   const selectedRecord = selectedEvidence ? canonicalEvidenceRecord(selectedEvidence) : null
 
   const chatHeader = <div className="flex items-start justify-between gap-4 border-b px-6 py-4">
-    <div><div className="mb-1 flex items-center gap-2 text-sm font-semibold text-primary"><Database className="size-4" />Conversational knowledge explorer</div><h2 className="text-xl font-semibold tracking-tight">Ask Permit History</h2><p className="mt-1 text-sm text-muted-foreground">Read the answer, verify exact source evidence, and continue the same conversation.</p></div>
+    <div><div className="mb-1 flex items-center gap-2 text-sm font-semibold text-primary"><Database className="size-4" />Conversational knowledge explorer</div><h2 className="text-xl font-semibold tracking-tight">Ask Permit History</h2><p className="mt-1 text-sm text-muted-foreground">Ask a general question or explore verified permit history with exact source evidence.</p></div>
     <div className="flex shrink-0 items-center gap-2"><Badge variant="outline" className="hidden sm:inline-flex">{city || "All cities"}</Badge>{expanded ? <Button variant="outline" size="sm" onClick={() => { setSelectedEvidence(null); setExpanded(false) }} aria-label="Collapse AI workspace"><Minimize2 />Collapse</Button> : <Button variant="outline" size="sm" onClick={() => setExpanded(true)} aria-label="Expand AI workspace"><Expand />Focus mode</Button>}</div>
   </div>
 
   const chatBody = <>
     <Conversation className={expanded ? "min-h-0 flex-1 bg-muted/15" : "h-[460px] bg-muted/15"}>
       <ConversationContent className="mx-auto w-full max-w-[1080px] gap-5 p-6">
-        {!messages.length && <ConversationEmptyState icon={<MessageSquareText className="size-8" />} title="Ask a question about permit history" description="Search precedents, compare projects, summarize common requirements, or calculate exact counts." />}
-        {messages.map((message) => <Message from={message.role} key={message.id}>{message.role === "user" ? <MessageContent>{message.text}</MessageContent> : message.payload && <AnswerMessage messageId={message.id} payload={message.payload} expanded={expanded} selectedEvidenceId={selectedEvidence?.messageId === message.id ? selectedEvidence.evidenceId : undefined} onOpenEvidence={selectEvidence} onOpenResults={onOpenResults} onGuidedAction={(action) => ask(action.label, action)} />}</Message>)}
-        {loading && <Message from="assistant"><MessageContent className="w-full space-y-3 rounded-xl border bg-card p-5"><div className="flex items-center gap-2 text-sm text-muted-foreground"><Sparkles className="size-4" />Searching verified history…</div><Skeleton className="h-4 w-5/6" /><Skeleton className="h-4 w-3/4" /><Skeleton className="h-20 w-full" /></MessageContent></Message>}
+        {!messages.length && <ConversationEmptyState icon={<MessageSquareText className="size-8" />} title="Ask Permit History" description="Start with a general permit question, search precedents, compare projects, or calculate exact counts." />}
+        {messages.map((message) => <Message from={message.role} key={message.id}>{message.role === "user" ? <MessageContent>{message.text}</MessageContent> : message.payload && <AnswerMessage messageId={message.id} payload={message.payload} expanded={expanded} selectedEvidenceId={selectedEvidence?.messageId === message.id ? selectedEvidence.evidenceId : undefined} onOpenEvidence={selectEvidence} onOpenResults={onOpenResults} onGuidedAction={(action) => ask(String(action.parameters?.query || action.label), action.type === "general_followup" ? undefined : action, action.type === "general_followup")} />}</Message>)}
+        {loading && <Message from="assistant"><MessageContent className="w-full space-y-3 rounded-xl border bg-card p-5"><div className="flex items-center gap-2 text-sm text-muted-foreground"><Sparkles className="size-4" />Thinking…</div><Skeleton className="h-4 w-5/6" /><Skeleton className="h-4 w-3/4" /><Skeleton className="h-20 w-full" /></MessageContent></Message>}
         {error && <Alert variant="destructive"><AlertTriangle /><AlertTitle>Could not answer</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
       </ConversationContent><ConversationScrollButton />
     </Conversation>
     <div className="border-t bg-card px-5 py-4">
       <PromptInput onSubmit={({ text }) => ask(text)}>
-        <PromptInputBody><PromptInputTextarea value={draft} onChange={(event) => setDraft(event.target.value)} aria-label="Ask Permit History" className={expanded ? "min-h-16 text-sm" : "min-h-20 text-sm"} placeholder="Ask a follow-up about historical comments, confirmed responses, or comparisons…" /></PromptInputBody>
-        <PromptInputFooter><PromptInputTools><span className="px-2 text-xs text-muted-foreground">Gemini-assisted · source grounded</span></PromptInputTools><PromptInputSubmit disabled={loading} status={loading ? "submitted" : "ready"} /></PromptInputFooter>
+        <PromptInputBody><PromptInputTextarea value={draft} onChange={(event) => setDraft(event.target.value)} aria-label="Ask Permit History" className={expanded ? "min-h-16 text-sm" : "min-h-20 text-sm"} placeholder="Ask about permit history or a general permit question…" /></PromptInputBody>
+        <PromptInputFooter><PromptInputTools><span className="px-2 text-xs text-muted-foreground">General help · verified sources when history is used</span></PromptInputTools><PromptInputSubmit disabled={loading} status={loading ? "submitted" : "ready"} /></PromptInputFooter>
       </PromptInput>
       {!messages.length && <Suggestions className="mt-3">{suggestions.map((item) => <Suggestion suggestion={item} onClick={ask} key={item} />)}</Suggestions>}
     </div>
@@ -360,7 +376,15 @@ export function KnowledgeChat({ city, filters, onOpenSource, onOpenResults }: { 
 
   return <>
     {!expanded && <Card className="knowledge-chat overflow-hidden border-border/80 shadow-sm">{chatPane}</Card>}
-    <Dialog open={expanded} onOpenChange={(open) => { setExpanded(open); if (!open) setSelectedEvidence(null) }}>
+    {/* Radix modal dialogs must not compete for focus. While the app-level
+        source viewer is open, temporarily remove this fullscreen dialog but
+        retain its conversation/evidence state. Closing the viewer restores
+        the user to the exact same AI workspace. */}
+    <Dialog open={expanded && !sourceViewerOpen} onOpenChange={(open) => {
+      if (sourceViewerOpen) return
+      setExpanded(open)
+      if (!open) setSelectedEvidence(null)
+    }}>
       <DialogContent className="ai-workspace flex h-[92vh] max-h-[92vh] w-[92vw] max-w-[92vw] flex-col gap-0 overflow-hidden p-0" onEscapeKeyDown={(event) => { event.preventDefault(); if (selectedEvidence) setSelectedEvidence(null); else setExpanded(false) }}>
         <DialogHeader className="sr-only"><DialogTitle>Permit History AI research workspace</DialogTitle><DialogDescription>Conversation and Library-style historical evidence in one workspace.</DialogDescription></DialogHeader>
         {selectedEvidence && desktopWorkspace ? <ResizablePanelGroup direction="horizontal" className="min-h-0 flex-1">
