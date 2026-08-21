@@ -757,7 +757,10 @@ AI Chat operates only over the cleaned knowledge base. It does not reread PDFs, 
 
 ```mermaid
 flowchart TD
-    Q[User question + selected city] --> I[Intent and topic routing]
+    Q[User question + selected city] --> D{Needs permit-history data?}
+    D -- No --> DC[Direct general answer]
+    D -- Current evidence is sufficient --> RE[Reuse validated result set]
+    D -- New evidence is required --> I[Intent and topic routing]
     I --> T1[Stage 1: exact controlled tags]
     T1 --> C{Coverage sufficient?}
     C -- No --> T2[Stage 2: related-tag graph]
@@ -770,6 +773,7 @@ flowchart TD
     A --> G[Bounded evidence packet to Gemini]
     G --> R[Grounded natural-language answer]
     R --> S[Claim-level citations + Explore next]
+    RE --> A
 ```
 
 ### The dataset is not sent with every question
@@ -785,9 +789,27 @@ Instead:
 5. It sends only a bounded evidence packet and computed facts to Gemini.
 6. Gemini explains those facts and attaches only the supplied citation IDs.
 
-Conversation state keeps the previous query, scope, evidence set, and guided actions so follow-ups can refine the current result without resending unrelated history.
+Conversation state keeps the previous query, scope, evidence set, and guided
+actions so follow-ups can reuse validated evidence without another search.
+Ambiguous messages are routed by a small Flash-Lite request that sees only the
+recent conversation and evidence metadata, not raw historical source text.
 
-### Intent modes
+### Conversation routing
+
+Before historical intent classification, the chat selects one of three lanes:
+
+- **Direct** — greetings, ordinary conversation, writing help, capabilities,
+  and general permit concepts that do not require facts from this dataset
+- **Reuse evidence** — contextual follow-ups that the current validated result
+  set can answer
+- **Search** — new topics, projects, wider scope, fresh counts, or other facts
+  requiring historical evidence
+
+The router does not answer the question or execute retrieval. Deterministic
+guards ensure that an explicitly historical question cannot bypass the
+evidence path.
+
+### Historical intent modes
 
 The backend internally recognizes:
 
@@ -844,7 +866,7 @@ Only validated records can support a claim or show the “Source grounded” lab
 
 ### Chat prompt contract
 
-The current Knowledge Chat model defaults to `gemini-3.6-flash`. The prompt supplies:
+The final Knowledge Chat model defaults to `gemini-3.6-flash`. The prompt supplies:
 
 - user question and selected city/scope
 - classified intent and requested concepts
@@ -853,7 +875,7 @@ The current Knowledge Chat model defaults to `gemini-3.6-flash`. The prompt supp
 - any prior conversation focus required for the follow-up
 - explicit excluded-record reasons where useful
 
-The model is instructed to:
+Hard evidence rules require the model to:
 
 - answer naturally and directly before showing supporting detail
 - use only the supplied verified evidence
@@ -861,8 +883,14 @@ The model is instructed to:
 - distinguish reviewer requirements from applicant actions
 - cite claims using supplied source IDs
 - state limitations when comparison or response coverage is insufficient
-- suggest useful broad-to-specific next questions
 - never promote `probable` or `needs_review` evidence into a formal conclusion
+
+Style guidance is intentionally flexible rather than a required report
+template. Broad questions should synthesize patterns, specific questions
+should stay focused, comparisons should compare, and count questions should
+lead with the backend-computed number. The model may also suggest up to three
+evidence-specific next questions; each suggestion states whether current
+evidence is sufficient or a new search is required.
 
 The database/server—not Gemini—calculates counts, response rates, project counts, round counts, repeated occurrences, and exact source locations.
 
@@ -942,6 +970,136 @@ Production deployments should place authentication/authorization in front of all
 
 ## Running the application
 
+For hosted environments, see [`DEPLOYMENT.md`](DEPLOYMENT.md). The supported
+initial architecture is a Vercel-hosted Vite frontend plus a persistent Python
+API and private persistent storage; production source data is not bundled into
+Vercel.
+
+### Local prerequisites and environment variables
+
+Use Python 3.11 or newer. Node.js is required only when rebuilding or changing
+the React frontend; the checked-in production build is served directly by the
+Python server.
+
+Copy [`.env.example`](.env.example) to `.env.local` in the repository root.
+The loader accepts the same `KEY=value` format on Windows, macOS, and Linux.
+Operating-system environment variables take precedence over `.env.local`.
+
+| Variable | Needed for | Notes |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | AI Chat, Smart Search, retagging, and verified ingestion | Set this or `GOOGLE_API_KEY`, not both. The app can open without it, but Gemini features are unavailable. |
+| `ADOBE_PDF_EMBED_CLIENT_ID` | Embedded PDF viewing | Use a client ID authorized for `localhost`. Spreadsheet viewing does not require it. |
+| `PERMIT_HOST` | Local server | Optional; defaults to `127.0.0.1`. |
+| `PERMIT_PORT` | Local server | Optional; `.env.example` uses `8010`. |
+| `VITE_API_BASE_URL` | Split frontend deployment | Public build-time backend origin used by the Vercel-hosted frontend. |
+| `PERMIT_ALLOWED_ORIGINS` | Split backend deployment | Exact comma-separated frontend origins allowed by the backend; this is not authentication. |
+
+Model selection is optional. The defaults can be overridden with
+`GEMINI_MODEL` (Smart Search), `KNOWLEDGE_GEMINI_MODEL` (answer synthesis),
+`KNOWLEDGE_ROUTER_MODEL` (low-cost chat routing), `INGESTION_GEMINI_MODEL`
+(document extraction/verification), and `PRESCAN_GEMINI_MODEL` (file/page
+classification). Ingestion tuning uses `VISUAL_BATCH_WORKERS`,
+`FOLDER_INGESTION_WORKERS`, and `VISUAL_BATCH_TEXT_CHARACTER_LIMIT`.
+
+Full ingestion also uses local document tools:
+
+- **Ghostscript:** required to render/read PDF pages in the full visual
+  ingestion path.
+- **Tesseract OCR:** required for image-only/scanned PDFs.
+- **LibreOffice:** optional for DOC/DOCX PDF previews; native Word text
+  extraction still works without it.
+- **PyMuPDF:** recommended for stronger PDF text/layout extraction. Install it
+  in the Python environment with `python -m pip install PyMuPDF`.
+
+On Windows, the app recognizes `gswin64c.exe`, `tesseract.exe`, and
+`soffice.exe`, and checks their usual `Program Files` locations. If an
+installer used a different directory, set `GHOSTSCRIPT_PATH`,
+`TESSERACT_PATH`, or `LIBREOFFICE_PATH` in `.env.local`. This replaces the old
+Unix-only tool lookup and the ingestion pipeline now uses platform-neutral
+temporary directories.
+
+Real permit data is intentionally excluded from Git. A coworker running the
+production corpus also needs an authorized copy of `phase2_dataset/`, source
+documents, and the private `web_app/data/*.json` runtime files. They can keep
+these outside the repository and configure the `PERMIT_*_PATH` variables shown
+in `.env.example`. Without those private files, use the synthetic demo below.
+
+### Coworker quick start
+
+The cross-platform launcher checks Python, creates `.env.local` from the safe
+template when missing, verifies the frontend build and private data paths, and
+then starts the existing server. It never downloads or modifies permit data.
+
+After cloning the repository, a coworker can immediately run the synthetic
+demo without receiving private project files:
+
+macOS/Linux:
+
+```sh
+python3 scripts/run_local.py --demo
+```
+
+Windows PowerShell:
+
+```powershell
+py -3 scripts/run_local.py --demo
+```
+
+The repository includes the curated processed corpus needed for Library,
+search, statistics, timelines, and AI retrieval. To use it, run the same
+command without `--demo`. The app can start without the original documents.
+Original permit documents are distributed separately; place them at
+`comments&response/` (or configure `PERMIT_SOURCE_ROOT`) to additionally
+enable source-file viewing and highlighting:
+
+```text
+phase2_dataset/dataset.json                 # included in Git
+phase2_dataset/evidence_model.json          # included in Git
+comments&response/                          # supplied separately
+web_app/data/category_assignments.json
+web_app/data/gemini_enrichment.json
+web_app/data/search_index.json
+web_app/data/source_registry.json
+web_app/data/link_review_decisions.json
+web_app/data/tag_suggestions.json
+web_app/data/workbook_review_decisions.json
+web_app/data/previews/                 # when DOC/DOCX previews are needed
+```
+
+```sh
+python3 scripts/run_local.py
+```
+
+```powershell
+py -3 scripts/run_local.py
+```
+
+Use `--check` to validate a workstation without starting a server. The private
+bundle is intentionally excluded from Git and must be transferred through an
+approved secure company channel. Each coworker should use their own Gemini key
+and localhost-authorized Adobe client ID; do not send `.env.local` through Git.
+
+The equivalent manual commands remain available:
+
+Start the normal local app:
+
+macOS/Linux:
+
+```sh
+cp .env.example .env.local
+python3 web_app/server.py
+```
+
+Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env.local
+py -3 web_app/server.py
+```
+
+Then open <http://localhost:8010>. Command-line flags still override the path
+defaults for one-off runs.
+
 ### Synthetic demo
 
 The public repository contains a small synthetic dataset. Real permit documents and derived production data should remain outside the public repository.
@@ -971,6 +1129,7 @@ With the default workspace paths:
 python3 web_app/server.py \
   --host 127.0.0.1 \
   --port 8010 \
+  --knowledge-router-model gemini-3.1-flash-lite \
   --knowledge-gemini-model gemini-3.6-flash \
   --gemini-api-key-stdin
 ```
@@ -993,6 +1152,46 @@ npm run build
 ```
 
 ### Incremental ingestion
+
+#### Maintainer ingestion entrance
+
+See [`INGESTION_NOTE.md`](INGESTION_NOTE.md) for the maintainer runbook,
+storage map, post-ingestion verification checklist, and recovery guidance.
+
+The top-navigation **Import data** action is a guarded maintainer entrance over
+the existing incremental pipeline. A maintainer chooses one complete project
+folder in the browser and clicks **Upload and ingest** once. Original filenames
+and nested folders are preserved; supported PDF, Word, Excel, and CSV files are
+streamed individually so a large folder is not buffered as one request.
+
+That single action automatically performs the internal phases in order:
+
+1. commit the complete upload under the workspace `new/` staging area;
+2. reconcile file hashes, checkpoints, and already processed material;
+3. run high-recall prescan for relevant files, pages, sheets, and regions;
+4. run verified extraction, pairing and coverage checks;
+5. deduplicate canonical events and rebuild issue timelines; and
+6. refresh the source registry and search metadata.
+
+The dialog reports upload progress, current pipeline stage, recent log lines,
+and completion. Gemini processing may take several minutes and incur API cost,
+but unchanged hashes and completed stage checkpoints are reused.
+
+The entrance allows only one background task at a time. Its durable job state is
+stored in `phase2_dataset/ingestion_admin_jobs.json`; bounded task logs are stored
+under `phase2_dataset/ingestion_jobs/`. These runtime files are private dataset
+artifacts and are excluded from Git with the rest of `phase2_dataset/`.
+
+For safety, browser-triggered ingestion is enabled automatically only when the
+server binds to a loopback host (`127.0.0.1`, `localhost`, or `::1`). A remote
+binding requires `--enable-ingestion-admin`; use that flag only behind an
+authenticated, trusted maintenance network. The browser never submits arbitrary
+host filesystem paths. Upload manifests use validated relative paths, per-file
+and total-size limits, and a private temporary session; files are moved into
+project staging only after the complete manifest arrives. A configured Gemini
+key is required for the one-click workflow.
+
+The CLI remains available for automation and recovery:
 
 Inventory only, without Gemini:
 

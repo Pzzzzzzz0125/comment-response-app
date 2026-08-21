@@ -48,6 +48,10 @@ from phase2.straggler_monitor import (
     utc_timestamp,
 )
 from web_app.source_lineage import document_date as derive_document_date
+from web_app.local_secrets import runtime_setting
+from web_app.platform_support import (
+    ghostscript_executable, libreoffice_executable, tesseract_executable,
+)
 from web_app.source_registry import (
     _xlsx_cells,
     pdf_same_row_context,
@@ -548,9 +552,9 @@ def _run(command: list[str], purpose: str, timeout: int = 600) -> None:
 
 
 def render_pdf_pages(path: Path, output_dir: Path, dpi: int = 180) -> list[PageImage]:
-    ghostscript = shutil.which("gs")
+    ghostscript = ghostscript_executable()
     if not ghostscript:
-        raise RuntimeError("Full-page visual ingestion requires Ghostscript (gs)")
+        raise RuntimeError("Full-page visual ingestion requires Ghostscript")
     output_dir.mkdir(parents=True, exist_ok=True)
     pattern = output_dir / "page-%04d.jpg"
     _run([
@@ -567,9 +571,9 @@ def render_pdf_page_selection(
     path: Path, output_dir: Path, page_numbers: list[int], dpi: int,
 ) -> list[PageImage]:
     """Render only selected source pages while preserving original page numbers."""
-    ghostscript = shutil.which("gs")
+    ghostscript = ghostscript_executable()
     if not ghostscript:
-        raise RuntimeError("Visual ingestion requires Ghostscript (gs)")
+        raise RuntimeError("Visual ingestion requires Ghostscript")
     output_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[PageImage] = []
     for page_number in sorted(set(page_numbers)):
@@ -586,7 +590,7 @@ def render_pdf_page_selection(
 
 
 def ocr_page(image: Path) -> str:
-    executable = shutil.which("tesseract")
+    executable = tesseract_executable()
     if not executable:
         return ""
     completed = subprocess.run(
@@ -947,9 +951,9 @@ def select_relevant_pages(
 
 
 def pdf_direct_text(path: Path) -> dict[str, Any]:
-    ghostscript = shutil.which("gs")
+    ghostscript = ghostscript_executable()
     if not ghostscript:
-        raise RuntimeError("Direct PDF text extraction requires Ghostscript (gs)")
+        raise RuntimeError("Direct PDF text extraction requires Ghostscript")
     with tempfile.TemporaryDirectory(prefix="visual-text-") as temporary:
         pattern = Path(temporary) / "page-%04d.txt"
         _run([
@@ -1334,7 +1338,7 @@ def normalized_content_fingerprint(raw_text: dict[str, Any], binary_sha256: str)
 
 
 def office_pdf(path: Path, output_dir: Path) -> Path:
-    executable = shutil.which("soffice") or shutil.which("libreoffice")
+    executable = libreoffice_executable()
     if not executable:
         raise RuntimeError(f"Rendering every page of {path.suffix.upper()} requires LibreOffice (soffice)")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -4270,7 +4274,7 @@ class VisualIngestionPipeline:
         self.batch_overlap = max(0, int(batch_overlap))
         self.batch_workers = max(1, int(batch_workers))
         self.batch_text_character_limit = max(
-            0, int(os.environ.get("VISUAL_BATCH_TEXT_CHARACTER_LIMIT", "21500")),
+            0, int(runtime_setting("VISUAL_BATCH_TEXT_CHARACTER_LIMIT", "21500")),
         )
         self._metrics: dict[str, Any] = {}
         self._metrics_lock = threading.RLock()

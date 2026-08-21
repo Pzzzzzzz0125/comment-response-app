@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { AlertCircle, FileSearch, Loader2, RefreshCw, SheetIcon, X } from "lucide-react"
-import { api } from "@/lib/api"
+import { api, apiUrl } from "@/lib/api"
 import type { SourceLocation, SourcePayload, SpreadsheetPayload } from "@/types"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -374,7 +374,7 @@ function PdfViewer({ source, onStatus }: { source: SourcePayload; onStatus: (val
         const documentId = source.location.preview_document_id || source.document.document_id
         const view = new window.AdobeDC.View({ clientId: config.adobe_pdf_embed_client_id, divId })
         const readyPromise = waitForViewerReady(view)
-        const viewer = await view.previewFile({ content: { location: { url: source.preview_url } }, metaData: { fileName: source.document.filename, id: documentId } }, {
+        const viewer = await view.previewFile({ content: { location: { url: apiUrl(source.preview_url) } }, metaData: { fileName: source.document.filename, id: documentId } }, {
           embedMode: "FULL_WINDOW", showDownloadPDF: false, showPrintPDF: false, showAnnotationTools: false, showSaveButton: false,
           defaultViewMode: "FIT_WIDTH", showZoomControl: true,
           enableFormFilling: false, enableSearchAPIs: true, enableAnnotationAPIs: true, includePDFAnnotations: false,
@@ -434,7 +434,7 @@ function PdfViewer({ source, onStatus }: { source: SourcePayload; onStatus: (val
   }, [divId, onStatus, source])
 
   const nativeZoom = pdfZoomForFilename(source.document.filename)
-  if (native) return <iframe className="size-full border-0" src={`${source.preview_url}#page=${source.location.page_number || 1}${nativeZoom ? `&zoom=${nativeZoom}` : ""}`} title="PDF source preview" />
+  if (native) return <iframe className="size-full border-0" src={`${apiUrl(source.preview_url)}#page=${source.location.page_number || 1}${nativeZoom ? `&zoom=${nativeZoom}` : ""}`} title="PDF source preview" />
   return <div className="relative size-full"><div id={divId} className="size-full" />{loading && <div className="absolute inset-0 grid place-items-center bg-white"><Loader2 className="size-7 animate-spin text-primary" /></div>}</div>
 }
 

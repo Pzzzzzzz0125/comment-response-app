@@ -29,8 +29,10 @@ if str(WORKSPACE_IMPORT) not in sys.path:
 from corpus_audit import audit_corpus as audit
 try:
     from .gemini_enrich import record_digest
+    from .platform_support import ghostscript_executable, libreoffice_executable
 except ImportError:
     from gemini_enrich import record_digest
+    from platform_support import ghostscript_executable, libreoffice_executable
 
 
 PDF_TYPES = {"pdf"}
@@ -262,7 +264,7 @@ class LibreOfficePreviewConverter:
     """Replaceable DOC/DOCX-to-PDF converter using LibreOffice headless."""
 
     def __init__(self, executable: str | None = None):
-        self.executable = executable or shutil.which("soffice") or shutil.which("libreoffice")
+        self.executable = libreoffice_executable(executable)
 
     @property
     def available(self) -> bool:
@@ -424,7 +426,7 @@ def _same_project(left: str, right: str) -> bool:
 
 
 def _pdf_text_pages(path: Path) -> list[str]:
-    executable = shutil.which("gs")
+    executable = ghostscript_executable()
     if not executable:
         return []
     with tempfile.TemporaryDirectory(prefix="permit-pdf-text-") as temporary:
@@ -581,7 +583,7 @@ def _normalized_locator_boxes_by_page(
     """Convert all Gemini boxes while retaining each box's source page."""
     if not isinstance(value, dict) or not isinstance(value.get("bounding_boxes"), list):
         return {}
-    executable = shutil.which("gs")
+    executable = ghostscript_executable()
     if not executable:
         return {}
     dimensions: dict[int, tuple[float, float]] = {}
@@ -605,7 +607,7 @@ def _normalized_locator_boxes_by_page(
 
 
 def _pdf_page_layout(path: Path, page_number: int) -> tuple[float, list[dict[str, Any]]]:
-    executable = shutil.which("gs")
+    executable = ghostscript_executable()
     if not executable or page_number < 1:
         return 0.0, []
     try:
@@ -905,7 +907,8 @@ class SourceRegistry:
         # migration.  Keep the default strict behavior; this opt-out is only
         # for starting the read-only UI without blocking on migration.
         skip_migration = os.getenv("PERMIT_SKIP_SOURCE_REGISTRY_MIGRATION", "").casefold() in {"1", "true", "yes"}
-        if auto_migrate and registry_is_stale and not skip_migration:
+        corpus_available = any(root.is_dir() for root in self.corpus_roots)
+        if auto_migrate and registry_is_stale and not skip_migration and corpus_available:
             self.migrate()
 
     @property

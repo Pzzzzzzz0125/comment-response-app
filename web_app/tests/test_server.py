@@ -6,6 +6,7 @@ from pathlib import Path
 
 from web_app.server import (
     DatasetStore,
+    PermitServer,
     document_date_label,
     document_submission_label,
     normalize_date_label,
@@ -151,6 +152,15 @@ def sample_dataset():
             }
         ],
     }
+
+
+class DeploymentConfigTests(unittest.TestCase):
+    def test_cors_allowlist_matches_exact_normalized_origins(self):
+        server = PermitServer.__new__(PermitServer)
+        server.allowed_origins = frozenset({"https://permit.example.com"})
+        self.assertTrue(server.origin_allowed("https://permit.example.com/"))
+        self.assertFalse(server.origin_allowed("https://preview.example.com"))
+        self.assertFalse(server.origin_allowed("https://permit.example.com.attacker.test"))
 
 
 class DatasetStoreTests(unittest.TestCase):
@@ -1172,6 +1182,9 @@ class DatasetStoreTests(unittest.TestCase):
 
     def test_conversational_evaluation_intent_cases(self):
         cases = [
+            ("Hi", False, "general_conversation"),
+            ("What can you do?", False, "general_conversation"),
+            ("What is a building permit?", False, "general_conversation"),
             ("How have we handled tree-protection comments?", False, "historical_response_summary"),
             ("How many comments concern door size?", False, "aggregate_count"),
             ("Summarize historical drainage comments.", False, "topic_summary"),
@@ -1182,10 +1195,203 @@ class DatasetStoreTests(unittest.TestCase):
             ("Summarize those.", False, "filter_previous_results"),
             ("Find door comments requesting dimensions rather than widening.", False, "precedent_search"),
             ("Find the same door-width issue with different required measurements.", False, "precedent_search"),
+            ("Which issues repeated across multiple review rounds?", False, "timeline_analysis"),
         ]
         for message, has_previous, expected in cases:
             with self.subTest(message=message):
                 self.assertEqual(fallback_query_plan(message, has_previous)["intent"], expected)
+
+    def test_standalone_recurring_question_loads_city_issue_timelines(self):
+        first = self.store._comments_by_id["C-SJ-1"]
+        second = self.store._comments_by_id["C-SJ-2"]
+        for row, round_value in ((first, "1"), (second, "2")):
+            row["review_round"] = round_value
+            row["issue_thread_id"] = "ISSUE-SJ-SETBACK"
+            row["canonical_issue_id"] = "ISSUE-SJ-SETBACK"
+            row["canonical_event_id"] = f"EVENT-SJ-{round_value}"
+        second["original_text"] = "The setback dimension remains unresolved in the later round."
+        issue = {
+            "issue_thread_id": "ISSUE-SJ-SETBACK",
+            "title": "Front setback dimension remained unresolved",
+            "first_round": "1",
+            "latest_round": "2",
+            "round_count": 2,
+            "history_event_count": 3,
+            "comment_event_count": 2,
+            "response_event_count": 1,
+            "status": "open",
+            "comment_ids": ["C-SJ-1", "C-SJ-2"],
+        }
+        original = self.store._recurring_issues
+        self.store._recurring_issues = lambda _rows: ([issue], {"recurring_issues": 1})
+        try:
+            payload = self.store.knowledge_chat.chat({
+                "message": "Which issues repeated across multiple review rounds?",
+                "city_id": "San Jose",
+                "filters": {},
+            })
+        finally:
+            self.store._recurring_issues = original
+
+        self.assertEqual(payload["intent"], "timeline_analysis")
+        self.assertEqual(payload["answer_type"], "TIMELINE")
+        self.assertEqual(payload["query_plan"]["analytical_unit"], "issue_timeline")
+        self.assertIn("load_issue_timelines", payload["query_plan"]["operations"])
+        self.assertEqual(payload["coverage"]["issue_count"], 1)
+        self.assertIn("Front setback dimension remained unresolved", payload["answer"])
+        self.assertNotIn("did not find a concrete issue", payload["answer"])
+        self.assertEqual(payload["patterns"], [])
+        self.assertFalse(any(action["type"] == "timeline_analysis" for action in payload["actions"]))
+        show_results = [action for action in payload["actions"] if action["type"] == "show_results"]
+        self.assertEqual(show_results[0]["label"], "View 1 recurring issue")
+
+    def test_response_summary_cannot_be_redirected_to_timeline_unit(self):
+        plan = enrich_query_plan({
+            "intent": "historical_response_summary",
+            "subject": "tree related issues",
+            "analytical_unit": "issue_timeline",
+            "operations": ["load_issue_timelines", "group_by_review_round"],
+        }, "How have we handled tree related issues?", False, {"city": "San Jose"})
+
+        self.assertEqual(plan["analytical_unit"], "canonical_event")
+        self.assertIn("smart_search", plan["operations"])
+        self.assertNotIn("load_issue_timelines", plan["operations"])
+
+    def test_general_conversation_does_not_search_or_cite_permit_history(self):
+        payload = self.store.knowledge_chat.chat({
+            "message": "Hello",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        self.assertEqual(payload["intent"], "general_conversation")
+        self.assertEqual(payload["answer_type"], "GENERAL_CONVERSATION")
+        self.assertEqual(payload["validation_status"], "not_applicable")
+        self.assertIsNone(payload["result_set_id"])
+        self.assertEqual(payload["citations"], [])
+        self.assertEqual(payload["evidence"], [])
+        self.assertEqual(payload["retrieval"]["stage"], 0)
+        self.assertIn("Hi!", payload["answer"])
+        self.assertNotIn("No validated evidence", payload["answer"])
+
+    def test_general_question_calls_gemini_without_passing_dataset_evidence(self):
+        class GeneralClient:
+            def __init__(self):
+                self.calls = []
+
+            def answer_general_conversation(self, message, history):
+                self.calls.append((message, history))
+                return {
+                    "answer": "A building permit is an approval used to review proposed construction work.",
+                    "suggested_followups": ["When is one usually required?"],
+                }
+
+        client = GeneralClient()
+        self.store.knowledge_gemini_client = client
+        self.store.knowledge_chat.remote_circuit_until = 0
+        payload = self.store.knowledge_chat.chat({
+            "message": "What is a building permit?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0][0], "What is a building permit?")
+        self.assertEqual(payload["answer_type"], "GENERAL_CONVERSATION")
+        self.assertIsNone(payload["result_set_id"])
+        self.assertEqual(payload["citations"], [])
+        self.assertIn("approval", payload["answer"])
+        self.assertEqual(payload["suggested_followups"], ["When is one usually required?"])
+
+    def test_lite_router_can_send_an_ordinary_message_to_direct_chat(self):
+        class RouterClient:
+            def __init__(self):
+                self.received = None
+
+            def route_knowledge_message(self, message, history, current_evidence):
+                self.received = (message, history, current_evidence)
+                return {"action": "direct", "search_query": ""}
+
+        router = RouterClient()
+        self.store.knowledge_router_client = router
+        payload = self.store.knowledge_chat.chat({
+            "message": "Nice to meet you",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        self.assertEqual(payload["answer_type"], "GENERAL_CONVERSATION")
+        self.assertIsNone(payload["result_set_id"])
+        self.assertEqual(router.received[0], "Nice to meet you")
+        self.assertEqual(router.received[2], {"available": False})
+
+    def test_lite_router_reuses_validated_evidence_without_a_new_search(self):
+        first = self.store.knowledge_chat.chat({
+            "message": "How many comments concern setback dimensions?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+
+        class RouterClient:
+            def __init__(self):
+                self.summary = None
+
+            def route_knowledge_message(self, _message, _history, current_evidence):
+                self.summary = current_evidence
+                return {"action": "reuse_evidence", "search_query": ""}
+
+        router = RouterClient()
+        self.store.knowledge_router_client = router
+        self.store._comments_by_id["C-SJ-1"]["original_text"] += " PRIVATE SOURCE TEXT"
+        second = self.store.knowledge_chat.chat({
+            "conversation_id": first["conversation_id"],
+            "previous_result_set_id": first["result_set_id"],
+            "message": "Why was that important?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        first_ids = self.store.knowledge_chat.result_sets[first["result_set_id"]]["comment_ids"]
+        second_result = self.store.knowledge_chat.result_sets[second["result_set_id"]]
+        self.assertEqual(second_result["comment_ids"], first_ids)
+        self.assertEqual(second_result["parent_result_set_id"], first["result_set_id"])
+        self.assertEqual(second_result["guided_action"], "reuse_evidence")
+        self.assertTrue(router.summary["available"])
+        self.assertNotIn("PRIVATE SOURCE TEXT", str(router.summary))
+
+    def test_project_named_followup_reuses_only_that_projects_evidence(self):
+        first_row = self.store._comments_by_id["C-SJ-1"]
+        second_row = self.store._comments_by_id["C-SJ-2"]
+        first_row.update({"project_id": "project-701", "project_name": "701 S Clover Ave"})
+        second_row.update({"project_id": "project-4155", "project_name": "4155 Mitzi Dr"})
+        previous_id = "rs_two_tree_projects"
+        now = self.store.knowledge_chat.clock()
+        self.store.knowledge_chat.result_sets[previous_id] = {
+            "result_set_id": previous_id,
+            "conversation_id": "conv_tree_followup",
+            "query": "How have we handled tree-related comments?",
+            "intent": "historical_response_summary",
+            "filters": {"city": "San Jose"},
+            "comment_ids": ["C-SJ-1", "C-SJ-2"],
+            "match_classes": {"C-SJ-1": "direct", "C-SJ-2": "direct"},
+            "validation_status": "not_required",
+            "validated_subject": "tree-related comments",
+            "created_at": now,
+            "expires_at": now + 1800,
+        }
+
+        class RouterClient:
+            def route_knowledge_message(self, _message, _history, _current_evidence):
+                return {"action": "reuse_evidence", "search_query": ""}
+
+        self.store.knowledge_router_client = RouterClient()
+        payload = self.store.knowledge_chat.chat({
+            "conversation_id": "conv_tree_followup",
+            "previous_result_set_id": previous_id,
+            "message": "Explore more on the 701 S Clover Ave one",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        result = self.store.knowledge_chat.result_sets[payload["result_set_id"]]
+        self.assertEqual(result["comment_ids"], ["C-SJ-1"])
+        self.assertEqual(result["filters"]["project_id"], "project-701")
+        self.assertEqual(payload["metrics"]["projects"], 1)
 
     def test_knowledge_answer_type_selects_a_question_specific_shape(self):
         chat = self.store.knowledge_chat
@@ -1230,6 +1436,11 @@ class DatasetStoreTests(unittest.TestCase):
                     "differences": [{"title": "Invented difference", "text": "Unsupported.",
                                      "supporting_event_ids": ["EVENT-NOT-IN-EVIDENCE"]}],
                     "takeaway": "Specific sheet references make review easier.",
+                    "explore_more": [{
+                        "label": "Why did this remain open?",
+                        "query": "Why did the setback issue remain open?",
+                        "reuse_current_evidence": True,
+                    }],
                 }
 
         client = SynthesisClient()
@@ -1260,6 +1471,7 @@ class DatasetStoreTests(unittest.TestCase):
         self.assertEqual([item["event_id"] for item in client.evidence], [event_id])
         self.assertEqual(client.evidence[0]["citation_index"], 1)
         self.assertTrue(client.evidence[0]["issue_label"])
+        self.assertEqual(result["explore_more"][0]["query"], "Why did the setback issue remain open?")
 
     def test_count_answer_is_compact_but_includes_grounded_analysis(self):
         payload = self.store.knowledge_chat.chat({
@@ -1300,6 +1512,31 @@ class DatasetStoreTests(unittest.TestCase):
         self.assertEqual(second["query_plan"]["filters"]["city"], "San Jose")
         self.assertEqual(second["query_plan"]["scope"]["city_ids"], ["San Jose"])
 
+    def test_knowledge_result_set_survives_server_store_restart(self):
+        first = self.store.knowledge_chat.chat({
+            "message": "How many comments mention setback dimensions?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        restarted = DatasetStore(
+            self.dataset_path, self.categories_path, self.source_root,
+        )
+        restored = restarted.knowledge_chat.result_comments(first["result_set_id"])
+        self.assertEqual(restored["result_set"]["query"], first["query_plan"].get("original_query", "How many comments mention setback dimensions?"))
+        self.assertEqual([row["comment_id"] for row in restored["comments"]], ["C-SJ-1"])
+
+    def test_missing_previous_result_set_does_not_block_fresh_question(self):
+        payload = self.store.knowledge_chat.chat({
+            "conversation_id": "conv_from_an_old_server",
+            "previous_result_set_id": "rs_from_an_old_server",
+            "message": "How many comments concern setback dimensions?",
+            "city_id": "San Jose",
+            "filters": {},
+        })
+        self.assertFalse(payload["needs_clarification"])
+        self.assertIsNotNone(payload["result_set_id"])
+        self.assertTrue(any("earlier result context expired" in item for item in payload["warnings"]))
+
     def test_knowledge_count_is_backend_calculated_and_parent_deduplicated(self):
         payload = self.store.knowledge_chat.chat({
             "message": "How many comments concern setback dimensions?", "city_id": "San Jose", "filters": {},
@@ -1334,9 +1571,56 @@ class DatasetStoreTests(unittest.TestCase):
             "filters": {},
             "guided_action": guided,
         })
-        self.assertEqual(second["intent"], "topic_summary")
+        self.assertEqual(second["intent"], "timeline_analysis")
+        self.assertEqual(second["answer_type"], "TIMELINE")
+        self.assertNotEqual(second["answer"], first["answer"])
         self.assertEqual(self.store.knowledge_chat.result_sets[second["result_set_id"]]["parent_result_set_id"], first["result_set_id"])
         self.assertEqual(self.store.knowledge_chat.result_sets[second["result_set_id"]]["guided_action"], "timeline_analysis")
+
+    def test_guided_subtopic_revalidates_changed_subject_instead_of_reusing_answer(self):
+        self.store._comments_by_id["C-SJ-1"]["original_text"] = "Provide tree protection fencing during construction."
+        self.store._comments_by_id["C-SJ-2"]["original_text"] = "Provide the separate grading permit."
+
+        class ChatClient:
+            def __init__(self):
+                self.validated_subjects = []
+
+            def plan_knowledge_query(self, _message, _has_previous):
+                return {
+                    "intent": "topic_summary", "subject": "San Jose permit comments",
+                    "operations": ["load_filtered_comments"], "filters": {},
+                    "needs_clarification": False, "clarification_question": "",
+                }
+
+            def validate_knowledge_evidence(self, subject, candidates):
+                self.validated_subjects.append(subject)
+                return [{
+                    "candidate_id": item["candidate_id"], "is_relevant": True,
+                    "matched_concept": "tree protection", "supporting_excerpt": item["comment_text"],
+                    "confidence": 0.99, "exclude_reason": "",
+                } for item in candidates]
+
+        client = ChatClient()
+        self.store.knowledge_gemini_client = client
+        first = self.store.knowledge_chat.chat({
+            "message": "Give me a summary of San Jose comments.", "city_id": "San Jose", "filters": {},
+        })
+        action = {
+            "type": "filter_subtopic", "label": "Explore: Tree Protection",
+            "result_set_id": first["result_set_id"],
+            "parameters": {"result_set_id": first["result_set_id"], "topic": "Tree Protection"},
+        }
+        second = self.store.knowledge_chat.chat({
+            "conversation_id": first["conversation_id"], "message": action["label"],
+            "city_id": "San Jose", "filters": {}, "guided_action": action,
+        })
+        self.assertEqual(second["validation_status"], "validated")
+        self.assertEqual(second["query_plan"]["subject"], "Tree Protection")
+        self.assertEqual(client.validated_subjects, ["Tree Protection"])
+        self.assertEqual(
+            self.store.knowledge_chat.result_sets[second["result_set_id"]]["validated_subject"],
+            "Tree Protection",
+        )
 
     def test_knowledge_followup_filters_previous_verified_ids(self):
         first = self.store.knowledge_chat.chat({
@@ -2435,7 +2719,8 @@ class SourceViewerTests(unittest.TestCase):
         self.assertIn("View evidence", chat)
         self.assertIn("Retrieval diagnostics", chat)
         self.assertNotIn("What the history shows", chat)
-        self.assertIn("SourcesTrigger", chat)
+        self.assertIn("CanonicalEvidenceDetail", chat)
+        self.assertIn("sourceViewerOpen", chat)
         self.assertIn("/api/sources/", viewer)
         self.assertNotIn("Download original", chat + app + viewer)
 

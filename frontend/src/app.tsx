@@ -112,13 +112,16 @@ export function App() {
       {error && <Alert variant="destructive"><RefreshCw /><AlertTitle>Application error</AlertTitle><AlertDescription className="flex items-center justify-between gap-3"><span>{error}</span><Button variant="outline" size="sm" onClick={() => loadCity(city)}>Retry</Button></AlertDescription></Alert>}
       {loading && !data ? <div className="space-y-5"><Skeleton className="h-[620px] rounded-xl" /><Skeleton className="h-[700px] rounded-xl" /></div> : <>
         {data?.analysis && <CitySummary city={city} analysis={data.analysis} onOpenTopic={openCommonTopic} onOpenRecurringIssue={openRecurringIssue} />}
-        <KnowledgeChat city={city} filters={{ discipline: filters.discipline, review_round: filters.review_round, category: filters.category }} onOpenSource={openSource} onOpenResults={openResultSet} />
+        {/* Chat has its own city-level evidence scope. Library filters are a
+            browsing concern and must not silently narrow an unrelated chat
+            question. Evidence-aware follow-ups remain scoped by result set. */}
+        <KnowledgeChat city={city} filters={{}} onOpenSource={openSource} onOpenResults={openResultSet} sourceViewerOpen={sourceOpen} />
         <div id="historical-results"><HistoricalResults city={city} comments={comments} loading={loading} activeId={activeId} onActive={setActiveId} filters={filters} onFilters={setFilters} relevance={relevance} explanations={explanations} recurringIssues={data?.analysis?.recurring_issues || []} resultLabel={resultLabel} onClearResultSet={() => loadCity(city)} onOpenSource={openSource} onCategoriesChanged={() => loadCity(city)} /></div>
       </>}
     </main>
     <Suspense fallback={null}>
       {sourceOpen && <SourceViewer sourceId={sourceId} open={sourceOpen} onOpenChange={setSourceOpen} />}
-      {importOpen && <ImportDialog open={importOpen} onOpenChange={setImportOpen} />}
+      {importOpen && <ImportDialog open={importOpen} onOpenChange={setImportOpen} onCompleted={() => { loadCity(city); loadWorkbookReviewCount(); loadReviewCount() }} />}
       {reviewOpen && <ReviewLinksDialog open={reviewOpen} onOpenChange={setReviewOpen} cities={data?.cities.map((item) => item.name) || []} onOpenSource={openSource} onChanged={() => { loadReviewCount(); loadCity(city) }} />}
       {workbookReviewOpen && <WorkbookReviewDialog open={workbookReviewOpen} onOpenChange={setWorkbookReviewOpen} cities={data?.cities.map((item) => item.name) || []} onOpenSource={openSource} onChanged={() => { loadWorkbookReviewCount(); loadReviewCount(); loadCity(city) }} />}
     </Suspense>

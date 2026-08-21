@@ -41,7 +41,8 @@ try:
     from .document_identity import canonical_city_name, canonicalize_documents, topic_occurrence_key, topic_occurrence_allowed
     from .topic_taxonomy import TOPIC_TAXONOMY_VERSION, classify_topic
     from .progressive_retrieval import ValidatedTagIndex, progressive_retrieve
-    from .local_secrets import gemini_api_key
+    from .local_secrets import gemini_api_key, runtime_setting
+    from .ingestion_admin import IngestionAdmin
 except ImportError:  # Direct `python3 web_app/server.py` execution.
     from source_registry import SourceRegistry
     from gemini_enrich import GeminiClient, record_digest
@@ -59,7 +60,8 @@ except ImportError:  # Direct `python3 web_app/server.py` execution.
     from document_identity import canonical_city_name, canonicalize_documents, topic_occurrence_key, topic_occurrence_allowed
     from topic_taxonomy import TOPIC_TAXONOMY_VERSION, classify_topic
     from progressive_retrieval import ValidatedTagIndex, progressive_retrieve
-    from local_secrets import gemini_api_key
+    from local_secrets import gemini_api_key, runtime_setting
+    from ingestion_admin import IngestionAdmin
 
 
 STOP_WORDS = {
@@ -1131,6 +1133,7 @@ class DatasetStore:
         knowledge_gemini_client: GeminiClient | None = None,
         link_reviews_path: Path | None = None,
         workbook_reviews_path: Path | None = None,
+        knowledge_router_client: GeminiClient | None = None,
     ):
         self.dataset_path = dataset_path.resolve()
         self.categories_path = categories_path.resolve()
@@ -1149,6 +1152,7 @@ class DatasetStore:
         ).resolve()
         self.gemini_client = gemini_client
         self.knowledge_gemini_client = knowledge_gemini_client
+        self.knowledge_router_client = knowledge_router_client
         self.search_index = SearchIndex(search_index_path or self.categories_path.parent / "search_index.json")
         self._search_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._lock = threading.RLock()
@@ -1290,12 +1294,17 @@ class DatasetStore:
         for source in self._comments:
             row = dict(source)
             event_id = str(row.get("canonical_event_id") or row.get("comment_id") or "")
+            accepted_event_ids = {
+                event_id,
+                str(row.get("comment_id") or ""),
+                str(row.get("canonical_comment_id") or ""),
+            }
             event_tags = list(row.get("event_tags") or []) if isinstance(row.get("event_tags"), list) else []
             issue_tags = list(row.get("issue_tags") or []) if isinstance(row.get("issue_tags"), list) else []
             for suggestion in self._tag_suggestions.values():
                 if str(suggestion.get("status")) != "confirmed":
                     continue
-                if str(suggestion.get("event_id") or "") != event_id:
+                if str(suggestion.get("event_id") or "") not in accepted_event_ids:
                     continue
                 tag = str(suggestion.get("suggested_tag") or suggestion.get("tag_id") or "").strip()
                 level = str(suggestion.get("tag_level") or "issue").strip()
@@ -3913,6 +3922,33 @@ class PermitHandler(BaseHTTPRequestHandler):
     def app(self) -> "PermitServer":
         return self.server  # type: ignore[return-value]
 
+    def end_headers(self) -> None:
+        origin = self.headers.get("Origin", "").strip().rstrip("/")
+        if origin and self.app.origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header(
+                "Access-Control-Expose-Headers",
+                "Accept-Ranges, Content-Length, Content-Range, Content-Type",
+            )
+        super().end_headers()
+
+    def do_OPTIONS(self) -> None:
+        parsed = urlparse(self.path)
+        origin = self.headers.get("Origin", "").strip().rstrip("/")
+        if not parsed.path.startswith("/api/"):
+            self._error(HTTPStatus.NOT_FOUND, "Unknown API endpoint")
+            return
+        if origin and not self.app.origin_allowed(origin):
+            self._error(HTTPStatus.FORBIDDEN, "Origin is not allowed")
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _json(self, payload: Any, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -4014,6 +4050,14 @@ class PermitHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self._json({
+                "status": "ok",
+                "dataset_loaded": True,
+                "source_registry_loaded": bool(self.app.store.source_registry),
+                "gemini_configured": bool(self.app.store.gemini_client),
+            })
+            return
         if self._redirect_root_to_localhost(parsed.path):
             return
         if parsed.path == "/api/data":
@@ -4057,7 +4101,11 @@ class PermitHandler(BaseHTTPRequestHandler):
                 "adobe_pdf_embed_client_id": self.app.adobe_pdf_embed_client_id,
                 "smart_search_model": getattr(self.app.store.gemini_client, "model", ""),
                 "knowledge_chat_model": getattr(self.app.store.knowledge_gemini_client, "model", ""),
+                "knowledge_router_model": getattr(self.app.store.knowledge_router_client, "model", ""),
             })
+            return
+        if parsed.path == "/api/ingestion":
+            self._json(self.app.ingestion_admin.snapshot())
             return
         conversation_match = re.fullmatch(r"/api/conversations/([A-Za-z0-9_-]+)", parsed.path)
         if conversation_match:
@@ -4107,6 +4155,34 @@ class PermitHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.GONE, "Filesystem source links were replaced by the in-app Source Viewer")
             return
         self._serve_static(parsed.path)
+
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        upload_match = re.fullmatch(
+            r"/api/ingestion/uploads/(upl-[A-Za-z0-9]+)/files/(file-[A-Za-z0-9]+)",
+            parsed.path,
+        )
+        if not upload_match:
+            self._error(HTTPStatus.NOT_FOUND, "Unknown API endpoint")
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "-1"))
+            if content_length < 0:
+                raise ValueError("A valid Content-Length is required")
+            upload_id, file_id = upload_match.groups()
+            self._json(
+                self.app.ingestion_admin.upload_file(
+                    upload_id, file_id, self.rfile, content_length,
+                )
+            )
+        except PermissionError as exc:
+            self._error(HTTPStatus.FORBIDDEN, str(exc))
+        except (ValueError, TypeError) as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+        except RuntimeError as exc:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+        except OSError:
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "Unable to store uploaded file")
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -4195,6 +4271,30 @@ class PermitHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/knowledge-chat":
                 self._json(self.app.store.knowledge_chat.chat(payload))
                 return
+            if parsed.path == "/api/ingestion/uploads":
+                files = payload.get("files")
+                if not isinstance(files, list):
+                    raise ValueError("files must be a list")
+                self._json(self.app.ingestion_admin.initiate_upload(
+                    str(payload.get("project_name", "")), files,
+                ), status=HTTPStatus.CREATED)
+                return
+            upload_complete = re.fullmatch(
+                r"/api/ingestion/uploads/(upl-[A-Za-z0-9]+)/complete", parsed.path,
+            )
+            if upload_complete:
+                self._json(
+                    self.app.ingestion_admin.complete_upload(upload_complete.group(1)),
+                    status=HTTPStatus.ACCEPTED,
+                )
+                return
+            if parsed.path == "/api/ingestion":
+                self._json(self.app.ingestion_admin.start(
+                    str(payload.get("mode", "")),
+                    str(payload.get("site_id", "")),
+                    confirmed=bool(payload.get("confirmed")),
+                ), status=HTTPStatus.ACCEPTED)
+                return
             if parsed.path == "/api/categories":
                 comment_ids = payload.get("comment_ids", [])
                 if not isinstance(comment_ids, list) or not all(isinstance(item, str) for item in comment_ids):
@@ -4226,6 +4326,9 @@ class PermitHandler(BaseHTTPRequestHandler):
         except RuntimeError as exc:
             self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
             return
+        except PermissionError as exc:
+            self._error(HTTPStatus.FORBIDDEN, str(exc))
+            return
         self._error(HTTPStatus.NOT_FOUND, "Unknown API endpoint")
 
     def _serve_static(self, request_path: str, send_body: bool = True) -> None:
@@ -4253,61 +4356,110 @@ class PermitHandler(BaseHTTPRequestHandler):
 
 
 class PermitServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], store: DatasetStore, static_root: Path, adobe_pdf_embed_client_id: str = ""):
+    def __init__(self, address: tuple[str, int], store: DatasetStore, static_root: Path, adobe_pdf_embed_client_id: str = "", ingestion_admin: IngestionAdmin | None = None, allowed_origins: str = ""):
         self.store = store
         self.static_root = static_root.resolve()
         self.adobe_pdf_embed_client_id = adobe_pdf_embed_client_id
+        self.ingestion_admin = ingestion_admin or IngestionAdmin(
+            Path(__file__).resolve().parents[1], enabled=False,
+        )
+        self.allowed_origins = frozenset(
+            origin.strip().rstrip("/")
+            for origin in allowed_origins.split(",")
+            if origin.strip()
+        )
         super().__init__(address, PermitHandler)
+
+    def origin_allowed(self, origin: str) -> bool:
+        return origin.strip().rstrip("/") in self.allowed_origins
 
 
 def build_parser() -> argparse.ArgumentParser:
     workspace = Path(__file__).resolve().parents[1]
+    configured_path = lambda name, default: Path(runtime_setting(name, str(default))).expanduser()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--dataset", type=Path, default=workspace / "phase2_dataset" / "dataset.json")
-    parser.add_argument("--categories", type=Path, default=workspace / "web_app" / "data" / "category_assignments.json")
-    parser.add_argument("--source-root", type=Path, default=workspace / "comments&response")
-    parser.add_argument("--static-root", type=Path, default=workspace / "web_app" / "static")
-    parser.add_argument("--source-registry", type=Path, default=workspace / "web_app" / "data" / "source_registry.json")
-    parser.add_argument("--preview-root", type=Path, default=workspace / "web_app" / "data" / "previews")
-    parser.add_argument("--enrichment", type=Path, default=workspace / "web_app" / "data" / "gemini_enrichment.json")
-    parser.add_argument("--search-index", type=Path, default=workspace / "web_app" / "data" / "search_index.json")
-    parser.add_argument("--link-reviews", type=Path, default=workspace / "web_app" / "data" / "link_review_decisions.json")
-    parser.add_argument("--workbook-reviews", type=Path, default=workspace / "web_app" / "data" / "workbook_review_decisions.json")
-    parser.add_argument("--gemini-model", default=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"))
+    parser.add_argument("--host", default=runtime_setting("PERMIT_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(runtime_setting("PERMIT_PORT", runtime_setting("PORT", "8000"))))
+    parser.add_argument(
+        "--allowed-origins",
+        default=runtime_setting("PERMIT_ALLOWED_ORIGINS", ""),
+        help="Comma-separated exact browser origins allowed to call the API",
+    )
+    parser.add_argument("--dataset", type=Path, default=configured_path("PERMIT_DATASET_PATH", workspace / "phase2_dataset" / "dataset.json"))
+    parser.add_argument("--categories", type=Path, default=configured_path("PERMIT_CATEGORIES_PATH", workspace / "web_app" / "data" / "category_assignments.json"))
+    parser.add_argument("--source-root", type=Path, default=configured_path("PERMIT_SOURCE_ROOT", workspace / "comments&response"))
+    parser.add_argument("--static-root", type=Path, default=configured_path("PERMIT_STATIC_ROOT", workspace / "web_app" / "static"))
+    parser.add_argument("--source-registry", type=Path, default=configured_path("PERMIT_SOURCE_REGISTRY_PATH", workspace / "web_app" / "data" / "source_registry.json"))
+    parser.add_argument("--preview-root", type=Path, default=configured_path("PERMIT_PREVIEW_ROOT", workspace / "web_app" / "data" / "previews"))
+    parser.add_argument("--enrichment", type=Path, default=configured_path("PERMIT_ENRICHMENT_PATH", workspace / "web_app" / "data" / "gemini_enrichment.json"))
+    parser.add_argument("--search-index", type=Path, default=configured_path("PERMIT_SEARCH_INDEX_PATH", workspace / "web_app" / "data" / "search_index.json"))
+    parser.add_argument("--link-reviews", type=Path, default=configured_path("PERMIT_LINK_REVIEWS_PATH", workspace / "web_app" / "data" / "link_review_decisions.json"))
+    parser.add_argument("--workbook-reviews", type=Path, default=configured_path("PERMIT_WORKBOOK_REVIEWS_PATH", workspace / "web_app" / "data" / "workbook_review_decisions.json"))
+    parser.add_argument("--gemini-model", default=runtime_setting("GEMINI_MODEL", "gemini-3.5-flash"))
     parser.add_argument(
         "--knowledge-gemini-model",
-        default=os.environ.get("KNOWLEDGE_GEMINI_MODEL", "gemini-3.6-flash"),
-        help="Gemini model used only for Knowledge Chat routing and grounded summaries",
+        default=runtime_setting("KNOWLEDGE_GEMINI_MODEL", "gemini-3.6-flash"),
+        help="Gemini model used for Knowledge Chat grounded answer synthesis",
+    )
+    parser.add_argument(
+        "--knowledge-router-model",
+        default=runtime_setting("KNOWLEDGE_ROUTER_MODEL", "gemini-3.1-flash-lite"),
+        help="Low-cost Gemini model used only to choose direct, evidence reuse, or search",
     )
     parser.add_argument("--gemini-api-key-stdin", action="store_true", help="Read Gemini key from a hidden startup prompt")
     parser.add_argument(
+        "--enable-ingestion-admin", action="store_true",
+        help="Enable browser-triggered ingestion when the server is not bound to a loopback host",
+    )
+    parser.add_argument(
         "--adobe-pdf-embed-client-id",
-        default=os.environ.get("ADOBE_PDF_EMBED_CLIENT_ID", "da40245968664bb9bf47141e8e0e9195"),
+        default=runtime_setting("ADOBE_PDF_EMBED_CLIENT_ID", "da40245968664bb9bf47141e8e0e9195"),
     )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    workspace = Path(__file__).resolve().parents[1]
     try:
         shared_gemini_api_key = gemini_api_key()
         if not shared_gemini_api_key and args.gemini_api_key_stdin:
             shared_gemini_api_key = getpass.getpass("Gemini API key: ")
         gemini_client = GeminiClient(shared_gemini_api_key, args.gemini_model) if shared_gemini_api_key else None
         knowledge_gemini_client = GeminiClient(shared_gemini_api_key, args.knowledge_gemini_model) if shared_gemini_api_key else None
+        knowledge_router_client = GeminiClient(shared_gemini_api_key, args.knowledge_router_model) if shared_gemini_api_key else None
         store = DatasetStore(
             args.dataset, args.categories, args.source_root,
             args.source_registry, args.preview_root, args.enrichment, args.search_index,
             gemini_client=gemini_client,
             knowledge_gemini_client=knowledge_gemini_client,
+            knowledge_router_client=knowledge_router_client,
             link_reviews_path=args.link_reviews,
             workbook_reviews_path=args.workbook_reviews,
+        )
+
+        def reload_after_ingestion() -> None:
+            store.reload(force=True)
+            try:
+                store.source_registry.payload = json.loads(
+                    store.source_registry.registry_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                pass
+            store.search_index._load()
+
+        loopback = args.host in {"127.0.0.1", "localhost", "::1"}
+        ingestion_admin = IngestionAdmin(
+            workspace,
+            enabled=bool(loopback or args.enable_ingestion_admin),
+            gemini_api_key=shared_gemini_api_key,
+            on_dataset_changed=reload_after_ingestion,
         )
         server = PermitServer(
             (args.host, args.port), store, args.static_root,
             args.adobe_pdf_embed_client_id,
+            ingestion_admin,
+            args.allowed_origins,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"Unable to start permit browser: {exc}")
