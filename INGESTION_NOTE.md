@@ -83,7 +83,10 @@ again.
 
 ## Where data is stored
 
-All production data currently remains local:
+The curated processed corpus is versioned in Git so authorized coworkers can
+run the application against the already-ingested records. Original source
+documents, ingestion artifacts, backups, telemetry, and local job state remain
+local or are distributed through the separate source bundle:
 
 | Location | Purpose |
 | --- | --- |
@@ -99,9 +102,10 @@ All production data currently remains local:
 | `web_app/data/source_registry.json` | Runtime citation and source-viewer mapping |
 | `web_app/data/search_index.json` | Runtime search projection |
 
-The real dataset and original permit files are private and excluded from Git.
-Do not commit `new/`, `comments&response/`, `phase2_dataset/`, API credentials,
-or real source documents.
+Do not commit `new/`, `comments&response/`, API credentials, original permit
+documents, `phase2_dataset/ingestion_artifacts/`, `dataset.pre-*` backups, or
+local ingestion job logs. Only the exact processed-data files allowlisted in
+`.gitignore` belong in Git.
 
 ## Verification after completion
 

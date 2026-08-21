@@ -1045,19 +1045,23 @@ Windows PowerShell:
 py -3 scripts/run_local.py --demo
 ```
 
-To use the complete corpus, securely provide the coworker with the authorized
-data bundle described below, place it at the default locations (or configure
-the `PERMIT_*_PATH` values in `.env.local`), and run the same command without
-`--demo`:
+The repository includes the curated processed corpus needed for Library,
+search, statistics, timelines, and AI retrieval. To use it, run the same
+command without `--demo`. The app can start without the original documents.
+Original permit documents are distributed separately; place them at
+`comments&response/` (or configure `PERMIT_SOURCE_ROOT`) to additionally
+enable source-file viewing and highlighting:
 
 ```text
-phase2_dataset/dataset.json
-comments&response/
+phase2_dataset/dataset.json                 # included in Git
+phase2_dataset/evidence_model.json          # included in Git
+comments&response/                          # supplied separately
 web_app/data/category_assignments.json
 web_app/data/gemini_enrichment.json
 web_app/data/search_index.json
 web_app/data/source_registry.json
 web_app/data/link_review_decisions.json
+web_app/data/tag_suggestions.json
 web_app/data/workbook_review_decisions.json
 web_app/data/previews/                 # when DOC/DOCX previews are needed
 ```

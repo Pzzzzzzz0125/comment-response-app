@@ -129,18 +129,17 @@ def main() -> int:
         source_root = configured_path(
             values, "PERMIT_SOURCE_ROOT", ROOT / "comments&response"
         )
-        missing: list[str] = []
         if not dataset.is_file():
-            missing.append(f"dataset: {dataset}")
-        if not source_root.is_dir():
-            missing.append(f"source folder: {source_root}")
-        if missing:
             print("Authorized local data is incomplete:")
-            for item in missing:
-                print(f"  - {item}")
+            print(f"  - dataset: {dataset}")
             print("\nAsk the project owner for the private data bundle, or run:")
             print(f"  {Path(sys.executable).name} scripts/run_local.py --demo")
             return 2
+        if not source_root.is_dir():
+            print("Original source folder is not installed:")
+            print(f"  - {source_root}")
+            print("Library, search, timelines, and AI retrieval remain available.")
+            print("Original-file viewing and citation highlighting will be unavailable.\n")
 
     print(f"Python: {sys.version.split()[0]}")
     print(f"Mode: {mode}")

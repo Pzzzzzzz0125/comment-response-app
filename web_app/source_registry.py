@@ -907,7 +907,8 @@ class SourceRegistry:
         # migration.  Keep the default strict behavior; this opt-out is only
         # for starting the read-only UI without blocking on migration.
         skip_migration = os.getenv("PERMIT_SKIP_SOURCE_REGISTRY_MIGRATION", "").casefold() in {"1", "true", "yes"}
-        if auto_migrate and registry_is_stale and not skip_migration:
+        corpus_available = any(root.is_dir() for root in self.corpus_roots)
+        if auto_migrate and registry_is_stale and not skip_migration and corpus_available:
             self.migrate()
 
     @property

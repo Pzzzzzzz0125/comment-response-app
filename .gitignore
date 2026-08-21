@@ -12,9 +12,19 @@ web_app/data/previews/
 # Regenerable audit reports may contain workstation-local paths.
 corpus_audit_output/
 
-# Local permit-derived datasets and review decisions are not public artifacts.
-phase2_dataset/
+# Publish only the curated processed corpus needed to run the application.
+# Backups, ingestion artifacts, telemetry, and local job state remain ignored.
+phase2_dataset/*
+!phase2_dataset/dataset.json
+!phase2_dataset/evidence_model.json
 web_app/data/*.json
+!web_app/data/category_assignments.json
+!web_app/data/gemini_enrichment.json
+!web_app/data/link_review_decisions.json
+!web_app/data/search_index.json
+!web_app/data/source_registry.json
+!web_app/data/tag_suggestions.json
+!web_app/data/workbook_review_decisions.json
 web_app/data/retag_runs/
 phase2/review_decisions.csv
 corpus_audit/manual_overrides.csv
