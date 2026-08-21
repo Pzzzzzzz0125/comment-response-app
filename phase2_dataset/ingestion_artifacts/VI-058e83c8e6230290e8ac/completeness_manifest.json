@@ -1,0 +1,36 @@
+{
+  "assigned_group_count": 3,
+  "assigned_unit_ids": [
+    "XLSX:Review Comments:C2",
+    "XLSX:Review Comments:C3",
+    "XLSX:Review Comments:C4"
+  ],
+  "candidate_comment_count": 3,
+  "candidate_response_count": 0,
+  "candidate_unit_ids": [
+    "XLSX:Review Comments:C2",
+    "XLSX:Review Comments:C3",
+    "XLSX:Review Comments:C4"
+  ],
+  "completion_status": "complete",
+  "context_only_unit_ids": [
+    "XLSX:Review Comments:A2",
+    "XLSX:Review Comments:A3",
+    "XLSX:Review Comments:A4",
+    "XLSX:Review Comments:B2",
+    "XLSX:Review Comments:B3",
+    "XLSX:Review Comments:B4",
+    "XLSX:Review Comments:D4",
+    "XLSX:Review Comments:G2",
+    "XLSX:Review Comments:G3",
+    "XLSX:Review Comments:G4",
+    "XLSX:Review Comments:H2",
+    "XLSX:Review Comments:H3",
+    "XLSX:Review Comments:H4"
+  ],
+  "duplicate_unit_ids": [],
+  "needs_review_unit_ids": [],
+  "requires_visual": false,
+  "unassigned_unit_ids": [],
+  "unresolved_signal_count": 0
+}
