@@ -2714,9 +2714,29 @@ class DatasetStore:
                 for link in links
             )
             decision = self._workbook_review_decisions.get(source, {})
+            artifact_ids = {
+                str(
+                    (row.get("ingestion_audit") or {}).get(
+                        "artifact_id", "",
+                    )
+                )
+                for row in rows
+                if isinstance(row.get("ingestion_audit"), dict)
+            }
+            current_artifact_id = (
+                next(iter(artifact_ids))
+                if len(artifact_ids) == 1
+                else ""
+            )
+            decision_confirmed = (
+                decision.get("decision") == "confirmed"
+                and bool(current_artifact_id)
+                and decision.get("artifact_id") == current_artifact_id
+                and int(decision.get("comment_count") or 0) == len(rows)
+            )
             effective = (
                 "confirmed"
-                if dataset_confirmed
+                if dataset_confirmed or decision_confirmed
                 else "needs_followup"
                 if decision.get("decision") == "needs_followup"
                 else "pending"

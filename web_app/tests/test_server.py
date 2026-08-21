@@ -1015,6 +1015,19 @@ class DatasetStoreTests(unittest.TestCase):
         )
         self.assertEqual(store.data("San Jose")["stats"]["comments"], 2)
 
+        # A later canonical-event dedup pass may suppress a duplicate row from
+        # search without invalidating the human review of the same immutable
+        # ingestion artifact. The workbook must not return to the pending queue.
+        saved["comments"][0]["search_eligible"] = False
+        saved["comments"][0]["duplicate_of"] = "C-canonical"
+        self.dataset_path.write_text(
+            json.dumps(saved), encoding="utf-8",
+        )
+        store.reload(force=True)
+        repaired_queue = store.workbook_review_queue("confirmed")
+        self.assertEqual(repaired_queue["counts"]["confirmed"], 1)
+        self.assertEqual(repaired_queue["counts"]["pending"], 0)
+
     def test_workbook_confirmation_requires_complete_local_manifest(self):
         dataset = sample_dataset()
         comment = dataset["comments"][0]
