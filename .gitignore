@@ -17,6 +17,13 @@ corpus_audit_output/
 phase2_dataset/*
 !phase2_dataset/dataset.json
 !phase2_dataset/evidence_model.json
+# Workbook review reads these compact manifests at runtime. Keep the much
+# larger extraction, OCR, Gemini, telemetry, and cache artifacts ignored.
+!phase2_dataset/ingestion_artifacts/
+phase2_dataset/ingestion_artifacts/*
+!phase2_dataset/ingestion_artifacts/*/
+phase2_dataset/ingestion_artifacts/*/*
+!phase2_dataset/ingestion_artifacts/*/completeness_manifest.json
 web_app/data/*.json
 !web_app/data/category_assignments.json
 !web_app/data/gemini_enrichment.json
